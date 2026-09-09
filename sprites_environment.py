@@ -16,15 +16,20 @@ running when ``persistent_filesystem`` is True; the Sprite is deleted otherwise.
 import hashlib
 import logging
 import re
-import shlex
 import threading
 import uuid
 from pathlib import Path
 
-from tools.environments.base import (
-    BaseEnvironment,
-    _ThreadedProcessHandle,
-)
+from tools.environments.base import BaseEnvironment
+
+try:
+    from tools.environments.base_output import _ThreadedProcessHandle
+except ModuleNotFoundError as exc:
+    # Hermes releases before the September 2026 module split keep it in base.
+    # Do not hide a missing dependency inside an otherwise available module.
+    if exc.name != "tools.environments.base_output":
+        raise
+    from tools.environments.base import _ThreadedProcessHandle
 from tools.environments.file_sync import (
     FileSyncManager,
     iter_sync_files,
@@ -197,8 +202,7 @@ class SpritesEnvironment(BaseEnvironment):
 
     Spawn-per-call via ``_ThreadedProcessHandle`` wrapping blocking
     ``sprite.command(...).combined_output()`` calls. The SDK timeout is
-    used (rather than wrapping the shell), since the SDK already cancels
-    the underlying WebSocket exec on deadline.
+    used to bound the client wait, not as a remote process-kill guarantee.
     """
 
     _stdin_mode = "heredoc"
@@ -298,7 +302,6 @@ class SpritesEnvironment(BaseEnvironment):
         # Detect remote home dir for .hermes sync target.
         self._remote_home = "/root"
         try:
-            from sprites.exceptions import ExitError
             cmd = self._sprite.command("bash", "-c", "echo $HOME", timeout=15)
             home = cmd.combined_output().decode().strip()
             if home:

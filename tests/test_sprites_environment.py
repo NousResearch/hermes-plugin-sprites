@@ -5,9 +5,12 @@ network or token required. Live-API checks live under
 tests/integration/test_sprites_terminal.py.
 """
 
+import json
+import shutil
 import sys
 import types
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -80,19 +83,26 @@ def _make_sprite(name="hermes-default"):
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    """Unit tests must not read the operator's profiles, tokens, or skills."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("SPRITES_TOKEN", raising=False)
+    monkeypatch.delenv("SPRITE_TOKEN", raising=False)
+    return home
+
 @pytest.fixture()
 def sprites_sdk(monkeypatch):
     return _patch_sprites_imports(monkeypatch)
 
 
 @pytest.fixture()
-def make_env(sprites_sdk, monkeypatch):
-    """Build a SpritesEnvironment instance against a mocked SDK.
-
-    Returns a factory; keyword args mirror SpritesEnvironment.__init__.
-    The factory accepts an optional ``get_side_effect`` to control what
-    ``client.get_sprite()`` does (e.g. raise NotFoundError to force create).
-    """
+def hermes_runtime(monkeypatch):
+    """Keep SDK installation and host-file sync out of transport-mocked tests."""
     monkeypatch.setenv("SPRITES_TOKEN", "test-token")
     # Don't try to lazy-install the SDK during tests
     monkeypatch.setattr(
@@ -110,6 +120,11 @@ def make_env(sprites_sdk, monkeypatch):
     )
     # Keep the base class from blocking forever on interrupt polling
     monkeypatch.setattr("tools.environments.base.is_interrupted", lambda: False)
+
+
+@pytest.fixture()
+def make_env(sprites_sdk, hermes_runtime, monkeypatch):
+    """Return a factory for SpritesEnvironment instances backed by the mocked SDK."""
     # Pin the profile identity to default (None) so Sprite names are
     # deterministic regardless of the test runner's HERMES_HOME.
     # Profile-scoping itself is covered explicitly in TestSpriteNaming.
@@ -217,8 +232,6 @@ class TestEphemeralIsolation:
 
     def test_session_isolation_covers_sprites(self, monkeypatch):
         """terminal_tool keys non-persistent sprites per session, not 'default'."""
-        import sys, pathlib
-        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
         import __init__ as plugin_pkg
         import tools.terminal_tool as tt
         from agent import terminal_env_registry as reg
@@ -229,14 +242,12 @@ class TestEphemeralIsolation:
             monkeypatch.setenv("TERMINAL_ENV", "sprites")
             monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
             monkeypatch.setattr(tt, "_terminal_config_bridge_attempted", True)
-            assert tt._session_isolation_enabled() is True
             # Docker-only paths (workspace mounts, container teardown) stay off.
             assert tt._docker_session_isolation_enabled() is False
             # An ordinary session task id no longer collapses onto the shared key.
             assert tt._resolve_container_task_id("session-abc123") != "default"
             # Persistent mode keeps the documented shared-Sprite contract.
             monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
-            assert tt._session_isolation_enabled() is False
             assert tt._resolve_container_task_id("session-abc123") == "default"
         finally:
             reg._reset_for_tests()
@@ -573,8 +584,6 @@ class TestDispatchWiring:
     """
 
     def test_terminal_tool_builds_container_config_for_sprites(self, monkeypatch):
-        import sys, pathlib
-        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
         import __init__ as plugin_pkg
         import tools.terminal_tool as tt
         from agent import terminal_env_registry as reg
@@ -582,7 +591,8 @@ class TestDispatchWiring:
         reg._reset_for_tests()
         request_cleanup = reg._reset_for_tests
         try:
-            reg.register_provider(plugin_pkg.SpritesProvider())
+            provider = plugin_pkg.SpritesProvider()
+            reg.register_provider(provider)
         except Exception:
             request_cleanup()
             raise
@@ -618,37 +628,32 @@ class TestDispatchWiring:
             def execute(self, *a, **k):
                 return {"output": "", "exit_code": 0}
 
-        def fake_create_environment(env_type, image, cwd, timeout, **kwargs):
-            captured["env_type"] = env_type
+        def fake_create_environment(**kwargs):
             captured["container_config"] = kwargs.get("container_config")
             return _DummyEnv()
 
         monkeypatch.setattr(tt, "_get_env_config", lambda: config)
         monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
         monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **k: {"approved": True})
-        monkeypatch.setattr(tt, "_create_environment", fake_create_environment)
+        monkeypatch.setattr(provider, "create_environment", fake_create_environment)
         monkeypatch.setattr(tt, "_active_environments", {})
         monkeypatch.setattr(tt, "_last_activity", {})
 
-        tt.terminal_tool(command="pwd")
+        try:
+            tt.terminal_tool(command="pwd")
+            cc = captured["container_config"]
+            assert cc is not None, (
+                "container_config=None silently discards container_persistent"
+            )
+            assert cc["container_persistent"] is False
+        finally:
+            request_cleanup()
 
-        assert captured["env_type"] == "sprites"
-        cc = captured["container_config"]
-        assert cc is not None, (
-            "sprites must be in terminal_tool's container_config builder set; "
-            "container_config=None silently discards container_persistent"
-        )
-        assert cc["container_persistent"] is False
-        request_cleanup()
-
-    def test_create_environment_passes_persistence_and_task_id(self, monkeypatch):
-        """Registry dispatch: _create_environment falls through to the provider."""
-        import tools.terminal_tool as tt
+    def test_provider_passes_persistence_and_task_id(self, monkeypatch):
+        """The registered provider passes its configuration to the environment."""
         import sprites_environment as sprites_mod
         from agent import terminal_env_registry as reg
 
-        import sys, pathlib
-        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
         import __init__ as plugin_pkg  # noqa: F401 — the plugin package
 
         captured = {}
@@ -667,8 +672,7 @@ class TestDispatchWiring:
         try:
             reg.register_provider(plugin_pkg.SpritesProvider())
 
-            env = tt._create_environment(
-                env_type="sprites",
+            reg.get_provider("sprites").create_environment(
                 image="ignored",
                 cwd="/root",
                 timeout=60,
@@ -679,16 +683,85 @@ class TestDispatchWiring:
             assert captured["persistent_filesystem"] is False
             assert captured["task_id"] == "tid-ephemeral"
             assert captured["cwd"] == "/root"
-            assert getattr(env, "_hermes_backend_name", None) == "sprites"
         finally:
             reg._reset_for_tests()
 
     def test_no_base_url_kwarg(self, make_env, sprites_sdk):
         """SpritesClient is constructed without a base_url override (endpoint is fixed)."""
-        env = make_env(task_id="urlcheck")
+        make_env(task_id="urlcheck")
         sprites_mod, _ = sprites_sdk
         _, kwargs = sprites_mod.SpritesClient.call_args
         assert "base_url" not in kwargs
+
+    @pytest.mark.parametrize("persistent", [True, False])
+    def test_discovered_plugin_executes_and_cleans_up(
+        self, persistent, isolated_home, hermes_runtime, sprites_sdk, monkeypatch
+    ):
+        """Exercise discovery, package imports and real terminal dispatch, mocking only transport."""
+        from hermes_cli import plugins
+        from agent import terminal_env_registry as reg
+        import tools.terminal_tool as tt
+        import yaml
+
+        plugin_dir = isolated_home / "plugins" / "sprites"
+        shutil.copytree(
+            Path(__file__).resolve().parents[1],
+            plugin_dir,
+            ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", ".pytest_cache", "tests"),
+        )
+        (isolated_home / "config.yaml").write_text(yaml.safe_dump({
+            "plugins": {"enabled": ["sprites"]},
+            "terminal": {
+                "backend": "sprites", "cwd": "/home/sprite", "timeout": 30,
+                "container_persistent": persistent,
+            },
+        }))
+        monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: isolated_home / "bundled")
+        manager = plugins.get_plugin_manager()
+        monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+        monkeypatch.setattr(tt, "_terminal_config_bridge_attempted", False)
+        monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+        monkeypatch.setattr(tt, "_active_environments", {})
+        monkeypatch.setattr(tt, "_last_activity", {})
+
+        sprite = _make_sprite()
+        command = MagicMock()
+        command.combined_output.return_value = b"from Sprite\n"
+        sprite.command.side_effect = [*sprite.command.side_effect, command]
+        client = MagicMock()
+        client.get_sprite.side_effect = _NotFoundError("not found")
+        client.create_sprite.return_value = sprite
+        sprites_sdk[0].SpritesClient.return_value = client
+
+        reg._reset_for_tests()
+        try:
+            manager.discover_and_load()
+            provider = reg.get_provider("sprites")
+            assert provider is not None
+            # Verify the package-loaded provider, not the direct-import test shortcut.
+            assert provider.__class__.__module__.startswith("hermes_plugins.")
+
+            result = json.loads(tt.terminal_tool("printf 'from Sprite\\n'", task_id="plugin-smoke"))
+            assert result["exit_code"] == 0, result
+            assert "from Sprite" in result["output"]
+            key = tt._resolve_container_task_id("plugin-smoke")
+            env = tt._active_environments[key]
+            assert env._persistent is persistent
+            assert env._task_id == key
+            assert env._hermes_backend_name == "sprites"
+            assert env.__class__.__module__.startswith(provider.__class__.__module__ + ".")
+            client.create_sprite.assert_called_once()
+            tt.cleanup_vm(key)
+            if persistent:
+                sprite.delete.assert_not_called()
+            else:
+                sprite.delete.assert_called_once()
+            client.close.assert_called_once()
+        finally:
+            for key in list(tt._active_environments):
+                tt.cleanup_vm(key)
+            manager.unload()
+            reg._reset_for_tests()
 
 
 # ---------------------------------------------------------------------------

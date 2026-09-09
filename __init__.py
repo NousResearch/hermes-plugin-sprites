@@ -157,10 +157,10 @@ class SpritesProvider(TerminalEnvironmentProvider):
 
     def create_environment(self, *, cwd, timeout, task_id="default",
                            image=None, container_config=None, **kwargs):
-        try:
+        if __package__:
             # Normal path: loaded by the Hermes plugin manager as a package.
             from .sprites_environment import SpritesEnvironment
-        except ImportError:
+        else:
             # Test / direct-import path (repo root on sys.path).
             from sprites_environment import SpritesEnvironment
 

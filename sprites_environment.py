@@ -217,14 +217,8 @@ class SpritesEnvironment(BaseEnvironment):
         requested_cwd = cwd
         super().__init__(cwd=cwd, timeout=timeout)
 
-        try:
-            from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("terminal.sprites", prompt=False)
-        except ImportError:
-            pass
-        except Exception as e:
-            raise ImportError(str(e))
-
+        # Standalone plugin dependencies are installed alongside the plugin,
+        # not through Hermes's allowlist of built-in lazy dependencies.
         from sprites import SpritesClient
         from sprites.exceptions import NotFoundError, SpriteError
 
@@ -363,12 +357,10 @@ class SpritesEnvironment(BaseEnvironment):
         else:
             shell_cmd = ["bash", "-c", cmd_string]
 
-        # The SDK timeout cancels the WebSocket cleanly, so prefer it over
-        # the shell-level ``timeout`` wrapper used by other backends. Never
-        # pass None: the SDK has no kill hook on a running Cmd
-        # (cancel_fn=None below), so an unbounded exec in a persistent VM
-        # could run — and bill — forever. Absent/nonpositive timeouts get a
-        # generous fallback deadline (explicit positive values pass through).
+        # Bound the client wait, including when no deadline was supplied.
+        # SDK cancellation closes the WebSocket, but does not guarantee the
+        # remote process is killed (cancel_fn=None below). Absent/nonpositive
+        # timeouts get a fallback deadline; explicit positive values pass through.
         cmd_timeout = float(timeout) if timeout and timeout > 0 else 3600.0
 
         def exec_fn() -> tuple[str, int]:
@@ -382,7 +374,10 @@ class SpritesEnvironment(BaseEnvironment):
                 buf = (e.stdout or b"") + (e.stderr or b"")
                 return (buf.decode("utf-8", errors="replace"),
                         e.exit_code() if callable(getattr(e, "exit_code", None)) else 1)
-            except SpritesTimeout:
+            except (SpritesTimeout, TimeoutError):
+                # sprites-py has matching async and synchronous deadlines.
+                # Its Future.result() can raise built-in TimeoutError before
+                # the coroutine translates expiry to the SDK's exception.
                 return (f"command timed out after {cmd_timeout}s\n", 124)
 
         # No external cancel: the SDK does not expose a kill hook on a

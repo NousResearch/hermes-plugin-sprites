@@ -10,6 +10,8 @@ The offline suite is tested against Hermes `v2026.8.31` and `v2026.9.7`.
 The plugin supports both the original environment module layout and the
 September 2026 split. It uses the new process-handle module when available,
 falling back only when that module is absent in an older release.
+The SDK must be installed into Hermes's Python environment; this standalone
+plugin does not use Hermes's built-in lazy-dependency allowlist.
 
 `hermes doctor` checks token and SDK availability; it does not execute a command
 or establish end-to-end backend compatibility. The offline tests below load the
@@ -23,19 +25,23 @@ separate and creates billable resources.
 # 1. Copy/clone this repo into the Hermes plugins dir
 git clone git@github.com:NousResearch/hermes-plugin-sprites.git ~/.hermes/plugins/sprites
 
-# 2. Install the SDK
+# 2. Install the SDK using Hermes's Python environment, not an unrelated Python
 pip install 'sprites-py>=0.5.0,<0.6'
 
 # 3. Enable + select
 hermes plugins enable sprites
 hermes config set terminal.backend sprites
 
-# 4. Token (get one with `sprite login`; a Restricted Token with
-#    prefix=hermes is recommended for CI / shared use)
-echo 'SPRITES_TOKEN=...' >> ~/.hermes/.env
+# 4. Use your editor to save SPRITES_TOKEN in the selected profile's .env.
+#    Create the token in your organization's Sprites token settings in
+#    the Fly.io dashboard. `sprite login` alone does not supply it to Hermes.
+chmod 600 ~/.hermes/.env
 ```
 
 `hermes doctor` reports token/SDK status once `terminal.backend: sprites` is active.
+For a named profile, install the plugin under that profile's `plugins/sprites`
+directory and use `hermes -p <profile>` for enable/config/chat commands. Keep its
+token in that profile's `.env` rather than the default profile's file.
 
 ## Behavior
 
@@ -45,6 +51,10 @@ echo 'SPRITES_TOKEN=...' >> ~/.hermes/.env
 - **Client-side exec timeouts.** SDK calls without a positive timeout use a 3600s client timeout. This is not a guarantee that the remote process stops at that instant; the plugin has no explicit kill hook for an in-flight command.
 - **Sharing model:** gateway/WebUI sessions each get their own Sprite; `delegate_task` children share their parent's; key-less flows (CLI, cron) share the profile-default Sprite.
 - `SPRITES_TOKEN` / `SPRITE_TOKEN` are stripped from every subprocess the agent spawns.
+- Hermes's remote-file sync uploads selected credential files, skills, and cache
+  files. Review the profile's contents; token environment stripping does not
+  mean no credentials leave the host. Local repositories are not automatically
+  uploaded, and remote edits are not synced back to the host.
 
 ## Tests
 
@@ -59,10 +69,37 @@ Repeat against each Hermes release being supported. Keep the real discovery and
 terminal-dispatch checks enabled: a registration-only test will miss an import
 failure that happens when the first environment is created.
 
-The legacy `tests/test_sprites_terminal_live.py` harness predates the standalone
-plugin layout and needs updating before use; it is not part of this offline
-compatibility check. Do not run it against an existing profile or treat the unit
-results as live-service validation.
+### Opt-in live tests
+
+The live suite requires Hermes `v2026.9.7`, its test dependencies, and the real
+SDK (`sprites-py` `0.5.1` was used for validation). It exercises plugin discovery
+and terminal dispatch, stdout/stderr and exit codes, shell state, skill-file
+upload/deletion, persistence, profile isolation, timeout/interrupt results, and
+ephemeral cleanup. It does not call an LLM.
+
+**This creates billable resources and deletes their files.** Use an appropriate
+test organization. Put its Sprites token in a private file (`chmod 600`) using
+your editor, outside source control. The file's explicit path enables the test;
+without it, the test skips before importing the SDK or making API calls.
+
+```bash
+cd /path/to/hermes-agent
+scripts/run_tests.sh /path/to/hermes-plugin-sprites/tests/test_sprites_terminal_live.py \
+  --file-timeout 600 --file-retries 0 -- \
+  --sprites-live-token-file /private/path/to/test-token
+```
+
+The test isolates Hermes's home, installs the plugin into temporary profiles,
+and permits only its run-unique Sprite names. It refuses to adopt existing
+Sprites, adds a unique ownership label at creation, checks identity before
+deleting, and verifies absence after cleanup. Persistent test Sprites are also
+removed. Review cleanup output after failures; forcibly killing the test process
+can prevent teardown and leave billable resources behind. Remove your temporary
+token file when finished.
+
+Timeout and interrupt checks use short, bounded remote workloads. Live testing
+observed both workloads continue remotely after the client returned; neither
+result should be treated as confirmation of a remote kill.
 
 ## Attribution
 

@@ -2,7 +2,7 @@
 
 These exercise SpritesEnvironment against a mocked sprites-py SDK; no
 network or token required. Live-API checks live under
-tests/integration/test_sprites_terminal.py.
+tests/test_sprites_terminal_live.py.
 """
 
 import json
@@ -102,12 +102,8 @@ def sprites_sdk(monkeypatch):
 
 @pytest.fixture()
 def hermes_runtime(monkeypatch):
-    """Keep SDK installation and host-file sync out of transport-mocked tests."""
+    """Keep host-file sync out of transport-mocked tests."""
     monkeypatch.setenv("SPRITES_TOKEN", "test-token")
-    # Don't try to lazy-install the SDK during tests
-    monkeypatch.setattr(
-        "tools.lazy_deps.ensure", lambda *a, **k: None, raising=False
-    )
     # Skip credential-file enumeration so init doesn't bring in real ~/.hermes state
     monkeypatch.setattr(
         "tools.credential_files.get_credential_file_mounts", lambda: []
@@ -844,11 +840,11 @@ class TestRunBashExitCodes:
         assert "before" in out
         assert handle.returncode == 7
 
-    def test_timeout_surfaces_124(self, make_env, sprites_sdk):
+    @pytest.mark.parametrize("timeout_type", [_SpritesTimeoutError, TimeoutError], ids=["sdk", "sync-future"])
+    def test_timeout_surfaces_124(self, make_env, sprites_sdk, timeout_type):
         env = make_env(task_id="rbto")
-        _, exc_mod = sprites_sdk
         cmd = MagicMock()
-        cmd.combined_output.side_effect = exc_mod.TimeoutError("deadline")
+        cmd.combined_output.side_effect = timeout_type("deadline")
         env._mock_sprite.command = MagicMock(return_value=cmd)
 
         handle = env._run_bash("sleep 999", timeout=1)

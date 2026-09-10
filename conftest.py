@@ -22,10 +22,3 @@ for p in (str(_hermes_agent), str(_REPO_ROOT)):
         sys.path.insert(0, p)
 
 collect_ignore = ["__init__.py", "sprites_environment.py"]
-
-
-def pytest_addoption(parser):
-    parser.addoption(
-        "--sprites-live-token-file",
-        help="Explicitly enable billable live tests using a private file containing a Sprites token.",
-    )

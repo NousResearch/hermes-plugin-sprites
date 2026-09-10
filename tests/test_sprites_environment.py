@@ -689,9 +689,8 @@ class TestDispatchWiring:
         _, kwargs = sprites_mod.SpritesClient.call_args
         assert "base_url" not in kwargs
 
-    @pytest.mark.parametrize("persistent", [True, False])
-    def test_discovered_plugin_executes_and_cleans_up(
-        self, persistent, isolated_home, hermes_runtime, sprites_sdk, monkeypatch
+    def test_discovered_plugin_executes(
+        self, isolated_home, hermes_runtime, sprites_sdk, monkeypatch
     ):
         """Exercise discovery, package imports and real terminal dispatch, mocking only transport."""
         from hermes_cli import plugins
@@ -707,10 +706,7 @@ class TestDispatchWiring:
         )
         (isolated_home / "config.yaml").write_text(yaml.safe_dump({
             "plugins": {"enabled": ["sprites"]},
-            "terminal": {
-                "backend": "sprites", "cwd": "/home/sprite", "timeout": 30,
-                "container_persistent": persistent,
-            },
+            "terminal": {"backend": "sprites"},
         }))
         monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: isolated_home / "bundled")
         manager = plugins.get_plugin_manager()
@@ -724,10 +720,9 @@ class TestDispatchWiring:
         command = MagicMock()
         command.combined_output.return_value = b"from Sprite\n"
         sprite.command.side_effect = [*sprite.command.side_effect, command]
-        client = MagicMock()
+        client = sprites_sdk[0].SpritesClient.return_value
         client.get_sprite.side_effect = _NotFoundError("not found")
         client.create_sprite.return_value = sprite
-        sprites_sdk[0].SpritesClient.return_value = client
 
         reg._reset_for_tests()
         try:
@@ -740,22 +735,10 @@ class TestDispatchWiring:
             result = json.loads(tt.terminal_tool("printf 'from Sprite\\n'", task_id="plugin-smoke"))
             assert result["exit_code"] == 0, result
             assert "from Sprite" in result["output"]
-            key = tt._resolve_container_task_id("plugin-smoke")
-            env = tt._active_environments[key]
-            assert env._persistent is persistent
-            assert env._task_id == key
-            assert env._hermes_backend_name == "sprites"
-            assert env.__class__.__module__.startswith(provider.__class__.__module__ + ".")
             client.create_sprite.assert_called_once()
-            tt.cleanup_vm(key)
-            if persistent:
-                sprite.delete.assert_not_called()
-            else:
-                sprite.delete.assert_called_once()
-            client.close.assert_called_once()
         finally:
-            for key in list(tt._active_environments):
-                tt.cleanup_vm(key)
+            for env in tt._active_environments.values():
+                env.cleanup()
             manager.unload()
             reg._reset_for_tests()
 

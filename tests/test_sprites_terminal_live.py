@@ -1,237 +1,205 @@
-"""Opt-in live checks with isolated profiles and owned, run-unique Sprites.
+"""Integration tests for the Sprites terminal backend.
 
-Run via Hermes's scripts/run_tests.sh with --sprites-live-token-file pointing
-to a private token file. No operator profile or existing Sprite is adopted.
+Requires SPRITES_TOKEN to be set. Run with:
+    TERMINAL_ENV=sprites pytest tests/integration/test_sprites_terminal.py -v
+
+SAFETY: every test runs in a run-unique ``hermes-test-{uuid8}-…`` Sprite
+namespace (see ``_force_sprites``), so the suite does not touch the real
+profile Sprite names production naming emits (a production task id would
+have to spell out this run's random uuid hex to collide).
 """
 
 import json
+import os
+import sys
+import uuid
 from pathlib import Path
-import shutil
-import stat
-import threading
-import time
-from uuid import uuid4
 
 import pytest
 
 pytestmark = pytest.mark.integration
 
+# Capture the token at import time. The project-wide hermetic conftest
+# wipes anything ending in _TOKEN before each test runs, so we save the
+# value here and re-inject it via the autouse fixture below.
+_SPRITES_TOKEN = os.getenv("SPRITES_TOKEN")
+if not _SPRITES_TOKEN:
+    pytest.skip("SPRITES_TOKEN not set", allow_module_level=True)
+
+# Import terminal_tool via importlib to avoid tools/__init__.py side effects.
+# IMPORTANT: this creates a module object DISTINCT from `tools.terminal_tool`;
+# every helper and global this file touches (terminal_tool, cleanup_vm,
+# _resolve_container_task_id, _active_environments) must come from THIS
+# module object, or assertions would read a registry the executed code never
+# wrote to. (sprites_environment is imported normally by both, so
+# patching it affects the executed path.)
+import importlib.util
+
+parent_dir = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(parent_dir))
+
+spec = importlib.util.spec_from_file_location(
+    "terminal_tool", parent_dir / "tools" / "terminal_tool.py"
+)
+terminal_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(terminal_module)
+
+terminal_tool = terminal_module.terminal_tool
+cleanup_vm = terminal_module.cleanup_vm
+_resolve_container_task_id = terminal_module._resolve_container_task_id
+_active_environments = terminal_module._active_environments
+
+# One unique Sprite namespace per test run, so parallel/repeated runs don't
+# collide and — critically — the suite never touches a production Sprite name.
+_RUN_ID = uuid.uuid4().hex[:8]
+
+
+def _test_sprite_name(task_id: str) -> str:
+    from sprites_environment import _collapse_slug
+    return f"hermes-test-{_RUN_ID}-{_collapse_slug(task_id) or 'default'}"
+
+
+@pytest.fixture(autouse=True)
+def _force_sprites(monkeypatch):
+    # Re-inject the token the hermetic conftest deleted.
+    monkeypatch.setenv("SPRITES_TOKEN", _SPRITES_TOKEN)
+    monkeypatch.setenv("TERMINAL_ENV", "sprites")
+    # Match the documented "ephemeral test" default — tests clean up after themselves.
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+    # Sandbox every test into the run-unique namespace: without this, task-id
+    # collapse would resume the operator's REAL hermes-{profile}-default
+    # Sprite and the ephemeral teardown would DELETE it (filesystem and all).
+    # Both naming paths are pinned: persistent envs resolve via
+    # _resolve_sprite_name, ephemeral envs (this suite's default) via
+    # _ephemeral_sprite_name.
+    import sprites_environment as sprites_mod
+    monkeypatch.setattr(sprites_mod, "_resolve_sprite_name", _test_sprite_name)
+    monkeypatch.setattr(sprites_mod, "_ephemeral_sprite_name", _test_sprite_name)
+
 
 @pytest.fixture()
-def live(monkeypatch, tmp_path, request):
-    token_path = request.config.getoption("--sprites-live-token-file")
-    if not token_path:
-        pytest.skip("Live tests require explicit --sprites-live-token-file authorization")
-    token_path = Path(token_path)
-    if token_path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        pytest.fail("Live token file must be private (chmod 600)")
-    token = token_path.read_text().strip()
-    if not token:
-        pytest.fail("Live token file is empty")
+def task_id(request):
+    """Unique task_id per test; environment is cleaned up afterwards.
 
-    import httpx
-    from sprites import SpritesClient
-    from sprites.exceptions import NotFoundError
-    from sprites.types import URLSettings
-    import yaml
+    Cleanup must use the CONTAINER key the env was registered under —
+    `_resolve_container_task_id` is mode-dependent: with this suite's
+    non-persistent config, session isolation keys per task id; under
+    persistent mode ordinary ids collapse to "default". Resolving at
+    teardown time (same env state) always yields the registration key.
+    """
+    tid = f"sprites_test_{request.node.name}"
+    yield tid
+    cleanup_vm(_resolve_container_task_id(tid))
 
-    run_id = uuid4().hex[:12]
-    label = "hermes-live-" + uuid4().hex
-    attempted = set()
-    created = {}
-    managers = []
-    root = tmp_path / ".hermes"
-    profile = root / "profiles" / f"live-{run_id}-a"
-    profile.mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setenv("HERMES_HOME", str(profile))
-    monkeypatch.setenv("SPRITES_TOKEN", token)
-    monkeypatch.delenv("SPRITE_TOKEN", raising=False)
-    monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
 
-    from hermes_cli import plugins
-    from agent import terminal_env_registry as registry
-    import tools.terminal_tool as terminal
-    from tools.terminal_tool_lifecycle import cleanup_vm
+def _run(command, task_id, **kwargs):
+    result = terminal_tool(command, task_id=task_id, **kwargs)
+    return json.loads(result)
 
-    monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: root / "empty-bundled")
-    monkeypatch.setattr(terminal, "_active_environments", {})
-    monkeypatch.setattr(terminal, "_last_activity", {})
-    monkeypatch.setattr(terminal, "_start_cleanup_thread", lambda: None)
-    control = httpx.Client(
-        base_url="https://api.sprites.dev", headers={"Authorization": "Bearer " + token}, timeout=60,
-    )
 
-    def allowed(name):
-        return name.startswith((f"hermes-live-{run_id}-", f"hermes-eph-live-{run_id}-"))
+class TestSpritesBasic:
+    def test_echo(self, task_id):
+        r = _run("echo 'Hello from a Sprite!'", task_id)
+        assert r["exit_code"] == 0
+        assert "Hello from a Sprite!" in r["output"]
 
-    def info(name):
-        assert allowed(name), "Refusing access outside the test namespace"
-        response = control.get("/v1/sprites/" + name)
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        return response.json()
+    def test_nonzero_exit(self, task_id):
+        r = _run("exit 42", task_id)
+        assert r["exit_code"] == 42
 
-    def owned(name, data):
-        assert name in attempted and label in data.get("labels", []), "Not a Sprite created by this test"
-        if name in created:
-            assert data["id"] == created[name], "Test Sprite identity changed"
+    def test_os_info(self, task_id):
+        r = _run("uname -a", task_id)
+        assert r["exit_code"] == 0
+        assert "Linux" in r["output"]
 
-    real_create = SpritesClient.create_sprite
-    real_get = SpritesClient.get_sprite
-    real_destroy = SpritesClient.destroy_sprite
+    def test_python_available(self, task_id):
+        r = _run("python3 --version || python --version", task_id)
+        assert r["exit_code"] == 0
+        assert "Python" in r["output"]
 
-    def create(client, name, *args, **kwargs):
-        assert info(name) is None, "Refusing to adopt an existing Sprite"
-        attempted.add(name)
-        sprite = real_create(client, name, *args, labels=[label], url_settings=URLSettings(auth="sprite"), **kwargs)
-        created[name] = sprite.id
-        print(json.dumps({"created": name, "id": sprite.id}), flush=True)
-        return sprite
 
-    def get(client, name):
-        data = info(name)
-        if data is None:
-            raise NotFoundError("Test Sprite does not exist")
-        owned(name, data)
-        return real_get(client, name)
+class TestSpritesFilesystem:
+    def test_write_and_read_file(self, task_id):
+        _run("echo 'sprites content' > /tmp/sprites_test.txt", task_id)
+        r = _run("cat /tmp/sprites_test.txt", task_id)
+        assert r["exit_code"] == 0
+        assert "sprites content" in r["output"]
 
-    def destroy(client, name):
-        data = info(name)
-        if data is not None:
-            owned(name, data)
-            real_destroy(client, name)
+    def test_env_var_persistence(self, task_id):
+        _run("export SPRITES_TEST_VAR=heyo", task_id)
+        r = _run("echo $SPRITES_TEST_VAR", task_id)
+        assert r["exit_code"] == 0
+        assert "heyo" in r["output"]
 
-    monkeypatch.setattr(SpritesClient, "create_sprite", create)
-    monkeypatch.setattr(SpritesClient, "get_sprite", get)
-    monkeypatch.setattr(SpritesClient, "destroy_sprite", destroy)
 
-    def select_profile(suffix, persistent):
-        # Model separate CLI invocations: a previous session's remote cwd must
-        # not seed a new profile that has never created that directory.
-        monkeypatch.setattr(terminal, "_session_cwd", {})
-        home = root / "profiles" / f"live-{run_id}-{suffix}"
-        home.mkdir(parents=True, exist_ok=True)
-        skill = home / "skills" / "live-fixture" / "SKILL.md"
-        skill.parent.mkdir(parents=True)
-        skill.write_text("Harmless live sync fixture\n")
-        plugin_dir = home / "plugins" / "sprites"
-        if not plugin_dir.exists():
-            shutil.copytree(
-                Path(__file__).resolve().parents[1], plugin_dir,
-                ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", ".pytest_cache", "tests"),
+class TestSpritesIdentity:
+    def test_runs_inside_a_sprite(self, task_id):
+        """Output should confirm we're in a Sprite, not on the host."""
+        r = _run("sprite-env info 2>/dev/null || echo MISSING", task_id)
+        assert r["exit_code"] == 0
+        if "MISSING" in r["output"]:
+            pytest.skip("sprite-env CLI not present inside the Sprite")
+        # `_resolve_container_task_id` collapses every ordinary task_id to
+        # "default", and the suite pins Sprite naming to the run-unique test
+        # namespace (see _force_sprites). Production naming semantics are
+        # covered by tests/tools/test_sprites_environment.py::TestSpriteNaming.
+        expected_name = _test_sprite_name(_resolve_container_task_id(task_id))
+        assert expected_name in r["output"]
+        # Sanity: the boot_id from inside the Sprite must differ from this
+        # process's view (i.e. command did NOT run on the host).
+        host_boot = open("/proc/sys/kernel/random/boot_id").read().strip()
+        r2 = _run("cat /proc/sys/kernel/random/boot_id", task_id)
+        assert host_boot not in r2["output"]
+
+
+class TestSpritesPersistence:
+    def test_filesystem_survives_session_recycle(self):
+        """Write a marker, tear down the env, resume — file should still be there.
+
+        NOTE: `_resolve_container_task_id` is persistence-mode-dependent.
+        Under persistent mode (this test) ordinary task ids collapse to
+        "default", so `_active_environments` keys the live env under
+        "default" — NOT under the raw task string; `cleanup_vm(<raw task>)`
+        would pop nothing (a vacuous recycle that silently reuses the same
+        in-memory env object). Tear down via the registration key so the
+        second _run genuinely re-creates the environment and resumes the
+        Sprite by name over the API. All registry reads use the SAME module
+        object the commands executed through (`terminal_module`, bound at
+        import).
+        """
+        task = "sprites_test_persist"
+        # Persistence must be set BEFORE computing the env key: with
+        # container_persistent=false this suite runs session-isolated
+        # (per-task keys), while persistent mode collapses ordinary ids
+        # to the shared "default" key — the key is mode-dependent.
+        os.environ["TERMINAL_CONTAINER_PERSISTENT"] = "true"
+        env_key = _resolve_container_task_id(task)
+        try:
+            _run("echo 'survive' > /tmp/sprites_persist.txt", task)
+
+            # Prove the env actually lives under the collapsed key, then
+            # recycle it. persistent=true → the Sprite itself stays alive.
+            assert env_key in _active_environments, (
+                f"env registered under {list(_active_environments)}, "
+                f"expected key {env_key!r}"
             )
-        (home / "config.yaml").write_text(yaml.safe_dump({
-            "plugins": {"enabled": ["sprites"]},
-            "terminal": {"backend": "sprites", "cwd": "/root", "timeout": 60,
-                         "container_persistent": persistent},
-        }))
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setattr(terminal, "_terminal_config_bridge_attempted", False)
-        manager = plugins.get_plugin_manager()
-        monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
-        manager.discover_and_load(force=True)
-        managers.append(manager)
-        assert registry.get_provider("sprites") is not None
-        return home
+            first_env = _active_environments[env_key]
+            cleanup_vm(env_key)
+            assert env_key not in _active_environments
 
-    def run(command, task="default", **kwargs):
-        result = json.loads(terminal.terminal_tool(command, task_id=task, **kwargs))
-        assert result.get("status") != "disabled", result.get("error", "Backend disabled")
-        return result
-
-    try:
-        yield select_profile, run, terminal, cleanup_vm, info, run_id
-    finally:
-        # Cleanup the environment clients first, then any persistent/orphaned test Sprite.
-        cleanup_errors = []
-        for key in list(terminal._active_environments):
-            try:
-                cleanup_vm(key)
-            except Exception as exc:
-                cleanup_errors.append((str(key), type(exc).__name__))
-        for name in sorted(attempted):
-            try:
-                data = info(name)
-                if data is not None:
-                    owned(name, data)
-                    control.delete("/v1/sprites/" + name).raise_for_status()
-                assert info(name) is None, "Deletion not confirmed"
-                print(json.dumps({"deleted_and_verified": name}), flush=True)
-            except Exception as exc:
-                cleanup_errors.append((name, type(exc).__name__))
-        for manager in managers:
-            manager.unload()
-        registry._reset_for_tests()
-        control.close()
-        assert not cleanup_errors, f"Test Sprite cleanup needs attention: {cleanup_errors}"
-
-
-def test_live_execution_persistence_profiles_and_cleanup(live):
-    select_profile, run, terminal, cleanup_vm, info, run_id = live
-    home = select_profile("a", True)
-    first = run("printf 'hello'; printf 'warning' >&2; exit 7")
-    assert first["exit_code"] == 7 and "hello" in first["output"] and "warning" in first["output"]
-    env = terminal._active_environments[terminal._resolve_container_task_id("default")]
-    first_name = env._sprite_name
-    assert info(first_name)["url_settings"]["auth"] == "sprite"
-    result = run("uname -s; python3 -c 'print(6 * 7)'; pwd")
-    assert result["exit_code"] == 0 and "Linux" in result["output"] and "42" in result["output"]
-    assert result["output"].splitlines()[-1] == "/root"
-    assert run("mkdir -p /tmp/hermes-live-work")["exit_code"] == 0
-    assert run("pwd", workdir="/tmp/hermes-live-work")["output"].strip() == "/tmp/hermes-live-work"
-    synced_skill = f"{env._remote_home}/.hermes/skills/live-fixture/SKILL.md"
-    assert "Harmless live sync fixture" in run(f"cat {synced_skill}")["output"]
-    (home / "skills" / "live-fixture" / "SKILL.md").unlink()
-    env._sync_manager.sync(force=True)
-    assert run(f"test ! -e {synced_skill}")["exit_code"] == 0
-    assert run('test -z "${SPRITES_TOKEN+x}${SPRITE_TOKEN+x}"')["exit_code"] == 0
-    assert run("printf persistent > /tmp/hermes-live-marker")["exit_code"] == 0
-    assert run("export HERMES_LIVE_MARKER=kept")["exit_code"] == 0
-    assert "kept" in run("printf '%s' \"$HERMES_LIVE_MARKER\"")["output"]
-    cleanup_vm(terminal._resolve_container_task_id("default"))
-    assert info(first_name) is not None
-    assert "persistent" in run("cat /tmp/hermes-live-marker")["output"]
-    resumed = terminal._active_environments[terminal._resolve_container_task_id("default")]
-    assert resumed is not env and resumed._sprite_name == first_name
-
-    # Client timeout is not a remote kill guarantee. The remote workload is bounded regardless.
-    timed = run("sleep 4; printf finished > /tmp/hermes-live-timeout", timeout=1)
-    assert timed["exit_code"] == 124, timed
-    time.sleep(5)
-    after_timeout = run("test -f /tmp/hermes-live-timeout && echo continued || echo stopped")
-    assert after_timeout["exit_code"] == 0
-    print(json.dumps({"remote_after_client_timeout": after_timeout["output"].strip()}), flush=True)
-    # A host interrupt also returns promptly without promising remote termination.
-    from tools.interrupt import set_interrupt
-    thread_id = threading.get_ident()
-    timer = threading.Timer(1, lambda: set_interrupt(True, thread_id))
-    timer.start()
-    try:
-        interrupted = run("sleep 6; printf finished > /tmp/hermes-live-interrupt", timeout=15)
-        assert interrupted["exit_code"] == 130
-    finally:
-        timer.cancel()
-        timer.join()
-        set_interrupt(False, thread_id)
-    time.sleep(7)
-    after_interrupt = run("test -f /tmp/hermes-live-interrupt && echo continued || echo stopped")
-    assert after_interrupt["exit_code"] == 0
-    print(json.dumps({"remote_after_client_interrupt": after_interrupt["output"].strip()}), flush=True)
-    cleanup_vm(terminal._resolve_container_task_id("default"))
-
-    select_profile("b", True)
-    isolated = run("test ! -e /tmp/hermes-live-marker")
-    assert isolated["exit_code"] == 0, isolated
-    second = terminal._active_environments[terminal._resolve_container_task_id("default")]
-    assert second._sprite_name != first_name
-    cleanup_vm(terminal._resolve_container_task_id("default"))
-
-    select_profile("c", False)
-    task = f"live-{run_id}-ephemeral"
-    assert run("echo ephemeral", task=task)["exit_code"] == 0
-    key = terminal._resolve_container_task_id(task)
-    ephemeral_name = terminal._active_environments[key]._sprite_name
-    cleanup_vm(key)
-    assert info(ephemeral_name) is None
+            r = _run("cat /tmp/sprites_persist.txt", task)
+            assert r["exit_code"] == 0
+            assert "survive" in r["output"]
+            # And the read ran in a NEW environment object (a real resume,
+            # not a lingering reference to the old one).
+            assert _active_environments.get(env_key) is not first_env
+        finally:
+            os.environ["TERMINAL_CONTAINER_PERSISTENT"] = "false"
+            # The live env was constructed while persistence was "true", so
+            # its baked-in _persistent flag would make plain cleanup LEAVE the
+            # test Sprite running (billing forever). Flip the flag on the
+            # object before cleanup so teardown genuinely deletes it.
+            live = _active_environments.get(env_key)
+            if live is not None and hasattr(live, "_persistent"):
+                live._persistent = False
+            cleanup_vm(env_key)

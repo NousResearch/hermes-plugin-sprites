@@ -21,10 +21,12 @@ import threading
 import uuid
 from pathlib import Path
 
-from tools.environments.base import (
-    BaseEnvironment,
-    _ThreadedProcessHandle,
-)
+from tools.environments.base import BaseEnvironment
+
+try:  # hermes-agent >= v0.21.4 (Sep 2026 decomposition moved it)
+    from tools.environments.base_output import _ThreadedProcessHandle
+except ImportError:  # older hermes-agent kept it in base
+    from tools.environments.base import _ThreadedProcessHandle
 from tools.environments.file_sync import (
     FileSyncManager,
     iter_sync_files,
@@ -215,11 +217,15 @@ class SpritesEnvironment(BaseEnvironment):
 
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("terminal.sprites", prompt=False)
+            try:
+                _lazy_ensure("terminal.sprites", prompt=False)
+            except Exception:
+                # 'terminal.sprites' is not (yet) in hermes' LAZY_DEPS
+                # allowlist; ensure() is only a convenience installer, so
+                # fall through — the SDK import below is authoritative.
+                pass
         except ImportError:
             pass
-        except Exception as e:
-            raise ImportError(str(e))
 
         from sprites import SpritesClient
         from sprites.exceptions import NotFoundError, SpriteError

@@ -5,3 +5,5 @@ author: Kyle McLaren (@kylemclaren) / Nous Research
 kind: backend
 requires_env:
   - SPRITES_TOKEN
+python_dependencies:
+  - sprites-py>=0.5.0,<0.6

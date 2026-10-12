@@ -1166,3 +1166,99 @@ class TestProviderSettings:
         assert fields["scope"]["type"] == "enum"
         assert fields["scope"]["choices"] == ["session", "instance"]
         assert fields["scope"]["value"] == "session"
+
+    @pytest.mark.parametrize("reader", ["context", "fallback"])
+    def test_unreadable_config_refuses_to_create(self, monkeypatch, isolated_home, reader):
+        """Core serves fallback values for a malformed config.yaml; never name Sprites from them."""
+        pytest.importorskip("hermes_cli.config_read_errors")
+        import __init__ as plugin_pkg
+        captured = self._capture(monkeypatch)
+        (isolated_home / "config.yaml").write_text(
+            "plugins:\n  entries:\n    sprites:\n      settings:\n"
+            "        name_prefix: hc-abc123\n        scope: [instance\n"
+        )
+        if reader == "context":
+            from hermes_cli.config import load_config_readonly
+
+            def _ctx_get_config(key, default=None):
+                entry = (load_config_readonly().get("plugins", {}).get("entries", {})
+                         .get("sprites", {}).get("settings", {}))
+                return entry.get(key, default)
+            provider = plugin_pkg.SpritesProvider(get_config=_ctx_get_config)
+        else:
+            provider = plugin_pkg.SpritesProvider()
+        with pytest.raises(RuntimeError, match="config.yaml could not be read"):
+            provider.create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured == {}
+        row = [r for r in provider.doctor_checks() if r[1] == "Sprites naming"][0]
+        assert row[0] is False
+
+    def test_config_broken_after_good_load_refuses(self, monkeypatch, isolated_home):
+        """A last-known-good fallback (here: no prefix) must not be used either."""
+        pytest.importorskip("hermes_cli.config_read_errors")
+        import __init__ as plugin_pkg
+        captured = self._capture(monkeypatch)
+        cfg = isolated_home / "config.yaml"
+        cfg.write_text(json.dumps({"terminal": {"backend": "sprites"}}))
+        provider = plugin_pkg.SpritesProvider()
+        provider.create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["name_prefix"] is None
+        captured.clear()
+        cfg.write_text(
+            "terminal: {backend: sprites}\nplugins:\n  entries:\n    sprites:\n"
+            "      settings: {name_prefix: hc-abc123, scope: [instance}\n"
+        )
+        with pytest.raises(RuntimeError, match="config.yaml could not be read"):
+            provider.create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured == {}
+
+
+class TestSharedSpriteFileSync:
+    """Environments resuming one Sprite must not leave an older file copy behind."""
+
+    def test_concurrent_sync_keeps_newest_file(self, make_env, monkeypatch, tmp_path):
+        import threading
+        import sprites_environment as se
+
+        host = tmp_path / "credential.json"
+        host.write_bytes(b"old credential")
+        remote_path = "/home/sprite/.hermes/credential.json"
+        monkeypatch.setattr(se, "iter_sync_files", lambda _root: [(str(host), remote_path)])
+        monkeypatch.setattr(
+            "tools.environments.file_sync._credential_host_paths", lambda: set(), raising=False)
+
+        remote = {}
+        a_uploading = threading.Event()
+        release_a = threading.Event()
+
+        def _upload(self, host_path, rp):
+            data = Path(host_path).read_bytes()
+            if self._task_id == "a":
+                a_uploading.set()
+                assert release_a.wait(10)
+            remote[rp] = data
+
+        monkeypatch.setattr(se.SpritesEnvironment, "_sprite_upload", _upload)
+        errors = []
+
+        def _build(task):
+            try:
+                make_env(task_id=task, name_prefix="hc-abc123", scope="instance",
+                         sprite=_make_sprite("hc-abc123-default"))
+            except BaseException as e:  # surfaced below
+                errors.append(e)
+
+        a = threading.Thread(target=_build, args=("a",))
+        a.start()
+        assert a_uploading.wait(10)
+        # A has read the old bytes and is mid-upload; the host file changes and
+        # B starts its own first sync of the same Sprite.
+        host.write_bytes(b"new credential version")
+        b = threading.Thread(target=_build, args=("b",))
+        b.start()
+        b.join(1.0)
+        release_a.set()
+        a.join(10)
+        b.join(10)
+        assert not errors, errors
+        assert remote[remote_path] == b"new credential version"

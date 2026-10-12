@@ -126,6 +126,41 @@ def _require_within_prefix(name: str, prefix: str | None) -> None:
         )
 
 
+#: One sync lock per Sprite name, shared by every environment in this process
+#: that targets that Sprite (see ``_SharedSpriteSyncManager``).
+_SYNC_LOCKS: dict[str, threading.Lock] = {}
+_SYNC_LOCKS_GUARD = threading.Lock()
+
+
+def _shared_sync_lock(sprite_name: str) -> threading.Lock:
+    with _SYNC_LOCKS_GUARD:
+        return _SYNC_LOCKS.setdefault(sprite_name, threading.Lock())
+
+
+class _SharedSpriteSyncManager(FileSyncManager):
+    """File sync whose transactions are serialised per Sprite, not per environment.
+
+    Several environments can resume one Sprite (``scope: instance`` does so
+    for every session; ``delegate_task`` children always have). Each keeps
+    its own sync history, but they all write the same remote paths. With
+    only per-manager locks, one environment can upload an old copy of a file
+    after another uploaded the newer one, and neither retries because each
+    history says its own upload succeeded. Holding a lock shared by every
+    manager of the same Sprite around the whole transaction makes each
+    upload read the host file after the previous upload finished, so the
+    last write is always the newest content. (Environments in other
+    processes are not covered.)
+    """
+
+    def __init__(self, *args, shared_lock: threading.Lock, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._shared_lock = shared_lock
+
+    def sync(self, *, force: bool = False) -> None:
+        with self._shared_lock:
+            super().sync(force=force)
+
+
 def _collapse_slug(value: str) -> str:
     """Plain DNS-safe collapse: lowercase, non-alnum runs become one hyphen."""
     return re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
@@ -405,10 +440,11 @@ class SpritesEnvironment(BaseEnvironment):
             pass
 
         self._fs = self._sprite.filesystem("/")
-        self._sync_manager = FileSyncManager(
+        self._sync_manager = _SharedSpriteSyncManager(
             get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
             upload_fn=self._sprite_upload,
             delete_fn=self._sprite_delete,
+            shared_lock=_shared_sync_lock(sprite_name),
         )
         self._sync_manager.sync(force=True)
         self.init_session()

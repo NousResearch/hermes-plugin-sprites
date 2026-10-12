@@ -39,6 +39,26 @@ _PLUGIN_ID = "sprites"
 _SETTING_KEYS = ("name_prefix", "scope")
 
 
+def _config_read_error() -> Optional[BaseException]:
+    """The error behind core's fallback config, or ``None`` when config.yaml read cleanly.
+
+    When config.yaml cannot be parsed, core serves a fallback (the last good
+    copy, or the defaults) instead of raising. Plugin settings taken from that
+    fallback may be missing a ``name_prefix`` the operator just configured, so
+    the caller must refuse rather than name Sprites from it. Hermes releases
+    without the fallback marker have nothing to detect and return ``None``.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_read_errors import FailedConfigRead
+    except ImportError:
+        return None
+    config = load_config_readonly()
+    if isinstance(config, FailedConfigRead):
+        return getattr(config, "read_error", None) or RuntimeError("unreadable config.yaml")
+    return None
+
+
 def _read_setting_from_config(key: str, default: Any = None) -> Any:
     """Read ``plugins.entries.sprites.settings.<key>`` straight from config.yaml.
 
@@ -102,12 +122,24 @@ class SpritesProvider(TerminalEnvironmentProvider):
         self._get_config = get_config or _read_setting_from_config
 
     def _naming_settings(self) -> tuple:
-        """Validated ``(name_prefix, scope)``; raises ``ValueError`` if invalid."""
+        """Validated ``(name_prefix, scope)``.
+
+        Raises ``ValueError`` for an invalid value and ``RuntimeError`` when
+        config.yaml could not be read (core then serves fallback values).
+        """
         if __package__:
             from .sprites_environment import resolve_naming_settings
         else:
             from sprites_environment import resolve_naming_settings
         raw = {key: self._get_config(key, None) for key in _SETTING_KEYS}
+        # Checked after the reads, so a config that broke mid-read is caught too.
+        read_error = _config_read_error()
+        if read_error is not None:
+            raise RuntimeError(
+                "Sprites backend refused to start: config.yaml could not be read "
+                f"({read_error}), so its plugin settings (name_prefix, scope) "
+                "cannot be trusted. Fix config.yaml (`hermes config check`)."
+            )
         return resolve_naming_settings(raw["name_prefix"], raw["scope"])
 
     @property

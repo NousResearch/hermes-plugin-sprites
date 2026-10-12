@@ -45,11 +45,13 @@ neither set, behaviour and Sprite names are exactly as described above.
 | Key | Values | Effect |
 |---|---|---|
 | `name_prefix` | lowercase letters, digits and single hyphens; max 40 chars | Every Sprite name starts with `<prefix>-` instead of `hermes-`: `<prefix>-{task}` on the default profile, `<prefix>-{display}-{digest12}` on named profiles, `<prefix>-eph-{task}-{nonce}` for ephemeral runs. The prefix is never truncated, and the plugin refuses to create or resume any Sprite outside it. |
-| `scope` | `session` (default) \| `instance` | `instance` makes every task id on a profile (gateway sessions, cron jobs, `delegate_task` children, CLI) resume the same persistent Sprite: `<prefix>-default` (or `hermes-default` without a prefix) on the default profile, the usual digest-scoped `-default` name on a named profile. Each session still gets its own shell; they share the VM and filesystem. |
+| `scope` | `session` (default) \| `instance` | `instance` makes every task id on a profile (gateway sessions, cron jobs, `delegate_task` children, CLI) resume the same persistent Sprite: `<prefix>-default` (or `hermes-default` without a prefix) on the default profile, the usual digest-scoped `-default` name on a named profile. Each session still gets its own shell; they share the VM and filesystem (file sync into the Sprite is serialised across sessions in one process). |
 
 An invalid value for either key is an error, not a fallback: the backend
 refuses to start and `hermes doctor` shows the reason on its "Sprites naming"
-row. Ignoring a bad prefix would create Sprites outside the namespace you meant
+row. The same happens when config.yaml itself cannot be parsed, because Hermes
+then runs on a fallback copy of the config that may not contain the settings
+you just wrote. Ignoring a bad prefix would create Sprites outside the namespace you meant
 to confine this install to; ignoring a misspelt scope would quietly start
 creating one Sprite per session.
 
@@ -73,8 +75,10 @@ That install's only Sprite is then `hc-<instance-id>-default`, so its
 lifecycle (resume after a restart, delete when the instance is deleted) is one
 deterministic name. Notes:
 
-- Use a prefix that is not purely digits: `hermes config set` stores `123` as a
-  number, which the plugin rejects.
+- Use a prefix like `hc-<id>`. `hermes config set` parses YAML scalars, so
+  values such as `123`, `1e3`, `true` or `off` are stored as numbers/booleans
+  (the plugin rejects them), and `null` / `none` clear the setting (the
+  default `hermes-*` names come back).
 - A prefix is a plain string prefix, so in `session` scope install `hc-a` can
   produce a name inside another install's `hc-a-b-` namespace (task id
   `b-...`). Use fixed-length ids, or `instance` scope (whose only name is
@@ -95,8 +99,11 @@ cd /path/to/hermes-agent
 scripts/run_tests.sh /path/to/hermes-plugin-sprites/tests/test_sprites_environment.py
 ```
 
-The tests import Hermes from the checkout you run them in (or from
-`HERMES_AGENT_REPO` when set, or `~/.hermes/hermes-agent` as a last resort).
+Through `scripts/run_tests.sh`, the tests import Hermes from the checkout you
+run them in (the runner clears the environment, so `HERMES_AGENT_REPO` does not
+reach them). When invoking pytest some other way, `HERMES_AGENT_REPO` selects
+the checkout if set; otherwise the current directory is used if it is a Hermes
+checkout, then `~/.hermes/hermes-agent`.
 Keep this plugin's clone outside the Hermes checkout and outside any other
 clone of this repo, or pytest also loads that other copy's `conftest.py`.
 

@@ -10,6 +10,11 @@ Install into ``~/.hermes/plugins/sprites/`` and enable via
     hermes config set terminal.backend sprites
     # SPRITES_TOKEN in ~/.hermes/.env (get one with `sprite login`)
 
+Optional settings (``plugins.entries.sprites.settings.*`` in config.yaml):
+``name_prefix`` confines every Sprite name to ``<prefix>-*`` and ``scope``
+(``session`` | ``instance``) chooses one Sprite per task id or one per
+profile. See README.md.
+
 Attribution: the Sprites environment was authored by Kyle McLaren
 (@kylemclaren, Fly.io) as hermes-agent PR #30112 and hardened through the
 #93523 salvage review (identity digests, DNS bounds, fail-closed profile
@@ -21,11 +26,34 @@ from __future__ import annotations
 
 import importlib.util
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from agent.terminal_env_provider import TerminalEnvironmentProvider
 
 _SPRITES_SPEC = "sprites-py>=0.5.0,<0.6"
+
+#: Manifest name; the settings namespace when no plugin context is available.
+_PLUGIN_ID = "sprites"
+
+#: Plugin settings this backend reads (``plugins.entries.<id>.settings.<key>``).
+_SETTING_KEYS = ("name_prefix", "scope")
+
+
+def _read_setting_from_config(key: str, default: Any = None) -> Any:
+    """Read ``plugins.entries.sprites.settings.<key>`` straight from config.yaml.
+
+    Used only when the provider was built without a plugin context (direct
+    construction). Errors propagate: settings that cannot be read must not be
+    treated as unset, or a configured prefix would be silently dropped.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    node: Any = load_config_readonly() or {}
+    for part in ("plugins", "entries", _PLUGIN_ID, "settings", key):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
 
 
 def _sdk_installed() -> bool:
@@ -65,6 +93,22 @@ class SpritesProvider(TerminalEnvironmentProvider):
     # a shared deterministic name would let two independent ephemeral runs
     # attach one live VM and delete it out from under each other (#82731).
     session_isolated_when_nonpersistent = True
+
+    def __init__(self, get_config: Optional[Callable[[str, Any], Any]] = None):
+        # ``get_config`` is ``PluginContext.get_config`` when registered by the
+        # plugin loader: it reads this plugin's settings namespace live from
+        # config.yaml on every call, so a changed setting applies to the next
+        # environment without a restart.
+        self._get_config = get_config or _read_setting_from_config
+
+    def _naming_settings(self) -> tuple:
+        """Validated ``(name_prefix, scope)``; raises ``ValueError`` if invalid."""
+        if __package__:
+            from .sprites_environment import resolve_naming_settings
+        else:
+            from sprites_environment import resolve_naming_settings
+        raw = {key: self._get_config(key, None) for key in _SETTING_KEYS}
+        return resolve_naming_settings(raw["name_prefix"], raw["scope"])
 
     @property
     def description(self) -> str:
@@ -153,6 +197,16 @@ class SpritesProvider(TerminalEnvironmentProvider):
             "Sprite stays alive across sessions; its ext4 filesystem is the authoritative store"
             if persistent else "Sprite is deleted on cleanup (ephemeral)",
         ))
+        try:
+            prefix, scope = self._naming_settings()
+        except Exception as e:
+            rows.append((False, "Sprites naming", f"(invalid plugin settings: {e})"))
+        else:
+            rows.append((
+                True,
+                "Sprites naming",
+                f"prefix {prefix + '-*' if prefix else 'hermes-* (default)'}, scope {scope}",
+            ))
         return rows
 
     def create_environment(self, *, cwd, timeout, task_id="default",
@@ -165,13 +219,20 @@ class SpritesProvider(TerminalEnvironmentProvider):
             from sprites_environment import SpritesEnvironment
 
         cc = container_config or {}
+        name_prefix, scope = self._naming_settings()
         return SpritesEnvironment(
             cwd=cwd,
             timeout=timeout,
             persistent_filesystem=cc.get("container_persistent", True),
             task_id=task_id,
+            name_prefix=name_prefix,
+            scope=scope,
         )
 
 
 def register(ctx):
-    ctx.register_terminal_environment_provider(SpritesProvider())
+    # Read settings through the plugin context so they come from this
+    # plugin's own namespace (``plugins.entries.<plugin_id>.settings``).
+    ctx.register_terminal_environment_provider(
+        SpritesProvider(get_config=getattr(ctx, "get_config", None))
+    )

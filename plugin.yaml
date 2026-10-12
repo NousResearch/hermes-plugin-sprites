@@ -7,3 +7,21 @@ requires_env:
   - SPRITES_TOKEN
 python_dependencies:
   - sprites-py>=0.5.0,<0.6
+# Optional settings, read from plugins.entries.sprites.settings in config.yaml.
+config_schema:
+  name_prefix:
+    type: str
+    label: Sprite name prefix
+    description: >-
+      Every Sprite name starts with "<prefix>-" instead of "hermes-" (lowercase
+      letters, digits and single hyphens, at most 40 characters). Unset keeps
+      the original hermes-* names. An invalid value refuses to start the backend.
+  scope:
+    type: str
+    label: Sprite scope
+    description: >-
+      "session" (default) gives each session its own persistent Sprite;
+      "instance" shares one persistent Sprite per profile across every
+      session, cron job and subagent.
+    choices: [session, instance]
+    default: session

@@ -24,8 +24,8 @@ chmod 600 ~/.hermes/.env
 ```
 
 `hermes doctor` checks token/SDK availability, not command execution. Compatibility
-is tested against Hermes `v2026.8.31` and `v2026.9.7` using real plugin discovery
-and terminal dispatch with mocked SDK transport.
+is tested against Hermes `v2026.8.31`, `v2026.9.7` and `v0.21.7` using real plugin
+discovery and terminal dispatch with mocked SDK transport.
 
 ## Behavior
 
@@ -36,6 +36,56 @@ and terminal dispatch with mocked SDK transport.
 - **Sharing model:** gateway/WebUI sessions each get their own Sprite; `delegate_task` children share their parent's; key-less flows (CLI, cron) share the profile-default Sprite.
 - `SPRITES_TOKEN` / `SPRITE_TOKEN` are stripped from every subprocess the agent spawns.
 
+## Settings
+
+Two optional settings live in the plugin's own namespace in `config.yaml`,
+`plugins.entries.sprites.settings` (they also appear in the Plugins hub). With
+neither set, behaviour and Sprite names are exactly as described above.
+
+| Key | Values | Effect |
+|---|---|---|
+| `name_prefix` | lowercase letters, digits and single hyphens; max 40 chars | Every Sprite name starts with `<prefix>-` instead of `hermes-`: `<prefix>-{task}` on the default profile, `<prefix>-{display}-{digest12}` on named profiles, `<prefix>-eph-{task}-{nonce}` for ephemeral runs. The prefix is never truncated, and the plugin refuses to create or resume any Sprite outside it. |
+| `scope` | `session` (default) \| `instance` | `instance` makes every task id on a profile (gateway sessions, cron jobs, `delegate_task` children, CLI) resume the same persistent Sprite: `<prefix>-default` (or `hermes-default` without a prefix) on the default profile, the usual digest-scoped `-default` name on a named profile. Each session still gets its own shell; they share the VM and filesystem. |
+
+An invalid value for either key is an error, not a fallback: the backend
+refuses to start and `hermes doctor` shows the reason on its "Sprites naming"
+row. Ignoring a bad prefix would create Sprites outside the namespace you meant
+to confine this install to; ignoring a misspelt scope would quietly start
+creating one Sprite per session.
+
+`scope` only affects persistent Sprites. Ephemeral mode
+(`terminal.container_persistent: false`) keeps its run-unique names under either
+scope, so two runs never share a VM.
+
+### One Sprite per hosted instance
+
+When several Hermes installs share one Sprites organization (for example one
+hosted instance per customer), give each install its own prefix and the
+`instance` scope, so each install owns exactly one Sprite and can never resume
+another install's:
+
+```bash
+hermes config set plugins.entries.sprites.settings.name_prefix hc-<instance-id>
+hermes config set plugins.entries.sprites.settings.scope instance
+```
+
+That install's only Sprite is then `hc-<instance-id>-default`, so its
+lifecycle (resume after a restart, delete when the instance is deleted) is one
+deterministic name. Notes:
+
+- Use a prefix that is not purely digits: `hermes config set` stores `123` as a
+  number, which the plugin rejects.
+- A prefix is a plain string prefix, so in `session` scope install `hc-a` can
+  produce a name inside another install's `hc-a-b-` namespace (task id
+  `b-...`). Use fixed-length ids, or `instance` scope (whose only name is
+  `<prefix>-default`), to keep installs disjoint.
+- The prefix confines what this plugin does; it is not an access control. The
+  `SPRITES_TOKEN` on the machine decides what the machine can reach, so scope
+  the token to the same prefix where Sprites lets you.
+- Changing either setting changes which Sprite is resumed. The previous
+  Sprite is not deleted; remove it with the Sprites CLI or API if you no longer
+  need its files.
+
 ## Tests
 
 ```bash
@@ -44,6 +94,11 @@ and terminal dispatch with mocked SDK transport.
 cd /path/to/hermes-agent
 scripts/run_tests.sh /path/to/hermes-plugin-sprites/tests/test_sprites_environment.py
 ```
+
+The tests import Hermes from the checkout you run them in (or from
+`HERMES_AGENT_REPO` when set, or `~/.hermes/hermes-agent` as a last resort).
+Keep this plugin's clone outside the Hermes checkout and outside any other
+clone of this repo, or pytest also loads that other copy's `conftest.py`.
 
 The legacy `tests/test_sprites_terminal_live.py` still assumes the pre-plugin
 Hermes layout and is not a supported standalone live-test recipe. Its rewrite

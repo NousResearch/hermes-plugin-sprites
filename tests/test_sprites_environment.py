@@ -1086,7 +1086,7 @@ class TestPrefixAndScopeInEnvironment:
 
 
 class TestProviderSettings:
-    """The provider reads plugins.entries.sprites.settings and passes them on."""
+    """The provider reads plugins.entries.<id>.settings and passes them on."""
 
     @staticmethod
     def _capture(monkeypatch):
@@ -1100,23 +1100,36 @@ class TestProviderSettings:
         monkeypatch.setattr(sprites_mod, "SpritesEnvironment", _FakeSpritesEnv)
         return captured
 
-    def test_context_reader_is_used(self, monkeypatch):
+    @staticmethod
+    def _write_settings(home, settings, plugin_id="sprites", subtree="settings"):
+        (home / "config.yaml").write_text(json.dumps({
+            "plugins": {"entries": {plugin_id: {subtree: settings}}},
+        }))
+
+    def test_settings_from_config_yaml(self, monkeypatch, isolated_home):
         import __init__ as plugin_pkg
         captured = self._capture(monkeypatch)
-        settings = {"name_prefix": "hc-abc123", "scope": "instance"}
-        provider = plugin_pkg.SpritesProvider(get_config=lambda k, d=None: settings.get(k, d))
-        provider.create_environment(cwd="/root", timeout=60, task_id="t")
-        assert captured["name_prefix"] == "hc-abc123"
+        self._write_settings(isolated_home, {"name_prefix": "hc-file", "scope": "instance"})
+        plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["name_prefix"] == "hc-file"
         assert captured["scope"] == "instance"
 
-    def test_register_wires_context_reader(self, monkeypatch):
+    def test_legacy_config_subtree_is_honoured(self, monkeypatch, isolated_home):
+        """Same lookup order as PluginContext.get_config (settings, then config)."""
         import __init__ as plugin_pkg
         captured = self._capture(monkeypatch)
+        self._write_settings(isolated_home, {"name_prefix": "hc-legacy"}, subtree="config")
+        plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["name_prefix"] == "hc-legacy"
+
+    def test_register_uses_loader_plugin_id(self, monkeypatch, isolated_home):
+        import __init__ as plugin_pkg
+        captured = self._capture(monkeypatch)
+        self._write_settings(isolated_home, {"name_prefix": "hc-ctx"}, plugin_id="sprites-dev")
         registered = []
 
         class _Ctx:
-            def get_config(self, key, default=None):
-                return {"name_prefix": "hc-ctx"}.get(key, default)
+            plugin_id = "sprites-dev"
 
             def register_terminal_environment_provider(self, provider):
                 registered.append(provider)
@@ -1126,35 +1139,21 @@ class TestProviderSettings:
         assert captured["name_prefix"] == "hc-ctx"
         assert captured["scope"] == "session"
 
-    def test_fallback_reads_config_yaml(self, monkeypatch, isolated_home):
+    def test_invalid_setting_refuses_to_create(self, monkeypatch, isolated_home):
         import __init__ as plugin_pkg
         captured = self._capture(monkeypatch)
-        (isolated_home / "config.yaml").write_text(json.dumps({
-            "plugins": {"entries": {"sprites": {"settings": {
-                "name_prefix": "hc-file", "scope": "instance",
-            }}}},
-        }))
-        plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
-        assert captured["name_prefix"] == "hc-file"
-        assert captured["scope"] == "instance"
-
-    def test_invalid_setting_refuses_to_create(self, monkeypatch):
-        import __init__ as plugin_pkg
-        captured = self._capture(monkeypatch)
-        provider = plugin_pkg.SpritesProvider(
-            get_config=lambda k, d=None: {"name_prefix": "Not Valid"}.get(k, d))
+        self._write_settings(isolated_home, {"name_prefix": "Not Valid"})
         with pytest.raises(ValueError, match="name_prefix"):
-            provider.create_environment(cwd="/root", timeout=60, task_id="t")
+            plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
         assert captured == {}
 
-    def test_doctor_reports_naming(self):
+    def test_doctor_reports_naming(self, isolated_home):
         import __init__ as plugin_pkg
-        ok = plugin_pkg.SpritesProvider(
-            get_config=lambda k, d=None: {"name_prefix": "hc-abc123", "scope": "instance"}.get(k, d))
-        row = [r for r in ok.doctor_checks() if r[1] == "Sprites naming"][0]
+        self._write_settings(isolated_home, {"name_prefix": "hc-abc123", "scope": "instance"})
+        row = [r for r in plugin_pkg.SpritesProvider().doctor_checks() if r[1] == "Sprites naming"][0]
         assert row[0] is True and "hc-abc123-*" in row[2] and "instance" in row[2]
-        bad = plugin_pkg.SpritesProvider(get_config=lambda k, d=None: {"scope": "x"}.get(k, d))
-        row = [r for r in bad.doctor_checks() if r[1] == "Sprites naming"][0]
+        self._write_settings(isolated_home, {"scope": "x"})
+        row = [r for r in plugin_pkg.SpritesProvider().doctor_checks() if r[1] == "Sprites naming"][0]
         assert row[0] is False and "scope" in row[2]
 
     def test_manifest_declares_settings_for_plugins_hub(self):
@@ -1167,26 +1166,19 @@ class TestProviderSettings:
         assert fields["scope"]["choices"] == ["session", "instance"]
         assert fields["scope"]["value"] == "session"
 
-    @pytest.mark.parametrize("reader", ["context", "fallback"])
-    def test_unreadable_config_refuses_to_create(self, monkeypatch, isolated_home, reader):
-        """Core serves fallback values for a malformed config.yaml; never name Sprites from them."""
-        pytest.importorskip("hermes_cli.config_read_errors")
-        import __init__ as plugin_pkg
-        captured = self._capture(monkeypatch)
-        (isolated_home / "config.yaml").write_text(
-            "plugins:\n  entries:\n    sprites:\n      settings:\n"
-            "        name_prefix: hc-abc123\n        scope: [instance\n"
-        )
-        if reader == "context":
-            from hermes_cli.config import load_config_readonly
+    _BROKEN = (
+        "plugins:\n  entries:\n    sprites:\n      settings:\n"
+        "        name_prefix: hc-abc123\n        scope: [instance\n"
+    )
 
-            def _ctx_get_config(key, default=None):
-                entry = (load_config_readonly().get("plugins", {}).get("entries", {})
-                         .get("sprites", {}).get("settings", {}))
-                return entry.get(key, default)
-            provider = plugin_pkg.SpritesProvider(get_config=_ctx_get_config)
-        else:
-            provider = plugin_pkg.SpritesProvider()
+    def test_unreadable_config_refuses_to_create(self, monkeypatch, isolated_home):
+        """Core serves fallback values for a malformed config.yaml; never name Sprites from them."""
+        import __init__ as plugin_pkg
+        if plugin_pkg._failed_read_marker() is None:
+            pytest.skip("this Hermes has no fallback-config marker")
+        captured = self._capture(monkeypatch)
+        (isolated_home / "config.yaml").write_text(self._BROKEN)
+        provider = plugin_pkg.SpritesProvider()
         with pytest.raises(RuntimeError, match="config.yaml could not be read"):
             provider.create_environment(cwd="/root", timeout=60, task_id="t")
         assert captured == {}
@@ -1195,8 +1187,9 @@ class TestProviderSettings:
 
     def test_config_broken_after_good_load_refuses(self, monkeypatch, isolated_home):
         """A last-known-good fallback (here: no prefix) must not be used either."""
-        pytest.importorskip("hermes_cli.config_read_errors")
         import __init__ as plugin_pkg
+        if plugin_pkg._failed_read_marker() is None:
+            pytest.skip("this Hermes has no fallback-config marker")
         captured = self._capture(monkeypatch)
         cfg = isolated_home / "config.yaml"
         cfg.write_text(json.dumps({"terminal": {"backend": "sprites"}}))
@@ -1204,10 +1197,39 @@ class TestProviderSettings:
         provider.create_environment(cwd="/root", timeout=60, task_id="t")
         assert captured["name_prefix"] is None
         captured.clear()
-        cfg.write_text(
-            "terminal: {backend: sprites}\nplugins:\n  entries:\n    sprites:\n"
-            "      settings: {name_prefix: hc-abc123, scope: [instance}\n"
-        )
+        cfg.write_text("terminal: {backend: sprites}\n" + self._BROKEN)
+        with pytest.raises(RuntimeError, match="config.yaml could not be read"):
+            provider.create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured == {}
+
+    def test_settings_come_from_one_checked_snapshot(self, monkeypatch):
+        """A fallback read followed by a clean one must not yield the fallback's values."""
+        import __init__ as plugin_pkg
+
+        class _Fallback(dict):
+            read_error = ValueError("bad yaml")
+
+        reads = iter([
+            _Fallback({}),  # fallback without the prefix
+            {"plugins": {"entries": {"sprites": {"settings": {
+                "name_prefix": "hc-new", "scope": "instance"}}}}},
+        ])
+        monkeypatch.setattr(plugin_pkg, "_failed_read_marker", lambda: _Fallback)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: next(reads))
+        with pytest.raises(RuntimeError, match="config.yaml could not be read"):
+            plugin_pkg.SpritesProvider()._naming_settings()
+
+    def test_core_without_marker_parses_the_file(self, monkeypatch, isolated_home):
+        """Older Hermes falls back silently; the plugin then checks the file itself."""
+        import __init__ as plugin_pkg
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(plugin_pkg, "_failed_read_marker", lambda: None)
+        self._write_settings(isolated_home, {"name_prefix": "hc-old"})
+        provider = plugin_pkg.SpritesProvider()
+        provider.create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["name_prefix"] == "hc-old"
+        captured.clear()
+        (isolated_home / "config.yaml").write_text(self._BROKEN)
         with pytest.raises(RuntimeError, match="config.yaml could not be read"):
             provider.create_environment(cwd="/root", timeout=60, task_id="t")
         assert captured == {}

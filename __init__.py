@@ -26,54 +26,94 @@ from __future__ import annotations
 
 import importlib.util
 import os
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 
 from agent.terminal_env_provider import TerminalEnvironmentProvider
 
 _SPRITES_SPEC = "sprites-py>=0.5.0,<0.6"
 
-#: Manifest name; the settings namespace when no plugin context is available.
+#: Manifest name; the default settings namespace.
 _PLUGIN_ID = "sprites"
 
 #: Plugin settings this backend reads (``plugins.entries.<id>.settings.<key>``).
 _SETTING_KEYS = ("name_prefix", "scope")
 
 
-def _config_read_error() -> Optional[BaseException]:
-    """The error behind core's fallback config, or ``None`` when config.yaml read cleanly.
+def _failed_read_marker() -> Optional[type]:
+    """Core's marker class for a fallback config, wherever this Hermes defines it."""
+    import importlib
 
-    When config.yaml cannot be parsed, core serves a fallback (the last good
-    copy, or the defaults) instead of raising. Plugin settings taken from that
-    fallback may be missing a ``name_prefix`` the operator just configured, so
-    the caller must refuse rather than name Sprites from it. Hermes releases
-    without the fallback marker have nothing to detect and return ``None``.
-    """
-    try:
-        from hermes_cli.config import load_config_readonly
-        from hermes_cli.config_read_errors import FailedConfigRead
-    except ImportError:
-        return None
-    config = load_config_readonly()
-    if isinstance(config, FailedConfigRead):
-        return getattr(config, "read_error", None) or RuntimeError("unreadable config.yaml")
+    for module in ("hermes_cli.config_read_errors", "hermes_cli.config"):
+        try:
+            marker = getattr(importlib.import_module(module), "FailedConfigRead")
+        except (ImportError, AttributeError):
+            continue
+        if isinstance(marker, type):
+            return marker
     return None
 
 
-def _read_setting_from_config(key: str, default: Any = None) -> Any:
-    """Read ``plugins.entries.sprites.settings.<key>`` straight from config.yaml.
+def _verify_config_file_parses() -> None:
+    """Parse config.yaml directly; raise if it exists but cannot be read or parsed.
 
-    Used only when the provider was built without a plugin context (direct
-    construction). Errors propagate: settings that cannot be read must not be
-    treated as unset, or a configured prefix would be silently dropped.
+    Only used on Hermes releases whose loader falls back silently, without a
+    marker the plugin could check.
+    """
+    from hermes_cli.config import get_config_path
+
+    path = get_config_path()
+    if not path.exists():
+        return
+    try:
+        from hermes_yaml import safe_load
+    except ImportError:
+        from yaml import safe_load
+    safe_load(path.read_text(encoding="utf-8-sig"))
+
+
+def _read_settings(plugin_id: str) -> Dict[str, Any]:
+    """Raw plugin settings from ONE config snapshot, or raise if it is not trustworthy.
+
+    When config.yaml cannot be parsed, core serves a fallback (the last good
+    copy, or the defaults) instead of raising. Settings taken from it may be
+    missing a ``name_prefix`` the operator just configured, so this refuses
+    rather than return them. Every key comes from the same snapshot whose read
+    status was checked, so a file repaired or broken between two reads cannot
+    mix a fallback value into a "clean" result. Lookup order matches
+    ``PluginContext.get_config``: ``settings`` first, then the legacy
+    ``config`` subtree.
     """
     from hermes_cli.config import load_config_readonly
 
-    node: Any = load_config_readonly() or {}
-    for part in ("plugins", "entries", _PLUGIN_ID, "settings", key):
-        if not isinstance(node, dict) or part not in node:
-            return default
-        node = node[part]
-    return node
+    marker = _failed_read_marker()
+    if marker is None:
+        try:
+            _verify_config_file_parses()
+        except Exception as e:
+            raise _unreadable_config(e) from e
+    config = load_config_readonly()
+    # Check the marker before any normalisation: an empty fallback is falsy.
+    if marker is not None and isinstance(config, marker):
+        raise _unreadable_config(getattr(config, "read_error", None))
+
+    entry: Any = config
+    for part in ("plugins", "entries", plugin_id):
+        entry = entry.get(part) if isinstance(entry, dict) else None
+    entry = entry if isinstance(entry, dict) else {}
+    settings = entry.get("settings") if isinstance(entry.get("settings"), dict) else {}
+    legacy = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+    return {
+        key: settings[key] if key in settings else legacy.get(key)
+        for key in _SETTING_KEYS
+    }
+
+
+def _unreadable_config(error: Any) -> RuntimeError:
+    return RuntimeError(
+        "Sprites backend refused to start: config.yaml could not be read "
+        f"({error}), so its plugin settings (name_prefix, scope) cannot be "
+        "trusted. Fix config.yaml (`hermes config check`)."
+    )
 
 
 def _sdk_installed() -> bool:
@@ -114,12 +154,12 @@ class SpritesProvider(TerminalEnvironmentProvider):
     # attach one live VM and delete it out from under each other (#82731).
     session_isolated_when_nonpersistent = True
 
-    def __init__(self, get_config: Optional[Callable[[str, Any], Any]] = None):
-        # ``get_config`` is ``PluginContext.get_config`` when registered by the
-        # plugin loader: it reads this plugin's settings namespace live from
-        # config.yaml on every call, so a changed setting applies to the next
-        # environment without a restart.
-        self._get_config = get_config or _read_setting_from_config
+    def __init__(self, plugin_id: str = _PLUGIN_ID):
+        # The settings namespace: ``plugins.entries.<plugin_id>.settings``.
+        # ``register(ctx)`` passes the loader's id for this plugin. Settings
+        # are re-read from config.yaml for every new environment, so a
+        # changed setting applies without a restart.
+        self._plugin_id = plugin_id
 
     def _naming_settings(self) -> tuple:
         """Validated ``(name_prefix, scope)``.
@@ -131,15 +171,7 @@ class SpritesProvider(TerminalEnvironmentProvider):
             from .sprites_environment import resolve_naming_settings
         else:
             from sprites_environment import resolve_naming_settings
-        raw = {key: self._get_config(key, None) for key in _SETTING_KEYS}
-        # Checked after the reads, so a config that broke mid-read is caught too.
-        read_error = _config_read_error()
-        if read_error is not None:
-            raise RuntimeError(
-                "Sprites backend refused to start: config.yaml could not be read "
-                f"({read_error}), so its plugin settings (name_prefix, scope) "
-                "cannot be trusted. Fix config.yaml (`hermes config check`)."
-            )
+        raw = _read_settings(self._plugin_id)
         return resolve_naming_settings(raw["name_prefix"], raw["scope"])
 
     @property
@@ -263,8 +295,11 @@ class SpritesProvider(TerminalEnvironmentProvider):
 
 
 def register(ctx):
-    # Read settings through the plugin context so they come from this
-    # plugin's own namespace (``plugins.entries.<plugin_id>.settings``).
+    # Settings live in this plugin's own namespace,
+    # ``plugins.entries.<plugin_id>.settings``. They are read directly rather
+    # than through ``ctx.get_config`` because each key would then come from a
+    # separate config read, with no way to tell whether that read was core's
+    # fallback for an unparseable config.yaml.
     ctx.register_terminal_environment_provider(
-        SpritesProvider(get_config=getattr(ctx, "get_config", None))
+        SpritesProvider(plugin_id=getattr(ctx, "plugin_id", None) or _PLUGIN_ID)
     )

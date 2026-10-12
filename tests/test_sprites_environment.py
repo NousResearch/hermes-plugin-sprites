@@ -655,12 +655,15 @@ class TestDispatchWiring:
         captured = {}
 
         class _FakeSpritesEnv:
-            def __init__(self, cwd, timeout, persistent_filesystem, task_id):
+            def __init__(self, cwd, timeout, persistent_filesystem, task_id,
+                         name_prefix=None, scope=None):
                 captured.update(
                     cwd=cwd,
                     timeout=timeout,
                     persistent_filesystem=persistent_filesystem,
                     task_id=task_id,
+                    name_prefix=name_prefix,
+                    scope=scope,
                 )
 
         monkeypatch.setattr(sprites_mod, "SpritesEnvironment", _FakeSpritesEnv)
@@ -679,6 +682,9 @@ class TestDispatchWiring:
             assert captured["persistent_filesystem"] is False
             assert captured["task_id"] == "tid-ephemeral"
             assert captured["cwd"] == "/root"
+            # No plugin settings configured → today's naming.
+            assert captured["name_prefix"] is None
+            assert captured["scope"] == "session"
         finally:
             reg._reset_for_tests()
 
@@ -689,14 +695,22 @@ class TestDispatchWiring:
         _, kwargs = sprites_mod.SpritesClient.call_args
         assert "base_url" not in kwargs
 
+    @pytest.mark.parametrize("settings, expected_name", [
+        (None, "hermes-default"),
+        ({"name_prefix": "hc-abc123", "scope": "instance"}, "hc-abc123-default"),
+    ])
     def test_discovered_plugin_executes(
-        self, isolated_home, hermes_runtime, sprites_sdk, monkeypatch
+        self, isolated_home, hermes_runtime, sprites_sdk, monkeypatch,
+        settings, expected_name,
     ):
-        """Exercise discovery, package imports and real terminal dispatch, mocking only transport."""
+        """Exercise discovery, package imports and real terminal dispatch, mocking only transport.
+
+        With settings, this also proves the loader-provided plugin context
+        reads ``plugins.entries.sprites.settings`` from config.yaml.
+        """
         from hermes_cli import plugins
         from agent import terminal_env_registry as reg
         import tools.terminal_tool as tt
-        import yaml
 
         plugin_dir = isolated_home / "plugins" / "sprites"
         shutil.copytree(
@@ -704,8 +718,12 @@ class TestDispatchWiring:
             plugin_dir,
             ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", ".pytest_cache", "tests"),
         )
-        (isolated_home / "config.yaml").write_text(yaml.safe_dump({
-            "plugins": {"enabled": ["sprites"]},
+        # JSON is valid YAML; newer Hermes test environments ship no PyYAML.
+        plugins_cfg = {"enabled": ["sprites"]}
+        if settings is not None:
+            plugins_cfg["entries"] = {"sprites": {"settings": settings}}
+        (isolated_home / "config.yaml").write_text(json.dumps({
+            "plugins": plugins_cfg,
             "terminal": {"backend": "sprites"},
         }))
         monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: isolated_home / "bundled")
@@ -735,7 +753,7 @@ class TestDispatchWiring:
             result = json.loads(tt.terminal_tool("printf 'from Sprite\\n'", task_id="plugin-smoke"))
             assert result["exit_code"] == 0, result
             assert "from Sprite" in result["output"]
-            client.create_sprite.assert_called_once()
+            client.create_sprite.assert_called_once_with(expected_name)
         finally:
             for env in tt._active_environments.values():
                 env.cleanup()
@@ -892,3 +910,377 @@ class TestStdinMode:
         from sprites_environment import SpritesEnvironment
 
         assert SpritesEnvironment._stdin_mode == "heredoc"
+
+
+# ---------------------------------------------------------------------------
+# Plugin settings: name_prefix and scope
+# ---------------------------------------------------------------------------
+
+_DNS_LABEL = r"[a-z0-9]+(?:-[a-z0-9]+)*"
+_LONG_TASK = "session:agent:main:telegram:dm:" + "x" * 80
+_LONG_PREFIX = "hc-" + "a" * 37  # exactly the 40-char maximum
+
+
+def _set_profile(monkeypatch, name):
+    monkeypatch.setattr(
+        "sprites_environment._resolve_profile_identity", lambda: name
+    )
+
+
+class TestNamingSettingsValidation:
+    """Invalid settings fail closed; unset settings mean today's behaviour."""
+
+    @pytest.mark.parametrize("prefix", [None, ""])
+    @pytest.mark.parametrize("scope", [None, ""])
+    def test_unset_means_legacy(self, prefix, scope):
+        from sprites_environment import resolve_naming_settings
+        assert resolve_naming_settings(prefix, scope) == (None, "session")
+
+    @pytest.mark.parametrize("prefix", ["hc-abc123", "a", "hc-0", _LONG_PREFIX])
+    def test_valid_prefixes(self, prefix):
+        from sprites_environment import resolve_naming_settings
+        assert resolve_naming_settings(prefix, "instance") == (prefix, "instance")
+
+    @pytest.mark.parametrize("prefix", [
+        "HC-abc", "hc_abc", "hc.abc", "-hc", "hc-", "hc--abc", "hc abc",
+        "hç-abc", _LONG_PREFIX + "b", 123, True, ["hc"],
+    ])
+    def test_invalid_prefix_raises(self, prefix):
+        from sprites_environment import resolve_naming_settings
+        with pytest.raises(ValueError, match="name_prefix"):
+            resolve_naming_settings(prefix, None)
+
+    @pytest.mark.parametrize("scope", ["instnace", "Instance", "profile", 1, True])
+    def test_invalid_scope_raises(self, scope):
+        from sprites_environment import resolve_naming_settings
+        with pytest.raises(ValueError, match="scope"):
+            resolve_naming_settings(None, scope)
+
+
+class TestPrefixedNames:
+    def test_unset_prefix_is_byte_identical(self, monkeypatch):
+        """Regression: no prefix → exactly the historical names."""
+        from sprites_environment import _resolve_sprite_name
+        _set_profile(monkeypatch, None)
+        assert _resolve_sprite_name("default", None) == "hermes-default"
+        assert _resolve_sprite_name("mytask", None) == "hermes-mytask"
+        assert _resolve_sprite_name(_LONG_TASK, None) == _resolve_sprite_name(_LONG_TASK)
+        _set_profile(monkeypatch, "work")
+        assert _resolve_sprite_name("default", None) == "hermes-work-default-a092ad600654"
+
+    def test_prefix_replaces_hermes_head(self, monkeypatch):
+        from sprites_environment import _ephemeral_sprite_name, _resolve_sprite_name
+        _set_profile(monkeypatch, None)
+        assert _resolve_sprite_name("default", "hc-abc123") == "hc-abc123-default"
+        assert _resolve_sprite_name("mytask", "hc-abc123") == "hc-abc123-mytask"
+        assert _ephemeral_sprite_name("mine", "hc-abc123").startswith("hc-abc123-eph-mine-")
+
+    def test_named_profile_stays_digest_scoped(self, monkeypatch):
+        """The prefix swaps the head only; the identity digest is unchanged."""
+        from sprites_environment import _resolve_sprite_name
+        _set_profile(monkeypatch, "work")
+        assert _resolve_sprite_name("default", "hc-abc123") == "hc-abc123-work-default-a092ad600654"
+        _set_profile(monkeypatch, "play")
+        assert _resolve_sprite_name("default", "hc-abc123") != "hc-abc123-work-default-a092ad600654"
+
+    @pytest.mark.parametrize("profile", [None, "work", "home:/a/very/long/custom/hermes/home/path"])
+    @pytest.mark.parametrize("task", ["default", "t", _LONG_TASK, "Sub Agent_42"])
+    @pytest.mark.parametrize("prefix", ["h", "hc-abc123", _LONG_PREFIX])
+    def test_dns_bound_and_prefix_intact(self, monkeypatch, profile, task, prefix):
+        import re
+        from sprites_environment import (
+            _MAX_NAME_LEN, _ephemeral_sprite_name, _resolve_sprite_name,
+        )
+        _set_profile(monkeypatch, profile)
+        for name in (_resolve_sprite_name(task, prefix), _ephemeral_sprite_name(task, prefix)):
+            assert len(name) <= _MAX_NAME_LEN, name
+            assert re.fullmatch(_DNS_LABEL, name), name
+            assert name.startswith(f"{prefix}-"), name
+
+    def test_long_prefix_keeps_full_digest(self, monkeypatch):
+        from sprites_environment import _identity_digest, _resolve_sprite_name
+        _set_profile(monkeypatch, "work")
+        name = _resolve_sprite_name(_LONG_TASK, _LONG_PREFIX)
+        assert name.endswith(_identity_digest("work", _LONG_TASK))
+
+
+class TestPrefixAndScopeInEnvironment:
+    def test_no_settings_unchanged(self, make_env):
+        env = make_env(task_id="fresh")
+        env._mock_client.get_sprite.assert_called_once_with("hermes-fresh")
+        env._mock_client.create_sprite.assert_called_once_with("hermes-fresh")
+
+    def test_prefix_persistent(self, make_env):
+        env = make_env(task_id="fresh", name_prefix="hc-abc123",
+                       sprite=_make_sprite("hc-abc123-fresh"))
+        env._mock_client.get_sprite.assert_called_once_with("hc-abc123-fresh")
+        env._mock_client.create_sprite.assert_called_once_with("hc-abc123-fresh")
+
+    def test_prefix_ephemeral(self, make_env):
+        env = make_env(task_id="mine", name_prefix="hc-abc123",
+                       persistent_filesystem=False)
+        (name,), _ = env._mock_client.create_sprite.call_args
+        assert name.startswith("hc-abc123-eph-mine-")
+        env._mock_client.get_sprite.assert_not_called()
+
+    @pytest.mark.parametrize("bad", ["Bad_Prefix", "hc--x", 42])
+    def test_invalid_prefix_fails_closed_before_any_api_call(self, make_env, sprites_sdk, bad):
+        with pytest.raises(ValueError, match="name_prefix"):
+            make_env(task_id="fresh", name_prefix=bad)
+        sprites_sdk[0].SpritesClient.assert_not_called()
+
+    def test_invalid_scope_fails_closed(self, make_env, sprites_sdk):
+        with pytest.raises(ValueError, match="scope"):
+            make_env(task_id="fresh", scope="instnace")
+        sprites_sdk[0].SpritesClient.assert_not_called()
+
+    def test_instance_scope_collapses_task_ids(self, make_env):
+        names = set()
+        for task in ("session:agent:main:telegram:dm:1", "cron-job-7", "default", _LONG_TASK):
+            env = make_env(task_id=task, name_prefix="hc-abc123", scope="instance",
+                           sprite=_make_sprite("hc-abc123-default"))
+            (name,), _ = env._mock_client.get_sprite.call_args
+            names.add(name)
+        assert names == {"hc-abc123-default"}
+
+    def test_instance_scope_without_prefix_uses_default_profile_name(self, make_env):
+        env = make_env(task_id="session:agent:main:x", scope="instance")
+        env._mock_client.get_sprite.assert_called_once_with("hermes-default")
+
+    def test_instance_scope_named_profile_is_digest_scoped(self, make_env, monkeypatch):
+        _set_profile(monkeypatch, "work")
+        env = make_env(task_id="session:abc", name_prefix="hc-abc123", scope="instance",
+                       sprite=_make_sprite("hc-abc123-work-default-a092ad600654"))
+        env._mock_client.get_sprite.assert_called_once_with("hc-abc123-work-default-a092ad600654")
+
+    def test_instance_scope_keeps_ephemeral_runs_unique(self, make_env):
+        a = make_env(task_id="s1", name_prefix="hc-abc123", scope="instance",
+                     persistent_filesystem=False)
+        b = make_env(task_id="s1", name_prefix="hc-abc123", scope="instance",
+                     persistent_filesystem=False)
+        assert a._sprite_name != b._sprite_name
+        assert a._sprite_name.startswith("hc-abc123-eph-")
+
+    @pytest.mark.parametrize("persistent", [True, False])
+    def test_prefix_guard_refuses_out_of_prefix_names(self, make_env, monkeypatch, persistent):
+        """Even if name resolution regresses, nothing outside the prefix is touched."""
+        monkeypatch.setattr("sprites_environment._resolve_sprite_name",
+                            lambda task_id, prefix=None: "hermes-default")
+        monkeypatch.setattr("sprites_environment._ephemeral_sprite_name",
+                            lambda task_id, prefix=None: "hermes-eph-default-0123456789ab")
+        with pytest.raises(RuntimeError, match="outside the configured name_prefix"):
+            make_env(task_id="x", name_prefix="hc-abc123",
+                     persistent_filesystem=persistent)
+        client = sys.modules["sprites"].SpritesClient.return_value
+        client.get_sprite.assert_not_called()
+        client.create_sprite.assert_not_called()
+
+    def test_prefix_guard_rejects_overlong_names(self):
+        from sprites_environment import _require_within_prefix
+        _require_within_prefix("hc-abc123-default", "hc-abc123")
+        _require_within_prefix("anything", None)
+        with pytest.raises(RuntimeError):
+            _require_within_prefix("hc-abc123-" + "x" * 60, "hc-abc123")
+        with pytest.raises(RuntimeError):
+            _require_within_prefix("hc-abc1234-default", "hc-abc123")
+
+
+class TestProviderSettings:
+    """The provider reads plugins.entries.<id>.settings and passes them on."""
+
+    @staticmethod
+    def _capture(monkeypatch):
+        import sprites_environment as sprites_mod
+        captured = {}
+
+        class _FakeSpritesEnv:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr(sprites_mod, "SpritesEnvironment", _FakeSpritesEnv)
+        return captured
+
+    @staticmethod
+    def _write_settings(home, settings, plugin_id="sprites", subtree="settings"):
+        (home / "config.yaml").write_text(json.dumps({
+            "plugins": {"entries": {plugin_id: {subtree: settings}}},
+        }))
+
+    def test_settings_from_config_yaml(self, monkeypatch, isolated_home):
+        import __init__ as plugin_pkg
+        captured = self._capture(monkeypatch)
+        self._write_settings(isolated_home, {"name_prefix": "hc-file", "scope": "instance"})
+        plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["name_prefix"] == "hc-file"
+        assert captured["scope"] == "instance"
+
+    def test_legacy_config_subtree_is_honoured(self, monkeypatch, isolated_home):
+        """Same lookup order as PluginContext.get_config (settings, then config)."""
+        import __init__ as plugin_pkg
+        captured = self._capture(monkeypatch)
+        self._write_settings(isolated_home, {"name_prefix": "hc-legacy"}, subtree="config")
+        plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["name_prefix"] == "hc-legacy"
+
+    def test_register_uses_loader_plugin_id(self, monkeypatch, isolated_home):
+        import __init__ as plugin_pkg
+        captured = self._capture(monkeypatch)
+        self._write_settings(isolated_home, {"name_prefix": "hc-ctx"}, plugin_id="sprites-dev")
+        registered = []
+
+        class _Ctx:
+            plugin_id = "sprites-dev"
+
+            def register_terminal_environment_provider(self, provider):
+                registered.append(provider)
+
+        plugin_pkg.register(_Ctx())
+        registered[0].create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["name_prefix"] == "hc-ctx"
+        assert captured["scope"] == "session"
+
+    def test_invalid_setting_refuses_to_create(self, monkeypatch, isolated_home):
+        import __init__ as plugin_pkg
+        captured = self._capture(monkeypatch)
+        self._write_settings(isolated_home, {"name_prefix": "Not Valid"})
+        with pytest.raises(ValueError, match="name_prefix"):
+            plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured == {}
+
+    def test_doctor_reports_naming(self, isolated_home):
+        import __init__ as plugin_pkg
+        self._write_settings(isolated_home, {"name_prefix": "hc-abc123", "scope": "instance"})
+        row = [r for r in plugin_pkg.SpritesProvider().doctor_checks() if r[1] == "Sprites naming"][0]
+        assert row[0] is True and "hc-abc123-*" in row[2] and "instance" in row[2]
+        self._write_settings(isolated_home, {"scope": "x"})
+        row = [r for r in plugin_pkg.SpritesProvider().doctor_checks() if r[1] == "Sprites naming"][0]
+        assert row[0] is False and "scope" in row[2]
+
+    def test_manifest_declares_settings_for_plugins_hub(self):
+        """plugin.yaml's config_schema renders both settings in the Plugins hub."""
+        hub = pytest.importorskip("hermes_cli.plugins_settings")
+        plugin_dir = Path(__file__).resolve().parents[1]
+        fields = {f["key"]: f for f in hub.plugin_settings_fields("sprites", plugin_dir)}
+        assert fields["name_prefix"]["type"] == "string"
+        assert fields["scope"]["type"] == "enum"
+        assert fields["scope"]["choices"] == ["session", "instance"]
+        assert fields["scope"]["value"] == "session"
+
+    _BROKEN = (
+        "plugins:\n  entries:\n    sprites:\n      settings:\n"
+        "        name_prefix: hc-abc123\n        scope: [instance\n"
+    )
+
+    def test_unreadable_config_refuses_to_create(self, monkeypatch, isolated_home):
+        """Core serves fallback values for a malformed config.yaml; never name Sprites from them."""
+        import __init__ as plugin_pkg
+        if plugin_pkg._failed_read_marker() is None:
+            pytest.skip("this Hermes has no fallback-config marker")
+        captured = self._capture(monkeypatch)
+        (isolated_home / "config.yaml").write_text(self._BROKEN)
+        provider = plugin_pkg.SpritesProvider()
+        with pytest.raises(RuntimeError, match="config.yaml could not be read"):
+            provider.create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured == {}
+        row = [r for r in provider.doctor_checks() if r[1] == "Sprites naming"][0]
+        assert row[0] is False
+
+    def test_config_broken_after_good_load_refuses(self, monkeypatch, isolated_home):
+        """A last-known-good fallback (here: no prefix) must not be used either."""
+        import __init__ as plugin_pkg
+        if plugin_pkg._failed_read_marker() is None:
+            pytest.skip("this Hermes has no fallback-config marker")
+        captured = self._capture(monkeypatch)
+        cfg = isolated_home / "config.yaml"
+        cfg.write_text(json.dumps({"terminal": {"backend": "sprites"}}))
+        provider = plugin_pkg.SpritesProvider()
+        provider.create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["name_prefix"] is None
+        captured.clear()
+        cfg.write_text("terminal: {backend: sprites}\n" + self._BROKEN)
+        with pytest.raises(RuntimeError, match="config.yaml could not be read"):
+            provider.create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured == {}
+
+    def test_settings_come_from_one_checked_snapshot(self, monkeypatch):
+        """A fallback read followed by a clean one must not yield the fallback's values."""
+        import __init__ as plugin_pkg
+
+        class _Fallback(dict):
+            read_error = ValueError("bad yaml")
+
+        reads = iter([
+            _Fallback({}),  # fallback without the prefix
+            {"plugins": {"entries": {"sprites": {"settings": {
+                "name_prefix": "hc-new", "scope": "instance"}}}}},
+        ])
+        monkeypatch.setattr(plugin_pkg, "_failed_read_marker", lambda: _Fallback)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: next(reads))
+        with pytest.raises(RuntimeError, match="config.yaml could not be read"):
+            plugin_pkg.SpritesProvider()._naming_settings()
+
+    def test_core_without_marker_parses_the_file(self, monkeypatch, isolated_home):
+        """Older Hermes falls back silently; the plugin then checks the file itself."""
+        import __init__ as plugin_pkg
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(plugin_pkg, "_failed_read_marker", lambda: None)
+        self._write_settings(isolated_home, {"name_prefix": "hc-old"})
+        provider = plugin_pkg.SpritesProvider()
+        provider.create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["name_prefix"] == "hc-old"
+        captured.clear()
+        (isolated_home / "config.yaml").write_text(self._BROKEN)
+        with pytest.raises(RuntimeError, match="config.yaml could not be read"):
+            provider.create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured == {}
+
+
+class TestSharedSpriteFileSync:
+    """Environments resuming one Sprite must not leave an older file copy behind."""
+
+    def test_concurrent_sync_keeps_newest_file(self, make_env, monkeypatch, tmp_path):
+        import threading
+        import sprites_environment as se
+
+        host = tmp_path / "credential.json"
+        host.write_bytes(b"old credential")
+        remote_path = "/home/sprite/.hermes/credential.json"
+        monkeypatch.setattr(se, "iter_sync_files", lambda _root: [(str(host), remote_path)])
+        monkeypatch.setattr(
+            "tools.environments.file_sync._credential_host_paths", lambda: set(), raising=False)
+
+        remote = {}
+        a_uploading = threading.Event()
+        release_a = threading.Event()
+
+        def _upload(self, host_path, rp):
+            data = Path(host_path).read_bytes()
+            if self._task_id == "a":
+                a_uploading.set()
+                assert release_a.wait(10)
+            remote[rp] = data
+
+        monkeypatch.setattr(se.SpritesEnvironment, "_sprite_upload", _upload)
+        errors = []
+
+        def _build(task):
+            try:
+                make_env(task_id=task, name_prefix="hc-abc123", scope="instance",
+                         sprite=_make_sprite("hc-abc123-default"))
+            except BaseException as e:  # surfaced below
+                errors.append(e)
+
+        a = threading.Thread(target=_build, args=("a",))
+        a.start()
+        assert a_uploading.wait(10)
+        # A has read the old bytes and is mid-upload; the host file changes and
+        # B starts its own first sync of the same Sprite.
+        host.write_bytes(b"new credential version")
+        b = threading.Thread(target=_build, args=("b",))
+        b.start()
+        b.join(1.0)
+        release_a.set()
+        a.join(10)
+        b.join(10)
+        assert not errors, errors
+        assert remote[remote_path] == b"new credential version"

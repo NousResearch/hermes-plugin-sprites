@@ -11,6 +11,12 @@ and is reused via a deterministic, profile-scoped name — ``hermes-{task_id}``
 on the default profile, ``hermes-{display}-{digest}`` on named profiles (see
 ``_resolve_sprite_name`` for the full contract). Cleanup leaves the Sprite
 running when ``persistent_filesystem`` is True; the Sprite is deleted otherwise.
+
+Two optional plugin settings (``plugins.entries.sprites.settings.*``) change
+the naming: ``name_prefix`` replaces the leading ``hermes`` of every name so
+one deployment's Sprites are confined to ``<prefix>-*``, and ``scope:
+instance`` makes every task id share one persistent Sprite per profile (see
+``resolve_naming_settings``).
 """
 
 import hashlib
@@ -47,6 +53,113 @@ _MAX_NAME_LEN = 63
 #: 6 chars, where a collision between valid profile names was demonstrated).
 _DIGEST_LEN = 12
 
+#: Leading component of every name when no ``name_prefix`` is configured.
+_DEFAULT_HEAD = "hermes"
+
+#: Longest accepted ``name_prefix``. Leaves at least 22 characters for the
+#: ``-{display}-{digest}`` tail, so even the bounded form keeps its full
+#: 12-char digest plus some readable display text.
+_MAX_PREFIX_LEN = 40
+
+#: A ``name_prefix`` must already be a clean DNS-label fragment: lowercase
+#: alphanumerics separated by single hyphens. It is never slugified — a prefix
+#: is an authority boundary, so an invalid one is an error, not a suggestion.
+_PREFIX_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+#: Accepted ``scope`` values. ``session`` keeps one Sprite per task id;
+#: ``instance`` shares one persistent Sprite across every task id.
+_SCOPES = frozenset({"session", "instance"})
+
+#: Task id every persistent environment resolves under in ``instance`` scope.
+_INSTANCE_TASK_ID = "default"
+
+
+def resolve_naming_settings(name_prefix=None, scope=None) -> tuple[str | None, str]:
+    """Validate the raw ``name_prefix`` / ``scope`` plugin settings.
+
+    Returns ``(prefix, scope)`` where ``prefix`` is ``None`` when unset.
+    ``None`` and ``""`` mean "unset" for both keys. Anything else that is not
+    a valid value raises ``ValueError`` — misconfiguration must fail closed,
+    because silently ignoring a prefix would create Sprites outside the
+    namespace the operator meant to confine this deployment to, and silently
+    ignoring a scope typo would start creating one Sprite per session.
+    """
+    prefix = None
+    if name_prefix not in (None, ""):
+        if not isinstance(name_prefix, str):
+            raise ValueError(
+                "Sprites plugin setting name_prefix must be a string, got "
+                f"{type(name_prefix).__name__} ({name_prefix!r})"
+            )
+        if len(name_prefix) > _MAX_PREFIX_LEN or not _PREFIX_RE.fullmatch(name_prefix):
+            raise ValueError(
+                f"Sprites plugin setting name_prefix {name_prefix!r} is invalid: "
+                "use lowercase letters, digits and single hyphens (no leading, "
+                f"trailing or doubled hyphens), at most {_MAX_PREFIX_LEN} characters"
+            )
+        prefix = name_prefix
+    if scope in (None, ""):
+        resolved_scope = "session"
+    elif isinstance(scope, str) and scope in _SCOPES:
+        resolved_scope = scope
+    else:
+        raise ValueError(
+            f"Sprites plugin setting scope {scope!r} is invalid: expected one of "
+            + ", ".join(sorted(_SCOPES))
+        )
+    return prefix, resolved_scope
+
+
+def _require_within_prefix(name: str, prefix: str | None) -> None:
+    """Refuse any Sprite name outside the configured prefix or the DNS bound.
+
+    This is the last check before a name reaches the Sprites API (and is
+    re-applied to the Sprite the API hands back), so a future naming bug
+    cannot create or adopt a Sprite that belongs to another deployment.
+    """
+    if prefix is None:
+        return
+    if not isinstance(name, str) or not name.startswith(f"{prefix}-") or len(name) > _MAX_NAME_LEN:
+        raise RuntimeError(
+            f"Sprites backend refused Sprite name {name!r}: it is outside the "
+            f"configured name_prefix {prefix!r} (or exceeds {_MAX_NAME_LEN} chars)"
+        )
+
+
+#: One sync lock per Sprite name, shared by every environment in this process
+#: that targets that Sprite (see ``_SharedSpriteSyncManager``).
+_SYNC_LOCKS: dict[str, threading.Lock] = {}
+_SYNC_LOCKS_GUARD = threading.Lock()
+
+
+def _shared_sync_lock(sprite_name: str) -> threading.Lock:
+    with _SYNC_LOCKS_GUARD:
+        return _SYNC_LOCKS.setdefault(sprite_name, threading.Lock())
+
+
+class _SharedSpriteSyncManager(FileSyncManager):
+    """File sync whose transactions are serialised per Sprite, not per environment.
+
+    Several environments can resume one Sprite (``scope: instance`` does so
+    for every session; ``delegate_task`` children always have). Each keeps
+    its own sync history, but they all write the same remote paths. With
+    only per-manager locks, one environment can upload an old copy of a file
+    after another uploaded the newer one, and neither retries because each
+    history says its own upload succeeded. Holding a lock shared by every
+    manager of the same Sprite around the whole transaction makes each
+    upload read the host file after the previous upload finished, so the
+    last write is always the newest content. (Environments in other
+    processes are not covered.)
+    """
+
+    def __init__(self, *args, shared_lock: threading.Lock, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._shared_lock = shared_lock
+
+    def sync(self, *, force: bool = False) -> None:
+        with self._shared_lock:
+            super().sync(force=force)
+
 
 def _collapse_slug(value: str) -> str:
     """Plain DNS-safe collapse: lowercase, non-alnum runs become one hyphen."""
@@ -68,17 +181,18 @@ def _identity_digest(*parts: str) -> str:
     return h.hexdigest()[:_DIGEST_LEN]
 
 
-def _bounded_name(display: str, digest: str) -> str:
-    """Compose ``hermes-{display}-{digest}`` within ``_MAX_NAME_LEN``.
+def _bounded_name(display: str, digest: str, head: str = _DEFAULT_HEAD) -> str:
+    """Compose ``{head}-{display}-{digest}`` within ``_MAX_NAME_LEN``.
 
-    The digest is the authoritative identity and is never truncated; the
-    human-readable display slug absorbs all the shortening.
+    The head (``hermes`` or the configured ``name_prefix``) and the digest
+    are authoritative and never truncated; the human-readable display slug
+    absorbs all the shortening.
     """
-    budget = _MAX_NAME_LEN - len("hermes-") - 1 - len(digest)
-    display = (display or "")[:budget].strip("-")
+    budget = _MAX_NAME_LEN - len(head) - 1 - 1 - len(digest)
+    display = (display or "")[:max(budget, 0)].strip("-")
     if display:
-        return f"hermes-{display}-{digest}"
-    return f"hermes-{digest}"
+        return f"{head}-{display}-{digest}"
+    return f"{head}-{digest}"
 
 
 def _slugify_name_component(value: str) -> str:
@@ -142,7 +256,7 @@ def _resolve_profile_identity() -> str | None:
     return name
 
 
-def _resolve_sprite_name(task_id: str) -> str:
+def _resolve_sprite_name(task_id: str, prefix: str | None = None) -> str:
     """Deterministic, profile-scoped Sprite name.
 
     A Sprite is persistent and resumed *by name*, so its name is the durable
@@ -166,25 +280,30 @@ def _resolve_sprite_name(task_id: str) -> str:
     Profile resolution failure raises rather than falling back: silently
     entering the default profile's durable namespace would put a named
     profile's session inside another trust domain's live VM.
+
+    ``prefix`` (an already-validated ``name_prefix``) replaces the leading
+    ``hermes`` in every form above; ``None`` keeps the historical names
+    byte-for-byte.
     """
+    head = prefix or _DEFAULT_HEAD
     profile_raw = _resolve_profile_identity()
     if profile_raw is None:
         task_slug = _slugify_name_component(task_id) or "default"
-        legacy = f"hermes-{task_slug}"
+        legacy = f"{head}-{task_slug}"
         if len(legacy) <= _MAX_NAME_LEN:
             return legacy
         # Too long for a DNS label (e.g. a session-keyed task id): fall to
         # the bounded form; the pair digest carries the identity.
         return _bounded_name(
-            _collapse_slug(task_id), _identity_digest("", task_id or "")
+            _collapse_slug(task_id), _identity_digest("", task_id or ""), head
         )
     profile_slug = _collapse_slug(profile_raw) or "profile"
     task_display = _collapse_slug(task_id) or "default"
     digest = _identity_digest(profile_raw, task_id or "")
-    return _bounded_name(f"{profile_slug}-{task_display}", digest)
+    return _bounded_name(f"{profile_slug}-{task_display}", digest, head)
 
 
-def _ephemeral_sprite_name(task_id: str) -> str:
+def _ephemeral_sprite_name(task_id: str, prefix: str | None = None) -> str:
     """Unique, non-resumable Sprite name for a non-persistent run.
 
     Ephemeral Sprites are created fresh and deleted on cleanup; their names
@@ -194,7 +313,7 @@ def _ephemeral_sprite_name(task_id: str) -> str:
     """
     nonce = uuid.uuid4().hex[:12]
     display = _collapse_slug(task_id) or "default"
-    return _bounded_name(f"eph-{display}", nonce)
+    return _bounded_name(f"eph-{display}", nonce, prefix or _DEFAULT_HEAD)
 
 
 class SpritesEnvironment(BaseEnvironment):
@@ -213,8 +332,14 @@ class SpritesEnvironment(BaseEnvironment):
         timeout: int = 60,
         persistent_filesystem: bool = True,
         task_id: str = "default",
+        name_prefix: str | None = None,
+        scope: str | None = None,
     ):
         requested_cwd = cwd
+        # Validate naming settings before anything else (including the SDK
+        # import and token lookup) so misconfiguration fails closed with a
+        # clear message and no Sprites API call is ever made.
+        prefix, scope = resolve_naming_settings(name_prefix, scope)
         super().__init__(cwd=cwd, timeout=timeout)
 
         # Standalone plugin dependencies are installed alongside the plugin,
@@ -238,6 +363,8 @@ class SpritesEnvironment(BaseEnvironment):
         )
         self._persistent = persistent_filesystem
         self._task_id = task_id
+        self._name_prefix = prefix
+        self._scope = scope
         self._lock = threading.Lock()
         self._sprite = None
 
@@ -246,7 +373,11 @@ class SpritesEnvironment(BaseEnvironment):
         # entirely so the wire format stays minimal until the platform exposes
         # these knobs.
         if persistent_filesystem:
-            sprite_name = _resolve_sprite_name(task_id)
+            # ``instance`` scope: every task id (gateway sessions, cron,
+            # delegate_task children) resumes the same per-profile Sprite.
+            name_task_id = _INSTANCE_TASK_ID if scope == "instance" else task_id
+            sprite_name = _resolve_sprite_name(name_task_id, prefix)
+            _require_within_prefix(sprite_name, prefix)
             self._sprite_name = sprite_name
             try:
                 self._sprite = self._client.get_sprite(sprite_name)
@@ -285,7 +416,10 @@ class SpritesEnvironment(BaseEnvironment):
             # from under the other — or silently resume a stale survivor of
             # a crashed prior run. Mint a unique name and NEVER adopt: this
             # constructor only ever creates.
-            sprite_name = _ephemeral_sprite_name(task_id)
+            # ``scope`` does not apply here: per-run uniqueness is the whole
+            # point of ephemeral mode, so instance scope never shares these.
+            sprite_name = _ephemeral_sprite_name(task_id, prefix)
+            _require_within_prefix(sprite_name, prefix)
             self._sprite_name = sprite_name
             self._sprite = self._client.create_sprite(sprite_name)
             logger.info(
@@ -306,10 +440,11 @@ class SpritesEnvironment(BaseEnvironment):
             pass
 
         self._fs = self._sprite.filesystem("/")
-        self._sync_manager = FileSyncManager(
+        self._sync_manager = _SharedSpriteSyncManager(
             get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
             upload_fn=self._sprite_upload,
             delete_fn=self._sprite_delete,
+            shared_lock=_shared_sync_lock(sprite_name),
         )
         self._sync_manager.sync(force=True)
         self.init_session()

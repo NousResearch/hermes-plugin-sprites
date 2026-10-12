@@ -10,6 +10,11 @@ Install into ``~/.hermes/plugins/sprites/`` and enable via
     hermes config set terminal.backend sprites
     # SPRITES_TOKEN in ~/.hermes/.env (get one with `sprite login`)
 
+Optional settings (``plugins.entries.sprites.settings.*`` in config.yaml):
+``name_prefix`` confines every Sprite name to ``<prefix>-*`` and ``scope``
+(``session`` | ``instance``) chooses one Sprite per task id or one per
+profile. See README.md.
+
 Attribution: the Sprites environment was authored by Kyle McLaren
 (@kylemclaren, Fly.io) as hermes-agent PR #30112 and hardened through the
 #93523 salvage review (identity digests, DNS bounds, fail-closed profile
@@ -26,6 +31,89 @@ from typing import Any, Dict, Optional
 from agent.terminal_env_provider import TerminalEnvironmentProvider
 
 _SPRITES_SPEC = "sprites-py>=0.5.0,<0.6"
+
+#: Manifest name; the default settings namespace.
+_PLUGIN_ID = "sprites"
+
+#: Plugin settings this backend reads (``plugins.entries.<id>.settings.<key>``).
+_SETTING_KEYS = ("name_prefix", "scope")
+
+
+def _failed_read_marker() -> Optional[type]:
+    """Core's marker class for a fallback config, wherever this Hermes defines it."""
+    import importlib
+
+    for module in ("hermes_cli.config_read_errors", "hermes_cli.config"):
+        try:
+            marker = getattr(importlib.import_module(module), "FailedConfigRead")
+        except (ImportError, AttributeError):
+            continue
+        if isinstance(marker, type):
+            return marker
+    return None
+
+
+def _verify_config_file_parses() -> None:
+    """Parse config.yaml directly; raise if it exists but cannot be read or parsed.
+
+    Only used on Hermes releases whose loader falls back silently, without a
+    marker the plugin could check.
+    """
+    from hermes_cli.config import get_config_path
+
+    path = get_config_path()
+    if not path.exists():
+        return
+    try:
+        from hermes_yaml import safe_load
+    except ImportError:
+        from yaml import safe_load
+    safe_load(path.read_text(encoding="utf-8-sig"))
+
+
+def _read_settings(plugin_id: str) -> Dict[str, Any]:
+    """Raw plugin settings from ONE config snapshot, or raise if it is not trustworthy.
+
+    When config.yaml cannot be parsed, core serves a fallback (the last good
+    copy, or the defaults) instead of raising. Settings taken from it may be
+    missing a ``name_prefix`` the operator just configured, so this refuses
+    rather than return them. Every key comes from the same snapshot whose read
+    status was checked, so a file repaired or broken between two reads cannot
+    mix a fallback value into a "clean" result. Lookup order matches
+    ``PluginContext.get_config``: ``settings`` first, then the legacy
+    ``config`` subtree.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    marker = _failed_read_marker()
+    if marker is None:
+        try:
+            _verify_config_file_parses()
+        except Exception as e:
+            raise _unreadable_config(e) from e
+    config = load_config_readonly()
+    # Check the marker before any normalisation: an empty fallback is falsy.
+    if marker is not None and isinstance(config, marker):
+        raise _unreadable_config(getattr(config, "read_error", None))
+
+    entry: Any = config
+    for part in ("plugins", "entries", plugin_id):
+        entry = entry.get(part) if isinstance(entry, dict) else None
+    entry = entry if isinstance(entry, dict) else {}
+    settings = entry.get("settings") if isinstance(entry.get("settings"), dict) else {}
+    legacy = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+    return {
+        key: settings[key] if key in settings else legacy.get(key)
+        for key in _SETTING_KEYS
+    }
+
+
+def _unreadable_config(error: Any) -> RuntimeError:
+    return RuntimeError(
+        "Sprites backend refused to start: config.yaml could not be read "
+        f"({error}), so its plugin settings (name_prefix, scope) cannot be "
+        "trusted. Fix config.yaml (`hermes config check`)."
+    )
 
 
 def _sdk_installed() -> bool:
@@ -65,6 +153,26 @@ class SpritesProvider(TerminalEnvironmentProvider):
     # a shared deterministic name would let two independent ephemeral runs
     # attach one live VM and delete it out from under each other (#82731).
     session_isolated_when_nonpersistent = True
+
+    def __init__(self, plugin_id: str = _PLUGIN_ID):
+        # The settings namespace: ``plugins.entries.<plugin_id>.settings``.
+        # ``register(ctx)`` passes the loader's id for this plugin. Settings
+        # are re-read from config.yaml for every new environment, so a
+        # changed setting applies without a restart.
+        self._plugin_id = plugin_id
+
+    def _naming_settings(self) -> tuple:
+        """Validated ``(name_prefix, scope)``.
+
+        Raises ``ValueError`` for an invalid value and ``RuntimeError`` when
+        config.yaml could not be read (core then serves fallback values).
+        """
+        if __package__:
+            from .sprites_environment import resolve_naming_settings
+        else:
+            from sprites_environment import resolve_naming_settings
+        raw = _read_settings(self._plugin_id)
+        return resolve_naming_settings(raw["name_prefix"], raw["scope"])
 
     @property
     def description(self) -> str:
@@ -153,6 +261,16 @@ class SpritesProvider(TerminalEnvironmentProvider):
             "Sprite stays alive across sessions; its ext4 filesystem is the authoritative store"
             if persistent else "Sprite is deleted on cleanup (ephemeral)",
         ))
+        try:
+            prefix, scope = self._naming_settings()
+        except Exception as e:
+            rows.append((False, "Sprites naming", f"(invalid plugin settings: {e})"))
+        else:
+            rows.append((
+                True,
+                "Sprites naming",
+                f"prefix {prefix + '-*' if prefix else 'hermes-* (default)'}, scope {scope}",
+            ))
         return rows
 
     def create_environment(self, *, cwd, timeout, task_id="default",
@@ -165,13 +283,23 @@ class SpritesProvider(TerminalEnvironmentProvider):
             from sprites_environment import SpritesEnvironment
 
         cc = container_config or {}
+        name_prefix, scope = self._naming_settings()
         return SpritesEnvironment(
             cwd=cwd,
             timeout=timeout,
             persistent_filesystem=cc.get("container_persistent", True),
             task_id=task_id,
+            name_prefix=name_prefix,
+            scope=scope,
         )
 
 
 def register(ctx):
-    ctx.register_terminal_environment_provider(SpritesProvider())
+    # Settings live in this plugin's own namespace,
+    # ``plugins.entries.<plugin_id>.settings``. They are read directly rather
+    # than through ``ctx.get_config`` because each key would then come from a
+    # separate config read, with no way to tell whether that read was core's
+    # fallback for an unparseable config.yaml.
+    ctx.register_terminal_environment_provider(
+        SpritesProvider(plugin_id=getattr(ctx, "plugin_id", None) or _PLUGIN_ID)
+    )

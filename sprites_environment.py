@@ -840,16 +840,28 @@ class SpritesEnvironment(BaseEnvironment):
                 "too slow to answer before the tool deadline",
                 retry_hint="This is not a command failure. Retry the same command shortly.",
             )
+        cut_off = threading.Event()
+
+        def _no_send_after_cut_off(event: str, info) -> None:
+            # httpx trace hook, run just before the request is written. A
+            # POST still resolving or connecting at the cut-off must not be
+            # sent: the create would start after this attempt gave up.
+            if cut_off.is_set() and event.endswith("send_request_headers.started"):
+                raise RuntimeError(f"create of {sprite_name} was cut off before it was sent")
+
         try:
             response = self._bounded_call(
                 wait, lambda client: client.http_client.post(
                     f"{client.base_url}/v1/sprites",
                     json=body,
                     timeout=_bounded_timeout(wait),
+                    extensions={"trace": _no_send_after_cut_off},
                 ))
         except (httpx.ReadTimeout, _CallExpired) as e:
-            # The request reached the platform, which may still finish the
-            # create. Say so in a retryable result instead of a stack trace.
+            cut_off.set()
+            # The request may have reached the platform, which may still
+            # finish the create. Say so in a retryable result instead of a
+            # stack trace.
             self._warn_ephemeral_left_behind(sprite_name)
             raise _still_creating_error(
                 sprite_name, self._create_config, waited=wait,
@@ -914,9 +926,12 @@ class SpritesEnvironment(BaseEnvironment):
         """``fn(client)`` on a fresh SDK client, cut off at ``seconds``.
 
         The client is closed afterwards in every case. On a cut-off that
-        ends the abandoned request at its next read, or at the latest when
-        its own per-read timeout (also ``seconds``) fires, so retries do not
-        pile up open requests.
+        usually ends the abandoned request at its next read, or when its own
+        per-read timeout (also ``seconds``) fires, so retries do not pile up
+        open requests. Best effort: a request still resolving DNS or
+        connecting at the cut-off can connect afterwards and run on. The
+        create POST is never sent after its cut-off (see _create_sprite); a
+        late GET only reads.
         """
         from sprites import SpritesClient
         client = SpritesClient(

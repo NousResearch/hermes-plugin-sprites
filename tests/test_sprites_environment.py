@@ -1875,6 +1875,50 @@ class TestCreateBudget:
             release.set()
         assert 1.4 < _time.monotonic() - started < 2.0  # budget 1 s + recovery 0.5 s
 
+    def test_cut_off_create_is_never_sent_late(self, sprites_sdk, hermes_runtime, monkeypatch):
+        """A POST still connecting at the cut-off (stalled DNS) is not sent afterwards."""
+        import http.server
+        import threading as _threading
+        import time as _time
+        import httpx
+        from tools.environments.base import EnvironmentConnectionError
+        received = []
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append(self.path)
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(201)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        server.daemon_threads = True
+        _threading.Thread(target=server.serve_forever, daemon=True).start()
+        real = httpx.Client()
+        monkeypatch.setattr("sprites_environment._tool_deadline", lambda: 2.0)  # budget 1 s
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [])
+        platform.client.base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+        def _post(url, **kwargs):
+            _time.sleep(1.5)  # still resolving / connecting at the 1 s cut-off
+            return real.post(url, **kwargs)
+
+        platform.client.http_client.post.side_effect = _post
+        try:
+            with pytest.raises(EnvironmentConnectionError, match="still being created"):
+                platform.build()
+            _time.sleep(1.0)  # the abandoned call wakes up and tries to send
+            assert received == []
+        finally:
+            server.shutdown()
+            server.server_close()
+            real.close()
+
     def test_failed_reget_keeps_retryable_error(self, sprites_sdk, hermes_runtime, monkeypatch):
         from tools.environments.base import EnvironmentConnectionError
         platform = _CreatePlatform(sprites_sdk, monkeypatch, [_read_timeout()])
@@ -1909,8 +1953,9 @@ class TestCreateConflictAndLeaks:
             _create_response(409, text=f"exists; debug auth={secret}")])
         with pytest.raises(EnvironmentConnectionError) as info:
             platform.build()
-        assert "SECRET" not in info.value.reason
-        assert "SECRET" not in info.value.retry_hint
+        for text in (info.value.reason, info.value.retry_hint):
+            assert secret not in text
+            assert "SECRET" not in text
         assert "HTTP 409" in info.value.reason
 
     def test_409_then_reget_network_error_is_retryable(self, sprites_sdk, hermes_runtime,

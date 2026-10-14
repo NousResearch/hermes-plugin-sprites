@@ -117,6 +117,10 @@ _CREATE_PHASE_TIMEOUT = 15.0
 #: more than half the budget.
 _RECOVERY_GET_TIMEOUT = 15.0
 
+#: Longest wait for reading Hermes's tool deadline (it reads config.yaml);
+#: past it the default deadline is assumed.
+_DEADLINE_LOOKUP_TIMEOUT = 2.0
+
 #: Least create budget left for the POST to be worth sending (capped at a
 #: quarter of the create wait for very short deadlines).
 _CREATE_MIN_POST = 5.0
@@ -196,12 +200,12 @@ class _CallExpired(Exception):
     """A Sprites API call did not return within its share of the budget."""
 
 
-def _call_within(seconds: float, fn, *args):
-    """Return ``fn(*args)``, or raise ``_CallExpired`` after ``seconds``.
+def _call_within(deadline: float, fn, *args):
+    """Return ``fn(*args)``, or raise ``_CallExpired`` at ``deadline`` (monotonic).
 
     httpx timeouts bound each connect or read, not a whole request: a server
     that keeps sending bytes slowly can hold a request open indefinitely. The
-    call runs on a daemon thread and the caller stops waiting at ``seconds``,
+    call runs on a daemon thread and the caller stops waiting at ``deadline``,
     so construction (and the task's creation lock) ends in time. Callers
     close the abandoned call's client (see ``_bounded_call``) so it stops
     too; its result is discarded.
@@ -220,7 +224,7 @@ def _call_within(seconds: float, fn, *args):
             done.set()
 
     threading.Thread(target=_run, name="sprites-create-call", daemon=True).start()
-    if not done.wait(max(0.0, seconds)):
+    if not done.wait(max(0.0, deadline - time.monotonic())):
         raise _CallExpired()
     if "error" in result:
         raise result["error"]
@@ -681,7 +685,14 @@ class SpritesEnvironment(BaseEnvironment):
         # within the tool deadline less the time kept for the rest of
         # construction. Without create settings the calls are the plain SDK
         # ones with the SDK's own timeouts.
-        self._create_wait = _create_wait() if create_config else _CREATE_WAIT_MAX
+        self._create_wait = _CREATE_WAIT_MAX
+        if create_config:
+            # Reading the deadline reads Hermes's config; bound it too.
+            try:
+                self._create_wait = _call_within(
+                    started + _DEADLINE_LOOKUP_TIMEOUT, _create_wait)
+            except _CallExpired:
+                self._create_wait = _TOOL_DEADLINE_DEFAULT - _CREATE_DEADLINE_MARGIN
         self._create_deadline = started + self._create_wait
         self._recovery_deadline = self._create_deadline + min(
             _RECOVERY_GET_TIMEOUT, self._create_wait / 2)
@@ -848,7 +859,7 @@ class SpritesEnvironment(BaseEnvironment):
             # must not be sent: the create would start after this attempt
             # gave up.
             if event.endswith("send_request_headers.started") and time.monotonic() >= deadline:
-                raise RuntimeError(f"create of {sprite_name} was cut off before it was sent")
+                raise _CallExpired()  # the usual cut-off handling applies
 
         def _post(client):
             return client.http_client.post(
@@ -953,7 +964,7 @@ class SpritesEnvironment(BaseEnvironment):
             return fn(client)
 
         try:
-            return _call_within(deadline - time.monotonic(), _run)
+            return _call_within(deadline, _run)
         except _CallExpired:
             with lock:
                 expired = True

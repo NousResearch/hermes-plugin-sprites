@@ -1947,6 +1947,43 @@ class TestCreateBudget:
         _time.sleep(1.0)  # the slow setup finishes on the abandoned thread
         platform.client.http_client.post.assert_not_called()
 
+    def test_stalled_deadline_lookup_falls_back_to_default(self, sprites_sdk, hermes_runtime,
+                                                           monkeypatch):
+        """Reading the deadline (Hermes config) is bounded; a stall assumes 420 s."""
+        import threading as _threading
+        import time as _time
+        release = _threading.Event()
+        monkeypatch.setattr("sprites_environment._DEADLINE_LOOKUP_TIMEOUT", 0.3)
+        monkeypatch.setattr("sprites_environment._tool_deadline", lambda: release.wait(10))
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [_create_response()])
+        platform.client.get_sprite.side_effect = [_NotFoundError("nf"), platform.sprite]
+        started = _time.monotonic()
+        try:
+            env = platform.build()
+        finally:
+            release.set()
+        assert _time.monotonic() - started < 1.0
+        assert env._create_wait == 300.0
+
+    def test_send_refused_after_deadline_is_retryable(self, sprites_sdk, hermes_runtime,
+                                                      monkeypatch):
+        """The pre-send hook firing past the deadline gives the usual retryable result."""
+        from tools.environments.base import EnvironmentConnectionError
+        clock = _Clock(monkeypatch)
+        # The caller is descheduled: the call runs to completion on its own.
+        monkeypatch.setattr("sprites_environment._call_within",
+                            lambda deadline, fn, *args: fn(*args))
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [])
+
+        def _post(url, **kwargs):
+            clock.now += 1000  # past the create deadline when about to send
+            kwargs["extensions"]["trace"]("http11.send_request_headers.started", {})
+            raise AssertionError("request sent after the deadline")
+
+        platform.client.http_client.post.side_effect = _post
+        with pytest.raises(EnvironmentConnectionError, match="still being created"):
+            platform.build()
+
     def test_failed_reget_keeps_retryable_error(self, sprites_sdk, hermes_runtime, monkeypatch):
         from tools.environments.base import EnvironmentConnectionError
         platform = _CreatePlatform(sprites_sdk, monkeypatch, [_read_timeout()])

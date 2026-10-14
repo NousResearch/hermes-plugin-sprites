@@ -105,6 +105,7 @@ _DELETE_COMMAND_MAX = 6000
 _REPO_COMPONENT_RE = re.compile(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*")
 _TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 _DIGEST_RE = re.compile(r"[a-z0-9]+(?:[+._-][a-z0-9]+)*:[A-Fa-f0-9]{32,}")
+_DIGEST_HEX_LEN = {"sha256": 64, "sha512": 128}
 _REGISTRY_RE = re.compile(r"[A-Za-z0-9.-]+(?::[0-9]+)?|\[[0-9A-Fa-f:]+\](?::[0-9]+)?")
 
 
@@ -131,6 +132,9 @@ def _validate_image_ref(image) -> str:
     name, at, digest = image.partition("@")
     if at and not _DIGEST_RE.fullmatch(digest):
         raise _bad("a digest looks like name@sha256:<hex>")
+    algo, _, hexpart = digest.partition(":")
+    if at and algo in _DIGEST_HEX_LEN and len(hexpart) != _DIGEST_HEX_LEN[algo]:
+        raise _bad(f"a {algo} digest has exactly {_DIGEST_HEX_LEN[algo]} hex characters")
     head, slash, last = name.rpartition("/")
     repo_last, colon, tag = last.partition(":")
     if colon and not _TAG_RE.fullmatch(tag):

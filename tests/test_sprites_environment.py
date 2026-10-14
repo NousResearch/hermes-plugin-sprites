@@ -1431,6 +1431,7 @@ class TestCreateSettingsValidation:
         "localhost:5000/team/img:2026.10",
         "ubuntu@sha256:" + "a" * 64,
         "ubuntu:latest@sha256:" + "b" * 64,  # a digest pins even with a latest tag
+        "ubuntu@sha512:" + "c" * 128,
     ])
     def test_valid_images(self, image):
         from sprites_environment import resolve_create_settings
@@ -1442,6 +1443,8 @@ class TestCreateSettingsValidation:
         "ubuntu@sha256:", "ubuntu@sha256:not-a-digest", "ubuntu:24.04@", "ubuntu::24.04",
         "Ubuntu:24.04", "ubuntu:24.04@sha256:" + "a" * 64 + "@x", "/ubuntu:24.04",
         "acme//img:1", "ubuntu:-bad", "ubuntu:" + "a" * 129,
+        "ubuntu@sha256:" + "a" * 32, "ubuntu@sha256:" + "a" * 63, "ubuntu@sha256:" + "a" * 65,
+        "ubuntu@sha512:" + "a" * 64,
         42, True, ["ubuntu:24.04"],
     ])
     def test_invalid_images(self, image):

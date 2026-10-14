@@ -10,7 +10,7 @@ import shutil
 import sys
 import types
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -19,11 +19,19 @@ import pytest
 # Mock sprites-py SDK
 # ---------------------------------------------------------------------------
 
-class _NotFoundError(Exception):
+class _SpriteError(Exception):
     pass
 
 
-class _SpriteError(Exception):
+class _NotFoundError(_SpriteError):
+    """Mirror of sprites.exceptions.NotFoundError (a SpriteError subclass)."""
+
+
+class _NetworkError(_SpriteError):
+    pass
+
+
+class _AuthenticationError(_SpriteError):
     pass
 
 
@@ -52,6 +60,8 @@ def _patch_sprites_imports(monkeypatch):
     exc_mod = types.ModuleType("sprites.exceptions")
     exc_mod.NotFoundError = _NotFoundError
     exc_mod.SpriteError = _SpriteError
+    exc_mod.NetworkError = _NetworkError
+    exc_mod.AuthenticationError = _AuthenticationError
     exc_mod.ExitError = _ExitError
     exc_mod.TimeoutError = _SpritesTimeoutError
     sprites_mod.exceptions = exc_mod
@@ -336,12 +346,21 @@ class TestDeleteFailurePropagates:
     therefore leaves stale credential material in a durable Sprite forever.
     """
 
-    def test_unlink_failure_raises(self, make_env):
+    def test_delete_exec_failure_raises(self, make_env):
         env = make_env(task_id="del", persistent_filesystem=True)
-        remote = MagicMock()
-        remote.unlink.side_effect = OSError("websocket dropped")
-        env._fs = MagicMock()
-        env._fs.__truediv__ = MagicMock(return_value=remote)
+        cmd = MagicMock()
+        cmd.combined_output.side_effect = _ExitError(
+            "exit status 1", 1, b"rm: cannot remove: Read-only file system\n"
+        )
+        env._mock_sprite.command = MagicMock(return_value=cmd)
+        with pytest.raises(RuntimeError, match="Read-only file system"):
+            env._sprite_delete(["/home/sprite/.hermes/.env"])
+
+    def test_delete_transport_failure_raises(self, make_env):
+        env = make_env(task_id="del", persistent_filesystem=True)
+        cmd = MagicMock()
+        cmd.combined_output.side_effect = OSError("websocket dropped")
+        env._mock_sprite.command = MagicMock(return_value=cmd)
         with pytest.raises(OSError, match="websocket dropped"):
             env._sprite_delete(["/home/sprite/.hermes/.env"])
 
@@ -656,7 +675,8 @@ class TestDispatchWiring:
 
         class _FakeSpritesEnv:
             def __init__(self, cwd, timeout, persistent_filesystem, task_id,
-                         name_prefix=None, scope=None):
+                         name_prefix=None, scope=None, **extra):
+                captured["extra"] = extra
                 captured.update(
                     cwd=cwd,
                     timeout=timeout,
@@ -685,6 +705,9 @@ class TestDispatchWiring:
             # No plugin settings configured → today's naming.
             assert captured["name_prefix"] is None
             assert captured["scope"] == "session"
+            # Hermes's own ``image`` (the Docker backend's) never reaches the
+            # Sprite, and no create settings are passed when none are set.
+            assert captured["extra"] == {}
         finally:
             reg._reset_for_tests()
 
@@ -858,30 +881,135 @@ class TestRunBashExitCodes:
 # ---------------------------------------------------------------------------
 
 class TestFileSyncPush:
-    def test_upload_writes_via_filesystem_api(self, make_env, tmp_path):
+    def test_upload_is_one_fs_write(self, make_env, tmp_path):
+        """fs/write creates parents itself; no mkdir/stat (fs/list is gone on 2.0)."""
         env = make_env(task_id="fs")
-        # Build a fake host file
         host_file = tmp_path / "secret.txt"
         host_file.write_bytes(b"hello")
 
-        # Mock the SpritePath returned by `fs / remote_path`
         remote_path_obj = MagicMock()
+        env._fs = MagicMock()
         env._fs.__truediv__.return_value = remote_path_obj
 
-        env._sprite_upload(str(host_file), "/home/sprite/.hermes/foo")
-        remote_path_obj.parent.mkdir.assert_called_once_with(
-            parents=True, exist_ok=True
+        env._sprite_upload(str(host_file), "/home/sprite/.hermes/new/dir/foo")
+        env._fs.__truediv__.assert_called_once_with("/home/sprite/.hermes/new/dir/foo")
+        # Same request sprites-py's write_bytes() defaults have always sent.
+        remote_path_obj.write_bytes.assert_called_once_with(
+            b"hello", mode=0o644, mkdir_parents=True
         )
-        remote_path_obj.write_bytes.assert_called_once_with(b"hello")
+        assert remote_path_obj.mock_calls == [
+            call.write_bytes(b"hello", mode=0o644, mkdir_parents=True)
+        ], "upload must not touch parent/mkdir/stat/exists"
 
-    def test_delete_invokes_unlink_per_path(self, make_env):
+
+class TestFileSyncDelete:
+    """Deletes go through one exec per batch: rm -f, then sudo -n rm -f."""
+
+    @staticmethod
+    def _env_with_cmd(make_env, output=b"", exc=None):
         env = make_env(task_id="fsdel")
-        remote_obj = MagicMock()
-        env._fs.__truediv__.return_value = remote_obj
-        env._sprite_delete(["/home/sprite/.hermes/a", "/home/sprite/.hermes/b"])
-        # Each path → one unlink call
-        assert remote_obj.unlink.call_count == 2
-        remote_obj.unlink.assert_any_call(missing_ok=True)
+        cmd = MagicMock()
+        if exc is not None:
+            cmd.combined_output.side_effect = exc
+        else:
+            cmd.combined_output.return_value = output
+        env._mock_sprite.command = MagicMock(return_value=cmd)
+        return env
+
+    def test_one_exec_per_batch_with_sudo_fallback(self, make_env):
+        import shlex
+        env = self._env_with_cmd(make_env)
+        paths = ["/home/sprite/.hermes/a", "/home/sprite/.hermes/b"]
+        env._sprite_delete(paths)
+        assert env._mock_sprite.command.call_count == 1
+        args, kwargs = env._mock_sprite.command.call_args
+        assert args[:2] == ("sh", "-c")
+        quoted = " ".join(shlex.quote(p) for p in paths)
+        assert args[2] == f"rm -f -- {quoted} || sudo -n rm -f -- {quoted}"
+        assert kwargs == {"timeout": 60.0}  # bounded; no env on a normal Sprite
+
+    def test_paths_with_spaces_and_quotes_are_quoted(self, make_env, tmp_path):
+        import shlex
+        import subprocess
+        env = self._env_with_cmd(make_env)
+        weird = [
+            str(tmp_path / "with space.txt"),
+            str(tmp_path / "it's \"quoted\".txt"),
+            str(tmp_path / "-leading-dash"),
+            str(tmp_path / "$(touch pwned)"),
+        ]
+        for p in weird:
+            Path(p).write_text("x")
+        env._sprite_delete(weird)
+        script = env._mock_sprite.command.call_args[0][2]
+        # Each path is exactly one shell word in both halves of the script.
+        rm_part = script.split(" || ")[0]
+        assert shlex.split(rm_part) == ["rm", "-f", "--", *weird]
+        # And the script really removes exactly those files.
+        subprocess.run(["sh", "-c", script], check=True, cwd=tmp_path)
+        assert not any(Path(p).exists() for p in weird)
+        assert not (tmp_path / "pwned").exists()
+
+    def test_missing_file_is_success(self, make_env, tmp_path):
+        import subprocess
+        env = self._env_with_cmd(make_env)
+        env._sprite_delete([str(tmp_path / "never-existed")])
+        script = env._mock_sprite.command.call_args[0][2]
+        # rm -f exits 0 for a missing path, so the exec succeeds.
+        assert subprocess.run(["sh", "-c", script]).returncode == 0
+
+    def test_nonzero_exit_raises(self, make_env):
+        env = self._env_with_cmd(
+            make_env, exc=_ExitError("exit status 1", 1, b"sudo: a password is required\n")
+        )
+        with pytest.raises(RuntimeError, match="exit 1.*password is required"):
+            env._sprite_delete(["/home/sprite/.hermes/.env"])
+
+    def test_sudo_fallback_runs_when_plain_rm_fails(self, make_env, tmp_path):
+        """With rm failing, the script falls back to sudo -n (stubbed here)."""
+        import os
+        import subprocess
+        env = self._env_with_cmd(make_env)
+        env._sprite_delete(["/root-owned/file"])
+        script = env._mock_sprite.command.call_args[0][2]
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        log = tmp_path / "log"
+        (bindir / "rm").write_text(f'#!/bin/sh\necho "rm $*" >> {log}\nexit 1\n')
+        (bindir / "sudo").write_text(f'#!/bin/sh\necho "sudo $*" >> {log}\nexit 0\n')
+        for f in ("rm", "sudo"):
+            (bindir / f).chmod(0o755)
+        envvars = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}")
+        assert subprocess.run(["sh", "-c", script], env=envvars).returncode == 0
+        assert log.read_text().splitlines() == [
+            "rm -f -- /root-owned/file",
+            "sudo -n rm -f -- /root-owned/file",
+        ]
+
+    def test_empty_batch_makes_no_exec(self, make_env):
+        env = self._env_with_cmd(make_env)
+        env._sprite_delete([])
+        env._mock_sprite.command.assert_not_called()
+
+    @pytest.mark.parametrize("name", ["x" * 80, "it's \"q\" " * 8, "skïll-é-日本語" * 4])
+    def test_huge_batch_is_split_by_encoded_size(self, make_env, name):
+        import shlex
+        from urllib.parse import quote
+        env = self._env_with_cmd(make_env)
+        paths = [f"/home/sprite/.hermes/skills/s{i:04d}/{name}" for i in range(200)]
+        env._sprite_delete(paths)
+        scripts = [c.args[2] for c in env._mock_sprite.command.call_args_list]
+        assert len(scripts) > 1
+        # The whole command (both rm halves), as it travels in the exec URL.
+        assert all(len(quote(s, safe="")) <= 6000 for s in scripts)
+        seen = [p for s in scripts for p in shlex.split(s.split(" || ")[0])[3:]]
+        assert seen == paths
+
+    def test_no_filesystem_delete_call(self, make_env):
+        env = self._env_with_cmd(make_env)
+        env._fs = MagicMock()
+        env._sprite_delete(["/home/sprite/.hermes/a"])
+        assert env._fs.mock_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1284,3 +1412,323 @@ class TestSharedSpriteFileSync:
         b.join(10)
         assert not errors, errors
         assert remote[remote_path] == b"new credential version"
+
+
+# ---------------------------------------------------------------------------
+# Create-time settings: image, max_cpus, max_ram_gb, max_disk_gb
+# ---------------------------------------------------------------------------
+
+class TestCreateSettingsValidation:
+    @pytest.mark.parametrize("kwargs", [{}, {"image": None}, {"image": "", "max_cpus": None}])
+    def test_unset_means_no_config(self, kwargs):
+        from sprites_environment import resolve_create_settings
+        assert resolve_create_settings(**kwargs) == {}
+
+    @pytest.mark.parametrize("image", [
+        "ubuntu:24.04",
+        "nousresearch/hermes-sandbox:v0.21.7-desktop",
+        "ghcr.io/acme/agent-env:1.4",
+        "localhost:5000/team/img:2026.10",
+        "ubuntu@sha256:" + "a" * 64,
+        "ubuntu:latest@sha256:" + "b" * 64,  # a digest pins even with a latest tag
+        "ubuntu@sha512:" + "c" * 128,
+    ])
+    def test_valid_images(self, image):
+        from sprites_environment import resolve_create_settings
+        assert resolve_create_settings(image=image) == {"image_url": image}
+
+    @pytest.mark.parametrize("image", [
+        "ubuntu", "ubuntu:latest", "ghcr.io/acme/img:latest", "localhost:5000/img",
+        "ubuntu:", "@sha256:abc", "ubuntu@abc", " ubuntu:24.04", "ubuntu :24.04",
+        "ubuntu@sha256:", "ubuntu@sha256:not-a-digest", "ubuntu:24.04@", "ubuntu::24.04",
+        "Ubuntu:24.04", "ubuntu:24.04@sha256:" + "a" * 64 + "@x", "/ubuntu:24.04",
+        "acme//img:1", "ubuntu:-bad", "ubuntu:" + "a" * 129,
+        "ubuntu@sha256:" + "a" * 32, "ubuntu@sha256:" + "a" * 63, "ubuntu@sha256:" + "a" * 65,
+        "ubuntu@sha512:" + "a" * 64,
+        42, True, ["ubuntu:24.04"],
+    ])
+    def test_invalid_images(self, image):
+        from sprites_environment import resolve_create_settings
+        with pytest.raises(ValueError, match="image"):
+            resolve_create_settings(image=image)
+
+    @pytest.mark.parametrize("key, value", [
+        ("max_cpus", 1), ("max_cpus", 128), ("max_ram_gb", 1), ("max_ram_gb", 1024),
+        ("max_disk_gb", 20), ("max_disk_gb", 1024),
+    ])
+    def test_valid_sizes(self, key, value):
+        from sprites_environment import resolve_create_settings
+        assert resolve_create_settings(**{key: value}) == {key: value}
+
+    @pytest.mark.parametrize("key, value", [
+        ("max_cpus", 0), ("max_cpus", 129), ("max_cpus", -1), ("max_cpus", 2.5),
+        ("max_cpus", "2"), ("max_cpus", True), ("max_ram_gb", 0), ("max_ram_gb", 1025),
+        ("max_disk_gb", 0), ("max_disk_gb", 2048), ("max_disk_gb", False),
+    ])
+    def test_invalid_sizes(self, key, value):
+        from sprites_environment import resolve_create_settings
+        with pytest.raises(ValueError, match=key):
+            resolve_create_settings(**{key: value})
+
+    def test_only_set_keys_are_returned(self):
+        from sprites_environment import resolve_create_settings
+        assert resolve_create_settings(max_ram_gb=4, max_cpus=2) == {
+            "max_cpus": 2, "max_ram_gb": 4,
+        }
+
+
+def _create_response(status=201, name="hermes-fresh", text=""):
+    resp = MagicMock()
+    resp.status_code = status
+    resp.is_success = 200 <= status < 300
+    resp.text = text
+    resp.json.return_value = {"name": name}
+    return resp
+
+
+class TestCreateWithSettings:
+    def test_no_settings_calls_sdk_create_unchanged(self, make_env):
+        """No create settings → the SDK's plain create_sprite(name), nothing else."""
+        env = make_env(task_id="fresh")
+        assert env._mock_client.create_sprite.call_args_list == [call("hermes-fresh")]
+        env._mock_client.http_client.post.assert_not_called()
+        assert env._create_config == {}
+
+    def test_no_settings_ephemeral_calls_sdk_create_unchanged(self, make_env):
+        env = make_env(task_id="mine", persistent_filesystem=False)
+        (name,), kwargs = env._mock_client.create_sprite.call_args
+        assert kwargs == {} and name.startswith("hermes-eph-mine-")
+        env._mock_client.http_client.post.assert_not_called()
+
+    def _build(self, sprites_sdk, monkeypatch, response, get_side_effect=None, **kwargs):
+        monkeypatch.setattr("sprites_environment._resolve_profile_identity", lambda: None)
+        sprite = _make_sprite("hermes-fresh")
+        client = MagicMock()
+        client.base_url = "https://api.sprites.dev"
+        client.http_client.post.return_value = response
+        state = {"n": 0}
+
+        def _get(name):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise _NotFoundError("not found")
+            return sprite
+
+        client.get_sprite.side_effect = get_side_effect or _get
+        sprites_sdk[0].SpritesClient = MagicMock(return_value=client)
+        from sprites_environment import SpritesEnvironment
+        env = SpritesEnvironment(task_id="fresh", **kwargs)
+        return env, client
+
+    def test_subset_config_in_json_body(self, sprites_sdk, hermes_runtime, monkeypatch):
+        env, client = self._build(
+            sprites_sdk, monkeypatch, _create_response(),
+            max_cpus=2, max_disk_gb=20,
+        )
+        client.create_sprite.assert_not_called()
+        (url,), kwargs = client.http_client.post.call_args
+        assert url == "https://api.sprites.dev/v1/sprites"
+        assert kwargs["json"] == {"name": "hermes-fresh",
+                                  "config": {"max_cpus": 2, "max_disk_gb": 20}}
+        assert kwargs["timeout"] >= 600
+        # The handle comes from the SDK (GET after create).
+        assert client.get_sprite.call_args_list == [call("hermes-fresh"), call("hermes-fresh")]
+        assert env._sprite.name == "hermes-fresh"
+
+    def test_full_config_in_json_body(self, sprites_sdk, hermes_runtime, monkeypatch):
+        env, client = self._build(
+            sprites_sdk, monkeypatch, _create_response(),
+            image="nousresearch/hermes-sandbox:v0.21.7-desktop",
+            max_cpus=2, max_ram_gb=4, max_disk_gb=20,
+        )
+        assert client.http_client.post.call_args.kwargs["json"] == {
+            "name": "hermes-fresh",
+            "config": {"image_url": "nousresearch/hermes-sandbox:v0.21.7-desktop",
+                       "max_cpus": 2, "max_ram_gb": 4, "max_disk_gb": 20},
+        }
+
+    def test_ephemeral_create_uses_config(self, sprites_sdk, hermes_runtime, monkeypatch):
+        monkeypatch.setattr("sprites_environment._resolve_profile_identity", lambda: None)
+        client = MagicMock()
+        client.base_url = "https://api.sprites.dev"
+        client.http_client.post.return_value = _create_response()
+        client.get_sprite.return_value = _make_sprite("hermes-eph")
+        sprites_sdk[0].SpritesClient = MagicMock(return_value=client)
+        from sprites_environment import SpritesEnvironment
+        SpritesEnvironment(task_id="mine", persistent_filesystem=False, max_ram_gb=8)
+        body = client.http_client.post.call_args.kwargs["json"]
+        assert body["name"].startswith("hermes-eph-mine-")
+        assert body["config"] == {"max_ram_gb": 8}
+        client.create_sprite.assert_not_called()
+
+    def test_existing_sprite_is_used_as_is(self, sprites_sdk, hermes_runtime, monkeypatch, caplog):
+        """Settings never change an existing Sprite (no create, no PUT config)."""
+        existing = _make_sprite("hermes-fresh")
+        with caplog.at_level("DEBUG", logger="sprites_environment"):
+            env, client = self._build(
+                sprites_sdk, monkeypatch, _create_response(),
+                get_side_effect=lambda name: existing, image="ubuntu:24.04",
+            )
+        client.http_client.post.assert_not_called()
+        client.http_client.put.assert_not_called()
+        client.create_sprite.assert_not_called()
+        assert "apply only when a Sprite is created" in caplog.text
+
+    def test_name_taken_adopts_winner(self, sprites_sdk, hermes_runtime, monkeypatch):
+        """A 409 from the direct create keeps the race-adopt semantics."""
+        env, client = self._build(
+            sprites_sdk, monkeypatch, _create_response(409, text="name already exists"),
+            max_cpus=2,
+        )
+        assert env._sprite.name == "hermes-fresh"
+        assert client.get_sprite.call_count == 2
+
+    @pytest.mark.parametrize("status, exc_type", [
+        (400, _SpriteError), (401, _AuthenticationError), (403, _SpriteError),
+        (404, _NotFoundError), (409, _SpriteError), (429, _SpriteError), (500, _SpriteError),
+    ])
+    def test_genuine_create_error_raises(self, sprites_sdk, hermes_runtime, monkeypatch,
+                                         status, exc_type):
+        """Same exception types as the SDK's create_sprite (_handle_response)."""
+        with pytest.raises(_SpriteError, match="create sprite") as info:
+            self._build(
+                sprites_sdk, monkeypatch, _create_response(status, text="quota exceeded"),
+                get_side_effect=_NotFoundError("not found"), max_cpus=2,
+            )
+        assert type(info.value) is exc_type
+
+    def test_network_error_raises_sprite_error(self, sprites_sdk, hermes_runtime, monkeypatch):
+        import httpx
+        monkeypatch.setattr("sprites_environment._resolve_profile_identity", lambda: None)
+        client = MagicMock()
+        client.base_url = "https://api.sprites.dev"
+        client.http_client.post.side_effect = httpx.ReadTimeout("slow pull")
+        client.get_sprite.side_effect = _NotFoundError("not found")
+        sprites_sdk[0].SpritesClient = MagicMock(return_value=client)
+        from sprites_environment import SpritesEnvironment
+        with pytest.raises(_NetworkError, match="slow pull"):
+            SpritesEnvironment(task_id="fresh", image="ubuntu:24.04")
+
+    def test_invalid_settings_fail_before_any_api_call(self, make_env, sprites_sdk):
+        with pytest.raises(ValueError, match="latest"):
+            make_env(task_id="fresh", image="ubuntu:latest")
+        sprites_sdk[0].SpritesClient.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# HOME fallback for images that run commands with $HOME unset
+# ---------------------------------------------------------------------------
+
+def _sprite_with_home(home: bytes, uid: bytes = b"0\n"):
+    sprite = MagicMock()
+    sprite.name = "hermes-default"
+    outputs = {"echo $HOME": home, "id -u": uid}
+
+    def _command(*args, **kwargs):
+        cmd = MagicMock()
+        cmd.combined_output.return_value = outputs.get(
+            args[-1], b"\n__HERMES_CWD_xxx__/root__HERMES_CWD_xxx__\n"
+        )
+        return cmd
+
+    sprite.command = MagicMock(side_effect=_command)
+    sprite.filesystem.return_value = MagicMock()
+    return sprite
+
+
+class TestHomeFallback:
+    def test_default_image_passes_no_env(self, make_env):
+        env = make_env(task_id="h")
+        assert env._remote_home == "/home/sprite"
+        assert env._exec_env is None
+        for c in env._mock_sprite.command.call_args_list:
+            assert "env" not in c.kwargs
+        cmd = MagicMock()
+        cmd.combined_output.return_value = b"ok"
+        env._mock_sprite.command = MagicMock(return_value=cmd)
+        env._run_bash("true", timeout=5).wait()
+        assert "env" not in env._mock_sprite.command.call_args.kwargs
+
+    def test_empty_home_as_root_sets_home_env(self, make_env):
+        sprite = _sprite_with_home(b"\n", b"0\n")
+        env = make_env(task_id="h", sprite=sprite)
+        assert env._remote_home == "/root"
+        assert env.cwd == "/root"
+        assert env._exec_env == {"HOME": "/root"}
+        # init_session's bootstrap (after detection) already carries HOME.
+        assert sprite.command.call_args_list[-1].kwargs.get("env") == {"HOME": "/root"}
+        cmd = MagicMock()
+        cmd.combined_output.return_value = b"ok"
+        sprite.command = MagicMock(return_value=cmd)
+        env._run_bash("true", timeout=5).wait()
+        assert sprite.command.call_args.kwargs["env"] == {"HOME": "/root"}
+        env._sprite_delete(["/root/.hermes/x"])
+        assert sprite.command.call_args.kwargs["env"] == {"HOME": "/root"}
+
+    def test_empty_home_non_root_keeps_previous_behaviour(self, make_env):
+        sprite = _sprite_with_home(b"\n", b"1000\n")
+        env = make_env(task_id="h", sprite=sprite)
+        assert env._remote_home == "/root"
+        assert env._exec_env is None
+
+    def test_sync_target_follows_fallback_home(self, make_env):
+        sprite = _sprite_with_home(b"", b"0\n")
+        env = make_env(task_id="h", sprite=sprite)
+        assert env._remote_home == "/root"
+
+
+# ---------------------------------------------------------------------------
+# Provider plumbing for the create settings
+# ---------------------------------------------------------------------------
+
+class TestProviderCreateSettings:
+    def test_create_settings_from_config_yaml(self, monkeypatch, isolated_home):
+        import __init__ as plugin_pkg
+        captured = TestProviderSettings._capture(monkeypatch)
+        TestProviderSettings._write_settings(isolated_home, {
+            "image": "ubuntu:24.04", "max_cpus": 2, "max_ram_gb": 4, "max_disk_gb": 20,
+        })
+        plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["image"] == "ubuntu:24.04"
+        assert (captured["max_cpus"], captured["max_ram_gb"], captured["max_disk_gb"]) == (2, 4, 20)
+
+    def test_unset_create_settings_are_not_passed(self, monkeypatch, isolated_home):
+        import __init__ as plugin_pkg
+        captured = TestProviderSettings._capture(monkeypatch)
+        TestProviderSettings._write_settings(isolated_home, {"max_cpus": 2})
+        plugin_pkg.SpritesProvider().create_environment(
+            cwd="/root", timeout=60, task_id="t", image="hermes-docker-image:1"
+        )
+        assert captured["max_cpus"] == 2
+        assert not {"image", "max_ram_gb", "max_disk_gb"} & set(captured)
+
+    def test_invalid_create_setting_refuses_to_create(self, monkeypatch, isolated_home):
+        import __init__ as plugin_pkg
+        captured = TestProviderSettings._capture(monkeypatch)
+        TestProviderSettings._write_settings(isolated_home, {"image": "ubuntu:latest"})
+        with pytest.raises(ValueError, match="latest"):
+            plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured == {}
+
+    def test_doctor_reports_create_settings(self, isolated_home):
+        import __init__ as plugin_pkg
+
+        def _row():
+            return [r for r in plugin_pkg.SpritesProvider().doctor_checks()
+                    if r[1] == "Sprites create settings"][0]
+
+        assert _row() == (True, "Sprites create settings", "default image and sizing")
+        TestProviderSettings._write_settings(isolated_home, {"image": "ubuntu:24.04", "max_cpus": 2})
+        row = _row()
+        assert row[0] is True and "ubuntu:24.04" in row[2] and "max_cpus 2" in row[2]
+        TestProviderSettings._write_settings(isolated_home, {"max_cpus": 0})
+        row = _row()
+        assert row[0] is False and "max_cpus" in row[2]
+
+    def test_manifest_declares_create_settings(self):
+        hub = pytest.importorskip("hermes_cli.plugins_settings")
+        plugin_dir = Path(__file__).resolve().parents[1]
+        fields = {f["key"]: f for f in hub.plugin_settings_fields("sprites", plugin_dir)}
+        assert fields["image"]["type"] == "string"
+        for key in ("max_cpus", "max_ram_gb", "max_disk_gb"):
+            assert fields[key]["type"] == "number"

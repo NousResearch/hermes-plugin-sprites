@@ -13,7 +13,8 @@ Install into ``~/.hermes/plugins/sprites/`` and enable via
 Optional settings (``plugins.entries.sprites.settings.*`` in config.yaml):
 ``name_prefix`` confines every Sprite name to ``<prefix>-*`` and ``scope``
 (``session`` | ``instance``) chooses one Sprite per task id or one per
-profile. See README.md.
+profile; ``image``, ``max_cpus``, ``max_ram_gb`` and ``max_disk_gb`` set the
+image and sizing of newly created Sprites. See README.md.
 
 Attribution: the Sprites environment was authored by Kyle McLaren
 (@kylemclaren, Fly.io) as hermes-agent PR #30112 and hardened through the
@@ -36,7 +37,10 @@ _SPRITES_SPEC = "sprites-py>=0.5.0,<0.6"
 _PLUGIN_ID = "sprites"
 
 #: Plugin settings this backend reads (``plugins.entries.<id>.settings.<key>``).
-_SETTING_KEYS = ("name_prefix", "scope")
+_SETTING_KEYS = ("name_prefix", "scope", "image", "max_cpus", "max_ram_gb", "max_disk_gb")
+
+#: Settings that only shape the create request (see ``resolve_create_settings``).
+_CREATE_SETTING_KEYS = ("image", "max_cpus", "max_ram_gb", "max_disk_gb")
 
 
 def _failed_read_marker() -> Optional[type]:
@@ -111,8 +115,8 @@ def _read_settings(plugin_id: str) -> Dict[str, Any]:
 def _unreadable_config(error: Any) -> RuntimeError:
     return RuntimeError(
         "Sprites backend refused to start: config.yaml could not be read "
-        f"({error}), so its plugin settings (name_prefix, scope) cannot be "
-        "trusted. Fix config.yaml (`hermes config check`)."
+        f"({error}), so its plugin settings (name_prefix, scope, image, "
+        "sizing) cannot be trusted. Fix config.yaml (`hermes config check`)."
     )
 
 
@@ -173,6 +177,23 @@ class SpritesProvider(TerminalEnvironmentProvider):
             from sprites_environment import resolve_naming_settings
         raw = _read_settings(self._plugin_id)
         return resolve_naming_settings(raw["name_prefix"], raw["scope"])
+
+    def _settings(self) -> tuple:
+        """Validated ``(name_prefix, scope, create_settings)`` from one config read.
+
+        ``create_settings`` holds the raw ``image`` / ``max_*`` values that
+        passed validation (``None`` when unset); ``SpritesEnvironment``
+        re-validates them.
+        """
+        if __package__:
+            from .sprites_environment import resolve_create_settings, resolve_naming_settings
+        else:
+            from sprites_environment import resolve_create_settings, resolve_naming_settings
+        raw = _read_settings(self._plugin_id)
+        prefix, scope = resolve_naming_settings(raw["name_prefix"], raw["scope"])
+        create = {key: raw[key] for key in _CREATE_SETTING_KEYS}
+        resolve_create_settings(**create)
+        return prefix, scope, create
 
     @property
     def description(self) -> str:
@@ -271,6 +292,17 @@ class SpritesProvider(TerminalEnvironmentProvider):
                 "Sprites naming",
                 f"prefix {prefix + '-*' if prefix else 'hermes-* (default)'}, scope {scope}",
             ))
+        try:
+            _, _, create = self._settings()
+        except Exception as e:
+            rows.append((False, "Sprites create settings", f"(invalid plugin settings: {e})"))
+        else:
+            chosen = ", ".join(f"{k} {v}" for k, v in create.items() if v not in (None, ""))
+            rows.append((
+                True,
+                "Sprites create settings",
+                f"{chosen} (new Sprites only)" if chosen else "default image and sizing",
+            ))
         return rows
 
     def create_environment(self, *, cwd, timeout, task_id="default",
@@ -283,7 +315,9 @@ class SpritesProvider(TerminalEnvironmentProvider):
             from sprites_environment import SpritesEnvironment
 
         cc = container_config or {}
-        name_prefix, scope = self._naming_settings()
+        name_prefix, scope, create = self._settings()
+        # ``image`` from Hermes (the Docker backend's image setting) is NOT the
+        # Sprite image: only the plugin's own ``image`` setting selects that.
         return SpritesEnvironment(
             cwd=cwd,
             timeout=timeout,
@@ -291,6 +325,7 @@ class SpritesProvider(TerminalEnvironmentProvider):
             task_id=task_id,
             name_prefix=name_prefix,
             scope=scope,
+            **{k: v for k, v in create.items() if v is not None},
         )
 
 

@@ -1947,23 +1947,47 @@ class TestCreateBudget:
         _time.sleep(1.0)  # the slow setup finishes on the abandoned thread
         platform.client.http_client.post.assert_not_called()
 
-    def test_stalled_deadline_lookup_falls_back_to_default(self, sprites_sdk, hermes_runtime,
-                                                           monkeypatch):
-        """Reading the deadline (Hermes config) is bounded; a stall assumes 420 s."""
+    def test_stalled_deadline_lookup_is_retryable(self, sprites_sdk, hermes_runtime,
+                                                  monkeypatch):
+        """Reading the deadline (Hermes config) is bounded; a stall sends no create."""
         import threading as _threading
         import time as _time
+        from tools.environments.base import EnvironmentConnectionError
         release = _threading.Event()
         monkeypatch.setattr("sprites_environment._DEADLINE_LOOKUP_TIMEOUT", 0.3)
         monkeypatch.setattr("sprites_environment._tool_deadline", lambda: release.wait(10))
         platform = _CreatePlatform(sprites_sdk, monkeypatch, [_create_response()])
-        platform.client.get_sprite.side_effect = [_NotFoundError("nf"), platform.sprite]
         started = _time.monotonic()
         try:
-            env = platform.build()
+            with pytest.raises(EnvironmentConnectionError, match="tool deadline") as info:
+                platform.build()
         finally:
             release.set()
         assert _time.monotonic() - started < 1.0
-        assert env._create_wait == 300.0
+        assert "Retry the same command shortly" in info.value.retry_hint
+        platform.client.get_sprite.assert_not_called()
+        platform.client.http_client.post.assert_not_called()
+
+    def test_slow_setup_before_lookup_keeps_real_deadline(self, sprites_sdk, hermes_runtime,
+                                                          monkeypatch):
+        """Slow SDK client setup does not eat the lookup window and swap a short
+        configured deadline for a guessed one."""
+        import time as _time
+        monkeypatch.setattr("sprites_environment._DEADLINE_LOOKUP_TIMEOUT", 0.5)
+        monkeypatch.setattr("sprites_environment._tool_deadline",
+                            lambda: (_time.sleep(0.1), 40.0)[1])  # reads config
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [_create_response()])
+        platform.client.get_sprite.side_effect = [_NotFoundError("nf"), platform.sprite]
+        client_class = sprites_sdk[0].SpritesClient
+
+        def _slow_first(**kwargs):
+            if client_class.call_count == 1:
+                _time.sleep(0.7)
+            return platform.client
+
+        client_class.side_effect = _slow_first
+        env = platform.build()
+        assert env._create_wait == 20.0
 
     def test_send_refused_after_deadline_is_retryable(self, sprites_sdk, hermes_runtime,
                                                       monkeypatch):

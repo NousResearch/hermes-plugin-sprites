@@ -118,7 +118,7 @@ _CREATE_PHASE_TIMEOUT = 15.0
 _RECOVERY_GET_TIMEOUT = 15.0
 
 #: Longest wait for reading Hermes's tool deadline (it reads config.yaml);
-#: past it the default deadline is assumed.
+#: past it construction stops with a retryable error.
 _DEADLINE_LOOKUP_TIMEOUT = 2.0
 
 #: Least create budget left for the POST to be worth sending (capped at a
@@ -687,12 +687,18 @@ class SpritesEnvironment(BaseEnvironment):
         # ones with the SDK's own timeouts.
         self._create_wait = _CREATE_WAIT_MAX
         if create_config:
-            # Reading the deadline reads Hermes's config; bound it too.
+            # Reading the deadline reads Hermes's config; bound it too. A
+            # guessed budget could outlast a short configured deadline, so
+            # give up (retryably, before any create) instead.
             try:
                 self._create_wait = _call_within(
-                    started + _DEADLINE_LOOKUP_TIMEOUT, _create_wait)
+                    time.monotonic() + _DEADLINE_LOOKUP_TIMEOUT, _create_wait)
             except _CallExpired:
-                self._create_wait = _TOOL_DEADLINE_DEFAULT - _CREATE_DEADLINE_MARGIN
+                raise EnvironmentConnectionError(
+                    "Sprite was not created: reading Hermes's tool deadline "
+                    "from its config timed out",
+                    retry_hint="This is not a command failure. Retry the same command shortly.",
+                ) from None
         self._create_deadline = started + self._create_wait
         self._recovery_deadline = self._create_deadline + min(
             _RECOVERY_GET_TIMEOUT, self._create_wait / 2)

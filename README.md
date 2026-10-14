@@ -65,8 +65,13 @@ creates a Sprite. An existing Sprite is resumed as it is; the plugin never
 updates its config (on Sprites 2.0 the image and disk size are fixed at
 creation). To move to a new image or size, delete the Sprite (or change
 `name_prefix`) so the next session creates a fresh one. Creating from an image
-Sprites has not pulled before can take a minute or more; the plugin waits up to
-10 minutes for that create. Most non-base images run commands as root, and some
+Sprites has not pulled before can take a minute or more. The plugin waits for
+that create up to 2 minutes less than Hermes's tool-call deadline (300 s under
+the default 420 s `timeouts.tools.sequential_call` / `concurrent_batch`; 600 s
+when both are disabled). If the create is still running then, the command
+returns a retryable "still being created" result; retry it shortly and it uses
+the Sprite once Sprites has finished creating it (an ephemeral run instead
+deletes the unfinished Sprite and the retry creates a new one). Most non-base images run commands as root, and some
 leave `$HOME` unset: the plugin then uses `/root` as the home directory and
 passes `HOME=/root` to its commands.
 

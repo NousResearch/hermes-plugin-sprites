@@ -112,9 +112,9 @@ _CREATE_WAIT_MAX = 600.0
 #: dominates its total time.
 _CREATE_PHASE_TIMEOUT = 15.0
 
-#: Longest wait for a GET made once the create budget may be spent (the GET
-#: after a failed or timed-out create, and the GET of a created Sprite). It
-#: comes out of the deadline margin, never more than half the create wait.
+#: Extra time after the create budget for the GET of a created Sprite or the
+#: re-GET after a failed create. It comes out of the deadline margin, never
+#: more than half the budget.
 _RECOVERY_GET_TIMEOUT = 15.0
 
 #: Least create budget left for the POST to be worth sending (capped at a
@@ -192,6 +192,40 @@ def _bounded_timeout(total: float):
     return httpx.Timeout(total - phase, connect=phase, write=phase, pool=phase)
 
 
+class _CallExpired(Exception):
+    """A Sprites API call did not return within its share of the budget."""
+
+
+def _call_within(seconds: float, fn, *args):
+    """Return ``fn(*args)``, or raise ``_CallExpired`` after ``seconds``.
+
+    httpx timeouts bound each connect or read, not a whole request: a server
+    that keeps sending bytes slowly can hold a request open indefinitely. The
+    call runs on a daemon thread and the caller stops waiting at ``seconds``,
+    so construction (and the task's creation lock) ends in time. An abandoned
+    call finishes or fails on its own; its result is discarded.
+    """
+    import contextvars
+    result: dict = {}
+    done = threading.Event()
+    context = contextvars.copy_context()
+
+    def _run():
+        try:
+            result["value"] = context.run(fn, *args)
+        except BaseException as e:  # handed to the waiting caller
+            result["error"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, name="sprites-create-call", daemon=True).start()
+    if not done.wait(max(0.0, seconds)):
+        raise _CallExpired()
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
 def _is_name_taken(err: BaseException) -> bool:
     """True for a create rejected because the name exists (HTTP 409).
 
@@ -202,7 +236,7 @@ def _is_name_taken(err: BaseException) -> bool:
 
 
 def _still_creating_error(sprite_name: str, create_config: dict, *,
-                          waited: float | None = None, cause: str | None = None,
+                          waited: float | None = None, name_taken: bool = False,
                           persistent: bool = True) -> EnvironmentConnectionError:
     """Retryable error for a Sprite whose create has not finished yet.
 
@@ -214,8 +248,9 @@ def _still_creating_error(sprite_name: str, create_config: dict, *,
     after = f" after {waited:.0f}s" if waited is not None else ""
     pulling = f" (the first pull of image {image} can take a few minutes)" if image else ""
     reason = f"Sprite {sprite_name} is still being created{after}{pulling}"
-    if cause:
-        reason += f"; create returned: {cause}"
+    if name_taken:
+        # Fixed text: the raw 409 body is not passed to the model.
+        reason += "; Sprites reports the name as taken (HTTP 409) but does not list it yet"
     if persistent:
         next_step = ("the next attempt uses this Sprite once the platform has "
                      "finished creating it.")
@@ -615,7 +650,7 @@ class SpritesEnvironment(BaseEnvironment):
         # Standalone plugin dependencies are installed alongside the plugin,
         # not through Hermes's allowlist of built-in lazy dependencies.
         from sprites import SpritesClient
-        from sprites.exceptions import NotFoundError, SpriteError
+        from sprites.exceptions import NetworkError, NotFoundError, SpriteError
 
         self._NotFoundError = NotFoundError
         self._SpriteError = SpriteError
@@ -636,12 +671,17 @@ class SpritesEnvironment(BaseEnvironment):
         self._name_prefix = prefix
         self._scope = scope
         self._create_config = create_config
-        # Construction budget for the GET + create of a Sprite with create
-        # settings (see _create_wait). Recovery GETs after it is spent come
-        # out of the margin left for the rest of construction.
+        # With create settings, the GET and create share one budget (see
+        # _create_wait); the GET of the created Sprite and the re-GET after a
+        # failed create may run up to a short recovery time past it. Every
+        # such call is cut off at its limit (_call_within), so all of them end
+        # within the tool deadline less the time kept for the rest of
+        # construction. Without create settings the calls are the plain SDK
+        # ones with the SDK's own timeouts.
         self._create_wait = _create_wait() if create_config else _CREATE_WAIT_MAX
         self._create_deadline = started + self._create_wait
-        self._recovery_timeout = min(_RECOVERY_GET_TIMEOUT, self._create_wait / 2)
+        self._recovery_deadline = self._create_deadline + min(
+            _RECOVERY_GET_TIMEOUT, self._create_wait / 2)
         self._lock = threading.Lock()
         self._sprite = None
         # Extra environment for every exec; set only when the Sprite reports
@@ -657,7 +697,7 @@ class SpritesEnvironment(BaseEnvironment):
             self._sprite_name = sprite_name
             try:
                 self._sprite = self._get_sprite_within(
-                    sprite_name, self._budget_left())
+                    sprite_name, self._create_deadline)
                 logger.info(
                     "Sprites: resumed existing sprite %s for task %s",
                     self._sprite.name, task_id,
@@ -689,25 +729,29 @@ class SpritesEnvironment(BaseEnvironment):
                 except (SpriteError, EnvironmentConnectionError) as create_err:
                     try:
                         self._sprite = self._get_sprite_within(
-                            sprite_name, self._recovery_timeout)
+                            sprite_name, self._recovery_deadline)
                         logger.info(
                             "Sprites: adopted sprite %s created concurrently "
                             "or by an earlier attempt (task %s)",
                             self._sprite.name, task_id,
                         )
-                    except NotFoundError:
-                        if _is_name_taken(create_err):
-                            # Name taken but not visible yet: an earlier
-                            # attempt's create is still in progress.
-                            raise _still_creating_error(
-                                sprite_name, self._create_config,
-                                cause=str(create_err),
-                            ) from create_err
-                        raise create_err
-                    except SpriteError:
+                    except (SpriteError, EnvironmentConnectionError) as get_err:
                         if isinstance(create_err, EnvironmentConnectionError):
                             # The re-GET failed too (slow or unreachable
                             # API); the retryable result still applies.
+                            raise create_err
+                        if _is_name_taken(create_err) and (
+                                isinstance(get_err, (NotFoundError, NetworkError,
+                                                     EnvironmentConnectionError))):
+                            # Name taken but not visible (or not checkable)
+                            # yet: an earlier attempt's create is still in
+                            # progress.
+                            logger.debug("Sprites: create of %s returned: %s",
+                                         sprite_name, create_err)
+                            raise _still_creating_error(
+                                sprite_name, self._create_config, name_taken=True,
+                            ) from create_err
+                        if isinstance(get_err, NotFoundError):
                             raise create_err
                         raise
         else:
@@ -782,7 +826,7 @@ class SpritesEnvironment(BaseEnvironment):
         # stays below Hermes's tool deadline: past it the user gets
         # tool_timeout while this constructor runs on and holds the task's
         # creation lock, so every retry would queue behind it.
-        wait = self._budget_left()
+        wait = self._create_deadline - time.monotonic()
         if wait < min(_CREATE_MIN_POST, self._create_wait / 4):
             # The lookup used the budget; nothing was sent, so the retry's
             # GET finds no Sprite and creates it then.
@@ -792,21 +836,16 @@ class SpritesEnvironment(BaseEnvironment):
                 retry_hint="This is not a command failure. Retry the same command shortly.",
             )
         try:
-            response = self._client.http_client.post(
-                f"{self._client.base_url}/v1/sprites",
-                json=body,
-                timeout=_bounded_timeout(wait),
-            )
-        except httpx.ReadTimeout as e:
+            response = _call_within(
+                wait, lambda: self._client.http_client.post(
+                    f"{self._client.base_url}/v1/sprites",
+                    json=body,
+                    timeout=_bounded_timeout(wait),
+                ))
+        except (httpx.ReadTimeout, _CallExpired) as e:
             # The request reached the platform, which may still finish the
             # create. Say so in a retryable result instead of a stack trace.
-            if not self._persistent:
-                # Ephemeral mode never adopts, so if the platform finishes
-                # this unique name later nothing will use or delete it.
-                logger.warning(
-                    "Sprites: create of ephemeral sprite %s timed out; if "
-                    "Sprites finishes it later, delete it by hand", sprite_name,
-                )
+            self._warn_ephemeral_left_behind(sprite_name)
             raise _still_creating_error(
                 sprite_name, self._create_config, waited=wait,
                 persistent=self._persistent,
@@ -825,35 +864,41 @@ class SpritesEnvironment(BaseEnvironment):
             raise self._SpriteError(
                 f"Failed create sprite (status {response.status_code}): {response.text}"
             )
-        return self._get_sprite_within(sprite_name, self._recovery_timeout)
-
-    def _budget_left(self) -> float:
-        """Seconds left of the construction budget for the GET + create."""
-        return self._create_deadline - time.monotonic()
-
-    def _get_sprite_within(self, sprite_name: str, seconds: float):
-        """``get_sprite`` bounded to ``seconds`` when create settings are set.
-
-        The SDK's GET uses the client's default timeout (30 s or the terminal
-        timeout, whichever is longer), which can outlast the budget. Lower it
-        on this environment's own client for one call. With no create
-        settings the call is the plain SDK one, unchanged; so is any client
-        that is not sprites-py's httpx client.
-        """
-        import httpx
-        http = getattr(self._client, "_client", None)
-        if not self._create_config or not isinstance(http, httpx.Client):
-            return self._client.get_sprite(sprite_name)
-        previous = http.timeout
-        seconds = max(1.0, seconds)
-        if (previous.read is not None and previous.connect is not None
-                and seconds >= previous.read + previous.connect):
-            return self._client.get_sprite(sprite_name)  # already within it
-        http.timeout = _bounded_timeout(seconds)
         try:
+            return self._get_sprite_within(sprite_name, self._recovery_deadline)
+        except Exception:
+            # Created, but this attempt cannot use it.
+            self._warn_ephemeral_left_behind(sprite_name)
+            raise
+
+    def _warn_ephemeral_left_behind(self, sprite_name: str) -> None:
+        """Name an ephemeral Sprite this run may leave behind."""
+        if not self._persistent:
+            # Ephemeral mode never adopts, so if the platform finishes this
+            # unique name nothing will use or delete it.
+            logger.warning(
+                "Sprites: ephemeral sprite %s may exist or appear later without "
+                "this run using it; delete it by hand", sprite_name,
+            )
+
+    def _get_sprite_within(self, sprite_name: str, deadline: float):
+        """``get_sprite``, cut off at ``deadline`` (monotonic) with create settings.
+
+        Raises the retryable ``EnvironmentConnectionError`` if the API has
+        not answered by then. With no create settings this is the plain SDK
+        call, unchanged.
+        """
+        if not self._create_config:
             return self._client.get_sprite(sprite_name)
-        finally:
-            http.timeout = previous
+        seconds = deadline - time.monotonic()
+        try:
+            return _call_within(seconds, self._client.get_sprite, sprite_name)
+        except _CallExpired:
+            raise EnvironmentConnectionError(
+                f"Sprite {sprite_name}: the Sprites API did not answer before "
+                "the tool deadline",
+                retry_hint="This is not a command failure. Retry the same command shortly.",
+            ) from None
 
     def _apply_home_fallback(self) -> None:
         """Handle a Sprite whose commands run with ``$HOME`` unset.

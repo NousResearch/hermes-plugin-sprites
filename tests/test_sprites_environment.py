@@ -1531,7 +1531,7 @@ class TestCreateWithSettings:
         assert kwargs["json"] == {"name": "hermes-fresh",
                                   "config": {"max_cpus": 2, "max_disk_gb": 20}}
         # Below Hermes's 420 s tool deadline (see TestCreateWait).
-        assert kwargs["timeout"].read == 300
+        assert kwargs["timeout"].read + kwargs["timeout"].connect == pytest.approx(300, abs=1)
         # The handle comes from the SDK (GET after create).
         assert client.get_sprite.call_args_list == [call("hermes-fresh"), call("hermes-fresh")]
         assert env._sprite.name == "hermes-fresh"
@@ -1663,8 +1663,8 @@ class TestCreateWait:
         platform.client.get_sprite.side_effect = [_NotFoundError("nf"), platform.sprite]
         platform.build()
         timeout = platform.client.http_client.post.call_args.kwargs["timeout"]
-        assert timeout.read == 300
         assert timeout.connect == timeout.write == timeout.pool == 15
+        assert 299 < timeout.read + timeout.connect <= 300
         assert timeout.read + timeout.connect + timeout.write + timeout.pool < 420
 
     def test_timeout_raises_clear_retryable_error(self, sprites_sdk, hermes_runtime, monkeypatch):
@@ -1748,25 +1748,128 @@ class TestCreateWait:
             "Failed create sprite (status 409): exists"
         )
 
-    def test_ephemeral_timeout_deletes_and_says_new_sprite(self, sprites_sdk, hermes_runtime, monkeypatch):
+    def test_ephemeral_timeout_warns_and_says_new_sprite(self, sprites_sdk, hermes_runtime,
+                                                         monkeypatch, caplog):
+        """Ephemeral never adopts: name the abandoned Sprite for manual cleanup."""
         from tools.environments.base import EnvironmentConnectionError
         platform = _CreatePlatform(sprites_sdk, monkeypatch, [_read_timeout()])
-        with pytest.raises(EnvironmentConnectionError) as info:
-            platform.build(persistent_filesystem=False, task_id="mine")
+        with caplog.at_level("WARNING", logger="sprites_environment"):
+            with pytest.raises(EnvironmentConnectionError, match="still being created") as info:
+                platform.build(persistent_filesystem=False, task_id="mine")
         name = platform.client.http_client.post.call_args.kwargs["json"]["name"]
-        platform.client.delete_sprite.assert_called_once_with(name)
+        assert f"create of ephemeral sprite {name} timed out" in caplog.text
+        assert "delete it by hand" in caplog.text
         assert "creates a new Sprite" in info.value.retry_hint
         platform.client.get_sprite.assert_not_called()  # ephemeral never adopts
+        platform.client.delete_sprite.assert_not_called()
 
-    def test_ephemeral_timeout_delete_failure_keeps_error(self, sprites_sdk, hermes_runtime,
-                                                          monkeypatch, caplog):
+    def test_instance_scope_timeout_keeps_one_name(self, sprites_sdk, hermes_runtime, monkeypatch):
+        """Instance scope: a timed-out create is never deleted or renamed; the retry adopts it."""
         from tools.environments.base import EnvironmentConnectionError
         platform = _CreatePlatform(sprites_sdk, monkeypatch, [_read_timeout()])
-        platform.client.delete_sprite.side_effect = _NotFoundError("not yet")
-        with caplog.at_level("WARNING", logger="sprites_environment"):
-            with pytest.raises(EnvironmentConnectionError, match="still being created"):
-                platform.build(persistent_filesystem=False, task_id="mine")
-        assert "delete it by hand" in caplog.text
+        platform.sprite.name = "hermes-default"
+        with pytest.raises(EnvironmentConnectionError) as info:
+            platform.build(task_id="session-a", scope="instance")
+        assert "Sprite hermes-default is still being created" in info.value.reason
+        platform.exists = True
+        env = platform.build(task_id="session-b", scope="instance")
+        assert env._sprite is platform.sprite
+        assert [c.args[0] for c in platform.client.get_sprite.call_args_list] == ["hermes-default"] * 3
+        assert platform.client.http_client.post.call_count == 1
+        platform.client.delete_sprite.assert_not_called()
+        platform.client.create_sprite.assert_not_called()
+
+
+class _Clock:
+    """Fake ``time.monotonic`` for the construction budget."""
+
+    def __init__(self, monkeypatch):
+        self.now = 1000.0
+        monkeypatch.setattr("sprites_environment.time.monotonic", lambda: self.now)
+
+
+class TestCreateBudget:
+    """GET + create share one budget that stays below the tool deadline."""
+
+    def test_post_gets_time_left_after_slow_get(self, sprites_sdk, hermes_runtime, monkeypatch):
+        clock = _Clock(monkeypatch)
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [_create_response()])
+        seen = []
+
+        def _get(name):
+            if not seen:
+                clock.now += 100  # the lookup took 100 s of the 300 s budget
+                seen.append(name)
+                raise _NotFoundError("nf")
+            return platform.sprite
+
+        platform.client.get_sprite.side_effect = _get
+        platform.build()
+        timeout = platform.client.http_client.post.call_args.kwargs["timeout"]
+        assert timeout.read + timeout.connect == pytest.approx(200)
+
+    def test_spent_budget_sends_no_create(self, sprites_sdk, hermes_runtime, monkeypatch):
+        """Friendly-review case: 40 s deadline, the 404 took 25 s; no POST, retryable."""
+        from tools.environments.base import EnvironmentConnectionError
+        monkeypatch.setattr("sprites_environment._tool_deadline", lambda: 40.0)
+        clock = _Clock(monkeypatch)
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [])
+
+        def _get(name):
+            clock.now += 25
+            raise _NotFoundError("nf")
+
+        platform.client.get_sprite.side_effect = _get
+        with pytest.raises(EnvironmentConnectionError) as info:
+            platform.build()
+        assert info.value.reason == (
+            "Sprite hermes-fresh was not created: the Sprites API was too slow "
+            "to answer before the tool deadline")
+        assert "Retry the same command shortly" in info.value.retry_hint
+        platform.client.http_client.post.assert_not_called()
+
+    def test_gets_are_bounded_and_client_timeout_restored(self, sprites_sdk, hermes_runtime,
+                                                          monkeypatch):
+        import httpx
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [_read_timeout()])
+        platform.client._client = httpx.Client(timeout=180.0)
+        seen = []
+
+        def _get(name):
+            t = platform.client._client.timeout
+            seen.append(t.read + t.connect)
+            raise _NotFoundError("nf")
+
+        platform.client.get_sprite.side_effect = _get
+        with pytest.raises(Exception, match="still being created"):
+            platform.build()
+        assert seen[0] == pytest.approx(300, abs=1)  # initial GET: the budget
+        assert seen[1] == pytest.approx(15)          # re-GET after the timeout
+        assert platform.client._client.timeout == httpx.Timeout(180.0)
+
+    def test_failed_reget_keeps_retryable_error(self, sprites_sdk, hermes_runtime, monkeypatch):
+        from tools.environments.base import EnvironmentConnectionError
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [_read_timeout()])
+        platform.client.get_sprite.side_effect = [
+            _NotFoundError("nf"), _NetworkError("read timed out")]
+        with pytest.raises(EnvironmentConnectionError, match="still being created"):
+            platform.build()
+
+    def test_no_settings_get_keeps_sdk_timeout(self, sprites_sdk, hermes_runtime, monkeypatch):
+        import httpx
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [])
+        platform.client._client = httpx.Client(timeout=180.0)
+        platform.client.create_sprite.return_value = platform.sprite
+        seen = []
+
+        def _get(name):
+            seen.append(platform.client._client.timeout)
+            raise _NotFoundError("nf")
+
+        platform.client.get_sprite.side_effect = _get
+        platform.build(image=None)
+        assert seen == [httpx.Timeout(180.0)]
+        assert platform.client.create_sprite.call_args_list == [call("hermes-fresh")]
 
 
 class TestCreateWaitFromDeadline:
@@ -1880,6 +1983,106 @@ class TestCreateTimeoutThroughTerminalTool:
             assert "from Sprite" in second["output"]
             assert client.http_client.post.call_count == 1
         finally:
+            for env in tt._active_environments.values():
+                env.cleanup()
+            manager.unload()
+            reg._reset_for_tests()
+
+    @pytest.mark.parametrize("first_get, reason", [
+        # The 404 arrives at 1.2 s; then the create and the re-GET hang.
+        ((1.2, True), "Sprite hermes-default is still being created"),
+        # Friendly-review case scaled to 4 s: a slow-drip 404 at 2.5 s, past
+        # the GET's own read timeout (httpx times each read, not the total).
+        ((2.5, False), "Sprite hermes-default was not created"),
+    ])
+    def test_short_deadline_returns_before_hermes_times_out(
+        self, isolated_home, hermes_runtime, sprites_sdk, monkeypatch, first_get, reason,
+    ):
+        """Hermes's own deadline poller, 4 s deadline: a slow lookup, a hung create
+        and a hung re-GET still give a degraded result in time and free the lock."""
+        import concurrent.futures
+        import time as _time
+        import types as _types
+        import httpx
+        from hermes_cli import plugins
+        from agent import terminal_env_registry as reg
+        import agent.tool_executor as te
+        import tools.terminal_tool as tt
+
+        plugin_dir = isolated_home / "plugins" / "sprites"
+        shutil.copytree(
+            Path(__file__).resolve().parents[1],
+            plugin_dir,
+            ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", ".pytest_cache", "tests"),
+        )
+        (isolated_home / "config.yaml").write_text(json.dumps({
+            "plugins": {"enabled": ["sprites"],
+                        "entries": {"sprites": {"settings": {"image": "ghcr.io/acme/big:1"}}}},
+            "terminal": {"backend": "sprites"},
+        }))
+        deadline_s = 4.0
+        monkeypatch.setattr(te, "_resolve_sequential_tool_timeout", lambda: deadline_s)
+        monkeypatch.setattr(te, "_resolve_concurrent_tool_timeout", lambda: deadline_s)
+        monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: isolated_home / "bundled")
+        manager = plugins.get_plugin_manager()
+        monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+        monkeypatch.setattr(tt, "_terminal_config_bridge_attempted", False)
+        monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+        monkeypatch.setattr(tt, "_active_environments", {})
+        monkeypatch.setattr(tt, "_last_activity", {})
+        monkeypatch.setattr(tt, "_creation_locks", {})
+
+        client = sprites_sdk[0].SpritesClient.return_value
+        client.base_url = "https://api.sprites.dev"
+        client._client = httpx.Client(timeout=180.0)
+
+        def _hang(delay, read_timeout, exc):
+            # A server that accepts the request and answers late: the client
+            # gives up after its read timeout.
+            _time.sleep(min(delay, read_timeout))
+            if delay > read_timeout:
+                raise exc
+
+        gets = []
+
+        def _get(name):
+            gets.append(name)
+            if len(gets) == 1:
+                delay, honours_timeout = first_get
+                read_timeout = client._client.timeout.read if honours_timeout else delay
+            else:
+                delay, read_timeout = 6.0, client._client.timeout.read  # hung re-GET
+            _hang(delay, read_timeout, _NetworkError("read timed out"))
+            raise _NotFoundError("not found")
+
+        def _post(*args, timeout, **kwargs):
+            _hang(6.0, timeout.read, _read_timeout())
+
+        client.get_sprite.side_effect = _get
+        client.http_client.post.side_effect = _post
+
+        agent = _types.SimpleNamespace(_interrupt_requested=False,
+                                       _touch_activity=lambda *a, **k: None)
+        gate = _types.SimpleNamespace(excluded_seconds=lambda: 0.0)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        reg._reset_for_tests()
+        try:
+            manager.discover_and_load()
+            started = _time.monotonic()
+            future = pool.submit(tt.terminal_tool, "true", task_id="deadline-smoke")
+            state, result = te._poll_sequential_future(
+                agent, future, "terminal", started + deadline_s, started, gate)
+            elapsed = _time.monotonic() - started
+            assert state == "done", f"Hermes timed out after {elapsed:.1f}s"
+            first = json.loads(result)
+            assert first["status"] == "degraded", first
+            assert reason in first["reason"]
+            assert "Retry the same command shortly" in first["retry_hint"]
+            assert elapsed < deadline_s
+            assert not any(lock.locked() for lock in tt._creation_locks.values())
+            assert tt._active_environments == {}
+        finally:
+            pool.shutdown(wait=True)
             for env in tt._active_environments.values():
                 env.cleanup()
             manager.unload()

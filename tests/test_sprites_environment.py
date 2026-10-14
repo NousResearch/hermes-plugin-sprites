@@ -19,11 +19,19 @@ import pytest
 # Mock sprites-py SDK
 # ---------------------------------------------------------------------------
 
-class _NotFoundError(Exception):
+class _SpriteError(Exception):
     pass
 
 
-class _SpriteError(Exception):
+class _NotFoundError(_SpriteError):
+    """Mirror of sprites.exceptions.NotFoundError (a SpriteError subclass)."""
+
+
+class _NetworkError(_SpriteError):
+    pass
+
+
+class _AuthenticationError(_SpriteError):
     pass
 
 
@@ -52,6 +60,8 @@ def _patch_sprites_imports(monkeypatch):
     exc_mod = types.ModuleType("sprites.exceptions")
     exc_mod.NotFoundError = _NotFoundError
     exc_mod.SpriteError = _SpriteError
+    exc_mod.NetworkError = _NetworkError
+    exc_mod.AuthenticationError = _AuthenticationError
     exc_mod.ExitError = _ExitError
     exc_mod.TimeoutError = _SpritesTimeoutError
     sprites_mod.exceptions = exc_mod
@@ -981,14 +991,18 @@ class TestFileSyncDelete:
         env._sprite_delete([])
         env._mock_sprite.command.assert_not_called()
 
-    def test_huge_batch_is_split(self, make_env):
+    @pytest.mark.parametrize("name", ["x" * 80, "it's \"q\" " * 8, "skïll-é-日本語" * 4])
+    def test_huge_batch_is_split_by_encoded_size(self, make_env, name):
+        import shlex
+        from urllib.parse import quote
         env = self._env_with_cmd(make_env)
-        paths = [f"/home/sprite/.hermes/skills/s{i:04d}/" + "x" * 80 for i in range(200)]
+        paths = [f"/home/sprite/.hermes/skills/s{i:04d}/{name}" for i in range(200)]
         env._sprite_delete(paths)
         scripts = [c.args[2] for c in env._mock_sprite.command.call_args_list]
         assert len(scripts) > 1
-        assert all(len(s) < 2 * 6000 + 100 for s in scripts)
-        seen = [p for s in scripts for p in s.split(" || ")[0].split()[3:]]
+        # The whole command (both rm halves), as it travels in the exec URL.
+        assert all(len(quote(s, safe="")) <= 6000 for s in scripts)
+        seen = [p for s in scripts for p in shlex.split(s.split(" || ")[0])[3:]]
         assert seen == paths
 
     def test_no_filesystem_delete_call(self, make_env):
@@ -1425,6 +1439,9 @@ class TestCreateSettingsValidation:
     @pytest.mark.parametrize("image", [
         "ubuntu", "ubuntu:latest", "ghcr.io/acme/img:latest", "localhost:5000/img",
         "ubuntu:", "@sha256:abc", "ubuntu@abc", " ubuntu:24.04", "ubuntu :24.04",
+        "ubuntu@sha256:", "ubuntu@sha256:not-a-digest", "ubuntu:24.04@", "ubuntu::24.04",
+        "Ubuntu:24.04", "ubuntu:24.04@sha256:" + "a" * 64 + "@x", "/ubuntu:24.04",
+        "acme//img:1", "ubuntu:-bad", "ubuntu:" + "a" * 129,
         42, True, ["ubuntu:24.04"],
     ])
     def test_invalid_images(self, image):
@@ -1563,13 +1580,19 @@ class TestCreateWithSettings:
         assert env._sprite.name == "hermes-fresh"
         assert client.get_sprite.call_count == 2
 
-    @pytest.mark.parametrize("status", [400, 401, 403, 409, 429, 500])
-    def test_genuine_create_error_raises(self, sprites_sdk, hermes_runtime, monkeypatch, status):
-        with pytest.raises(_SpriteError, match="create sprite"):
+    @pytest.mark.parametrize("status, exc_type", [
+        (400, _SpriteError), (401, _AuthenticationError), (403, _SpriteError),
+        (404, _NotFoundError), (409, _SpriteError), (429, _SpriteError), (500, _SpriteError),
+    ])
+    def test_genuine_create_error_raises(self, sprites_sdk, hermes_runtime, monkeypatch,
+                                         status, exc_type):
+        """Same exception types as the SDK's create_sprite (_handle_response)."""
+        with pytest.raises(_SpriteError, match="create sprite") as info:
             self._build(
                 sprites_sdk, monkeypatch, _create_response(status, text="quota exceeded"),
                 get_side_effect=_NotFoundError("not found"), max_cpus=2,
             )
+        assert type(info.value) is exc_type
 
     def test_network_error_raises_sprite_error(self, sprites_sdk, hermes_runtime, monkeypatch):
         import httpx
@@ -1580,7 +1603,7 @@ class TestCreateWithSettings:
         client.get_sprite.side_effect = _NotFoundError("not found")
         sprites_sdk[0].SpritesClient = MagicMock(return_value=client)
         from sprites_environment import SpritesEnvironment
-        with pytest.raises(_SpriteError, match="slow pull"):
+        with pytest.raises(_NetworkError, match="slow pull"):
             SpritesEnvironment(task_id="fresh", image="ubuntu:24.04")
 
     def test_invalid_settings_fail_before_any_api_call(self, make_env, sprites_sdk):

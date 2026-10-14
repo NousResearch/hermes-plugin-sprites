@@ -35,6 +35,7 @@ import shlex
 import threading
 import uuid
 from pathlib import Path
+from urllib.parse import quote as _url_quote
 
 from tools.environments.base import BaseEnvironment
 
@@ -95,43 +96,57 @@ _CREATE_WITH_CONFIG_TIMEOUT = 600.0
 #: Client wait for the exec that deletes synced files.
 _DELETE_TIMEOUT = 60.0
 
-#: Upper bound on the quoted paths in one delete exec. The command travels in
-#: the exec URL, so a very large batch is split into several execs.
-_DELETE_BATCH_CHARS = 6000
+#: Upper bound on one delete command, measured URL-encoded (the command
+#: travels in the exec URL), so a very large batch is split into several execs.
+_DELETE_COMMAND_MAX = 6000
+
+#: OCI reference pieces (distribution/reference grammar, simplified): a
+#: repository path component, a tag, and an ``algorithm:hex`` digest.
+_REPO_COMPONENT_RE = re.compile(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*")
+_TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+_DIGEST_RE = re.compile(r"[a-z0-9]+(?:[+._-][a-z0-9]+)*:[A-Fa-f0-9]{32,}")
+_REGISTRY_RE = re.compile(r"[A-Za-z0-9.-]+(?::[0-9]+)?|\[[0-9A-Fa-f:]+\](?::[0-9]+)?")
 
 
 def _validate_image_ref(image) -> str:
     """Return ``image`` if it is a pinned OCI reference, else raise ``ValueError``.
 
-    Sprites requires an explicit tag (not ``latest``) or a digest.
+    Sprites requires an explicit tag (not ``latest``) or a digest. The check
+    follows the OCI reference grammar closely enough to reject malformed
+    values (empty or non-hex digests, stray separators) before any API call.
     """
     if not isinstance(image, str):
         raise ValueError(
             "Sprites plugin setting image must be a string, got "
             f"{type(image).__name__} ({image!r})"
         )
-    if image != image.strip() or any(c.isspace() for c in image):
-        raise ValueError(f"Sprites plugin setting image {image!r} must not contain whitespace")
-    name, _, digest = image.partition("@")
-    if digest:
-        if not name or ":" not in digest:
-            raise ValueError(
-                f"Sprites plugin setting image {image!r} is invalid: a digest "
-                "looks like name@sha256:<hex>"
-            )
-        return image
-    last = name.rsplit("/", 1)[-1]
-    repo, sep, tag = last.partition(":")
-    if not repo or not sep or not tag:
-        raise ValueError(
-            f"Sprites plugin setting image {image!r} needs an explicit tag or "
-            "digest (for example ubuntu:24.04 or name@sha256:<hex>)"
-        )
-    if tag == "latest":
-        raise ValueError(
-            f"Sprites plugin setting image {image!r} uses the latest tag, which "
-            "Sprites rejects: pin a version tag or a digest"
-        )
+
+    def _bad(reason: str) -> ValueError:
+        return ValueError(f"Sprites plugin setting image {image!r} is invalid: {reason}")
+
+    if any(c.isspace() for c in image):
+        raise _bad("it must not contain whitespace")
+    if image.count("@") > 1:
+        raise _bad("more than one '@'")
+    name, at, digest = image.partition("@")
+    if at and not _DIGEST_RE.fullmatch(digest):
+        raise _bad("a digest looks like name@sha256:<hex>")
+    head, slash, last = name.rpartition("/")
+    repo_last, colon, tag = last.partition(":")
+    if colon and not _TAG_RE.fullmatch(tag):
+        raise _bad(f"tag {tag!r} is not a valid tag")
+    path = f"{head}{slash}{repo_last}"
+    parts = path.split("/")
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+        if not _REGISTRY_RE.fullmatch(parts[0]):
+            raise _bad(f"registry {parts[0]!r} is not valid")
+        parts = parts[1:]
+    if not parts or not all(_REPO_COMPONENT_RE.fullmatch(p) for p in parts):
+        raise _bad("the repository name must be lowercase letters, digits and . _ - separators")
+    if not at and not tag:
+        raise _bad("it needs an explicit tag or digest (for example ubuntu:24.04 or name@sha256:<hex>)")
+    if not at and tag == "latest":
+        raise _bad("the latest tag is rejected by Sprites; pin a version tag or a digest")
     return image
 
 
@@ -414,18 +429,25 @@ def _ephemeral_sprite_name(task_id: str, prefix: str | None = None) -> str:
     return _bounded_name(f"eph-{display}", nonce, prefix or _DEFAULT_HEAD)
 
 
+def _delete_script(paths: list[str]) -> str:
+    """``rm -f`` the paths, retrying with ``sudo -n`` if the plain rm fails."""
+    quoted = " ".join(shlex.quote(p) for p in paths)
+    return f"rm -f -- {quoted} || sudo -n rm -f -- {quoted}"
+
+
 def _delete_batches(paths: list[str]) -> list[list[str]]:
-    """Split ``paths`` so each delete command stays under ``_DELETE_BATCH_CHARS``."""
+    """Split ``paths`` so each URL-encoded delete command fits ``_DELETE_COMMAND_MAX``.
+
+    A single path longer than the budget still gets its own batch.
+    """
     batches: list[list[str]] = []
     current: list[str] = []
-    size = 0
     for p in paths:
-        n = len(shlex.quote(p)) + 1
-        if current and size + n > _DELETE_BATCH_CHARS:
+        candidate = current + [p]
+        if current and len(_url_quote(_delete_script(candidate), safe="")) > _DELETE_COMMAND_MAX:
             batches.append(current)
-            current, size = [], 0
-        current.append(p)
-        size += n
+            candidate = [p]
+        current = candidate
     if current:
         batches.append(current)
     return batches
@@ -601,6 +623,7 @@ class SpritesEnvironment(BaseEnvironment):
             return self._client.create_sprite(sprite_name)
 
         import httpx
+        from sprites.exceptions import AuthenticationError, NetworkError
 
         body = {"name": sprite_name, "config": dict(self._create_config)}
         try:
@@ -610,12 +633,16 @@ class SpritesEnvironment(BaseEnvironment):
                 timeout=_CREATE_WITH_CONFIG_TIMEOUT,
             )
         except httpx.RequestError as e:
-            raise self._SpriteError(f"Network error creating sprite: {e}") from e
+            raise NetworkError(f"Network error creating sprite: {e}") from e
+        # Same exception types as the SDK's create_sprite (all SpriteError
+        # subclasses). A 409 (name taken) raises SpriteError like any other
+        # failure, so the caller's re-GET adopts a Sprite another process
+        # created.
         if response.status_code == 401:
-            raise self._SpriteError("Authentication failed for create sprite")
+            raise AuthenticationError("Authentication failed for create sprite")
+        if response.status_code == 404:
+            raise self._NotFoundError("Resource not found for create sprite")
         if not response.is_success:
-            # A 409 (name taken) lands here like any other failure, so the
-            # caller's re-GET adopts a Sprite another process created.
             raise self._SpriteError(
                 f"Failed create sprite (status {response.status_code}): {response.text}"
             )
@@ -679,8 +706,7 @@ class SpritesEnvironment(BaseEnvironment):
         from sprites.exceptions import ExitError
 
         for batch in _delete_batches(remote_paths):
-            quoted = " ".join(shlex.quote(p) for p in batch)
-            script = f"rm -f -- {quoted} || sudo -n rm -f -- {quoted}"
+            script = _delete_script(batch)
             cmd = self._sprite.command(
                 "sh", "-c", script, timeout=_DELETE_TIMEOUT,
                 **self._command_kwargs(),

@@ -1932,6 +1932,14 @@ class TestCreateConflictAndLeaks:
         with pytest.raises(_AuthenticationError):
             platform.build()
 
+    def test_timeout_then_reget_auth_error_is_not_masked(self, sprites_sdk, hermes_runtime,
+                                                         monkeypatch):
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [_read_timeout()])
+        platform.client.get_sprite.side_effect = [
+            _NotFoundError("nf"), _AuthenticationError("bad token")]
+        with pytest.raises(_AuthenticationError):
+            platform.build()
+
     def test_ephemeral_created_then_get_fails_names_sprite(self, sprites_sdk, hermes_runtime,
                                                            monkeypatch, caplog):
         platform = _CreatePlatform(sprites_sdk, monkeypatch, [_create_response()])
@@ -2138,21 +2146,29 @@ class TestCreateTimeoutThroughTerminalTool:
         monkeypatch.setattr(tt, "_last_activity", {})
         monkeypatch.setattr(tt, "_creation_locks", {})
 
-        http = httpx.Client(timeout=30.0)  # the SDK client's default timeout
-        client = sprites_sdk[0].SpritesClient.return_value
-        client.base_url = base_url
-        client.http_client = http  # the real POST
         gets = []
+        clients = []
 
-        def _get(name):
-            gets.append(name)
-            if ("GET" if len(gets) == 1 else "REGET") in drip:
-                http.get(f"{base_url}/v1/sprites/{name}")
-            raise _NotFoundError("not found")
+        def _new_client(token=None, base_url_=None, timeout=30.0, **kwargs):
+            # One SDK client per construction or bounded call, each with a
+            # real httpx client; close() closes it like sprites-py's.
+            http = httpx.Client(timeout=timeout)
+            client = MagicMock()
+            client.token, client.base_url = "test-token", base_url
+            client.http_client = http if "POST" in drip else MagicMock()
+            client.close.side_effect = http.close
 
-        client.get_sprite.side_effect = _get
-        if "POST" not in drip:
-            client.http_client = MagicMock()
+            def _get(name):
+                gets.append(name)
+                if ("GET" if len(gets) == 1 else "REGET") in drip:
+                    http.get(f"{base_url}/v1/sprites/{name}")
+                raise _NotFoundError("not found")
+
+            client.get_sprite.side_effect = _get
+            clients.append(client)
+            return client
+
+        sprites_sdk[0].SpritesClient = MagicMock(side_effect=_new_client)
 
         agent = _types.SimpleNamespace(_interrupt_requested=False,
                                        _touch_activity=lambda *a, **k: None)
@@ -2174,12 +2190,18 @@ class TestCreateTimeoutThroughTerminalTool:
             assert elapsed < deadline_s
             assert not any(lock.locked() for lock in tt._creation_locks.values())
             assert tt._active_environments == {}
+            # The abandoned requests stop too: their clients were closed, so
+            # each ends at the next trickled byte instead of running on.
+            _time.sleep(1.0)
+            assert not [th for th in _threading.enumerate()
+                        if th.name == "sprites-create-call" and th.is_alive()]
         finally:
             stop.set()
             pool.shutdown(wait=True)
             server.shutdown()
             server.server_close()
-            http.close()
+            for client in clients:
+                client.close()
             for env in tt._active_environments.values():
                 env.cleanup()
             manager.unload()

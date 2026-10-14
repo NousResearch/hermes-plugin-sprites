@@ -68,7 +68,9 @@ creation). To move to a new image or size, delete the Sprite (or change
 Sprites has not pulled before can take a minute or more. Looking up and
 creating the Sprite together get up to 2 minutes less than Hermes's tool-call
 deadline (300 s under the default 420 s `timeouts.tools.sequential_call` /
-`concurrent_batch`; 600 s when both are disabled). If the create is still
+`concurrent_batch`; 600 s when both are disabled; 30 s for deadlines under
+150 s, half the deadline under 60 s), plus up to 15 s (at most half that budget) to
+fetch the Sprite afterwards. If the create is still
 running then, the command returns a retryable "still being created" result;
 retry it shortly and it uses the same Sprite (same name) once Sprites has
 finished creating it. An ephemeral run (`container_persistent: false`) never

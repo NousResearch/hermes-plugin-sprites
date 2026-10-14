@@ -202,8 +202,9 @@ def _call_within(seconds: float, fn, *args):
     httpx timeouts bound each connect or read, not a whole request: a server
     that keeps sending bytes slowly can hold a request open indefinitely. The
     call runs on a daemon thread and the caller stops waiting at ``seconds``,
-    so construction (and the task's creation lock) ends in time. An abandoned
-    call finishes or fails on its own; its result is discarded.
+    so construction (and the task's creation lock) ends in time. Callers
+    close the abandoned call's client (see ``_bounded_call``) so it stops
+    too; its result is discarded.
     """
     import contextvars
     result: dict = {}
@@ -650,7 +651,9 @@ class SpritesEnvironment(BaseEnvironment):
         # Standalone plugin dependencies are installed alongside the plugin,
         # not through Hermes's allowlist of built-in lazy dependencies.
         from sprites import SpritesClient
-        from sprites.exceptions import NetworkError, NotFoundError, SpriteError
+        from sprites.exceptions import (
+            AuthenticationError, NetworkError, NotFoundError, SpriteError,
+        )
 
         self._NotFoundError = NotFoundError
         self._SpriteError = SpriteError
@@ -736,6 +739,8 @@ class SpritesEnvironment(BaseEnvironment):
                             self._sprite.name, task_id,
                         )
                     except (SpriteError, EnvironmentConnectionError) as get_err:
+                        if isinstance(get_err, AuthenticationError):
+                            raise  # a bad token is not "still creating"
                         if isinstance(create_err, EnvironmentConnectionError):
                             # The re-GET failed too (slow or unreachable
                             # API); the retryable result still applies.
@@ -836,9 +841,9 @@ class SpritesEnvironment(BaseEnvironment):
                 retry_hint="This is not a command failure. Retry the same command shortly.",
             )
         try:
-            response = _call_within(
-                wait, lambda: self._client.http_client.post(
-                    f"{self._client.base_url}/v1/sprites",
+            response = self._bounded_call(
+                wait, lambda client: client.http_client.post(
+                    f"{client.base_url}/v1/sprites",
                     json=body,
                     timeout=_bounded_timeout(wait),
                 ))
@@ -892,13 +897,37 @@ class SpritesEnvironment(BaseEnvironment):
             return self._client.get_sprite(sprite_name)
         seconds = deadline - time.monotonic()
         try:
-            return _call_within(seconds, self._client.get_sprite, sprite_name)
+            sprite = self._bounded_call(
+                seconds, lambda client: client.get_sprite(sprite_name))
         except _CallExpired:
             raise EnvironmentConnectionError(
                 f"Sprite {sprite_name}: the Sprites API did not answer before "
                 "the tool deadline",
                 retry_hint="This is not a command failure. Retry the same command shortly.",
             ) from None
+        # The per-call client is closed; run the Sprite on this
+        # environment's client like any other.
+        sprite.client = self._client
+        return sprite
+
+    def _bounded_call(self, seconds: float, fn):
+        """``fn(client)`` on a fresh SDK client, cut off at ``seconds``.
+
+        The client is closed afterwards in every case. On a cut-off that
+        ends the abandoned request at its next read, or at the latest when
+        its own per-read timeout (also ``seconds``) fires, so retries do not
+        pile up open requests.
+        """
+        from sprites import SpritesClient
+        client = SpritesClient(
+            token=self._client.token,
+            base_url=self._client.base_url,
+            timeout=max(1.0, seconds),
+        )
+        try:
+            return _call_within(seconds, fn, client)
+        finally:
+            client.close()
 
     def _apply_home_fallback(self) -> None:
         """Handle a Sprite whose commands run with ``$HOME`` unset.

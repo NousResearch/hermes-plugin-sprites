@@ -840,25 +840,27 @@ class SpritesEnvironment(BaseEnvironment):
                 "too slow to answer before the tool deadline",
                 retry_hint="This is not a command failure. Retry the same command shortly.",
             )
-        cut_off = threading.Event()
+        deadline = self._create_deadline
 
         def _no_send_after_cut_off(event: str, info) -> None:
             # httpx trace hook, run just before the request is written. A
-            # POST still resolving or connecting at the cut-off must not be
-            # sent: the create would start after this attempt gave up.
-            if cut_off.is_set() and event.endswith("send_request_headers.started"):
+            # POST still setting up, resolving or connecting at the cut-off
+            # must not be sent: the create would start after this attempt
+            # gave up.
+            if event.endswith("send_request_headers.started") and time.monotonic() >= deadline:
                 raise RuntimeError(f"create of {sprite_name} was cut off before it was sent")
 
+        def _post(client):
+            return client.http_client.post(
+                f"{client.base_url}/v1/sprites",
+                json=body,
+                timeout=_bounded_timeout(max(0.1, deadline - time.monotonic())),
+                extensions={"trace": _no_send_after_cut_off},
+            )
+
         try:
-            response = self._bounded_call(
-                wait, lambda client: client.http_client.post(
-                    f"{client.base_url}/v1/sprites",
-                    json=body,
-                    timeout=_bounded_timeout(wait),
-                    extensions={"trace": _no_send_after_cut_off},
-                ))
+            response = self._bounded_call(deadline, _post)
         except (httpx.ReadTimeout, _CallExpired) as e:
-            cut_off.set()
             # The request may have reached the platform, which may still
             # finish the create. Say so in a retryable result instead of a
             # stack trace.
@@ -907,10 +909,9 @@ class SpritesEnvironment(BaseEnvironment):
         """
         if not self._create_config:
             return self._client.get_sprite(sprite_name)
-        seconds = deadline - time.monotonic()
         try:
             sprite = self._bounded_call(
-                seconds, lambda client: client.get_sprite(sprite_name))
+                deadline, lambda client: client.get_sprite(sprite_name))
         except _CallExpired:
             raise EnvironmentConnectionError(
                 f"Sprite {sprite_name}: the Sprites API did not answer before "
@@ -922,27 +923,45 @@ class SpritesEnvironment(BaseEnvironment):
         sprite.client = self._client
         return sprite
 
-    def _bounded_call(self, seconds: float, fn):
-        """``fn(client)`` on a fresh SDK client, cut off at ``seconds``.
+    def _bounded_call(self, deadline: float, fn):
+        """``fn(client)`` on a fresh SDK client, cut off at ``deadline`` (monotonic).
 
-        The client is closed afterwards in every case. On a cut-off that
+        The client is built on the bounded thread too, with timeouts from the
+        time left, and is closed afterwards in every case. On a cut-off that
         usually ends the abandoned request at its next read, or when its own
-        per-read timeout (also ``seconds``) fires, so retries do not pile up
-        open requests. Best effort: a request still resolving DNS or
-        connecting at the cut-off can connect afterwards and run on. The
-        create POST is never sent after its cut-off (see _create_sprite); a
-        late GET only reads.
+        per-read timeout fires, so retries do not pile up open requests.
+        Best effort: a request still resolving DNS or connecting at the
+        cut-off can connect afterwards and run on. The create POST is never
+        sent after its cut-off (see _create_sprite); a late GET only reads.
         """
         from sprites import SpritesClient
-        client = SpritesClient(
-            token=self._client.token,
-            base_url=self._client.base_url,
-            timeout=max(1.0, seconds),
-        )
+        token, base_url = self._client.token, self._client.base_url
+        clients: list = []
+        lock = threading.Lock()
+        expired = False
+
+        def _run():
+            client = SpritesClient(
+                token=token, base_url=base_url,
+                timeout=max(1.0, deadline - time.monotonic()),
+            )
+            with lock:
+                if expired:  # cut off while the client was being built
+                    client.close()
+                    raise _CallExpired()
+                clients.append(client)
+            return fn(client)
+
         try:
-            return _call_within(seconds, fn, client)
+            return _call_within(deadline - time.monotonic(), _run)
+        except _CallExpired:
+            with lock:
+                expired = True
+            raise
         finally:
-            client.close()
+            with lock:
+                for client in clients:
+                    client.close()
 
     def _apply_home_fallback(self) -> None:
         """Handle a Sprite whose commands run with ``$HOME`` unset.

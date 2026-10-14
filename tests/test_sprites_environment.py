@@ -1919,6 +1919,34 @@ class TestCreateBudget:
             server.server_close()
             real.close()
 
+    @pytest.mark.parametrize("slow_call", ["GET", "POST"])
+    def test_slow_client_setup_is_inside_the_cut_off(self, sprites_sdk, hermes_runtime,
+                                                     monkeypatch, slow_call):
+        """Building the per-call client counts against the budget; a POST whose
+        client was still being built at the cut-off is never sent."""
+        import time as _time
+        from tools.environments.base import EnvironmentConnectionError
+        monkeypatch.setattr("sprites_environment._tool_deadline", lambda: 2.0)  # budget 1 s
+        platform = _CreatePlatform(sprites_sdk, monkeypatch, [_create_response()])
+        made = []
+        slow_index = {"GET": 1, "POST": 2}[slow_call]  # 0 is the environment's client
+
+        def _make(**kwargs):
+            made.append(kwargs)
+            if len(made) - 1 == slow_index:
+                _time.sleep(1.5)  # slow TLS / trust-store setup
+            return platform.client
+
+        sprites_sdk[0].SpritesClient = MagicMock(side_effect=_make)
+        started = _time.monotonic()
+        with pytest.raises(EnvironmentConnectionError) as info:
+            platform.build()
+        assert _time.monotonic() - started < 1.6
+        expected = {"GET": "did not answer", "POST": "still being created"}[slow_call]
+        assert expected in info.value.reason
+        _time.sleep(1.0)  # the slow setup finishes on the abandoned thread
+        platform.client.http_client.post.assert_not_called()
+
     def test_failed_reget_keeps_retryable_error(self, sprites_sdk, hermes_runtime, monkeypatch):
         from tools.environments.base import EnvironmentConnectionError
         platform = _CreatePlatform(sprites_sdk, monkeypatch, [_read_timeout()])

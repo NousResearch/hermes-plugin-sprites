@@ -38,13 +38,18 @@ discovery and terminal dispatch with mocked SDK transport.
 
 ## Settings
 
-Two optional settings live in the plugin's own namespace in `config.yaml`,
+Optional settings live in the plugin's own namespace in `config.yaml`,
 `plugins.entries.sprites.settings` (they also appear in the Plugins hub). With
-neither set, behaviour and Sprite names are exactly as described above.
+none set, behaviour, Sprite names and API requests are exactly as described
+above.
 
 | Key | Values | Effect |
 |---|---|---|
 | `name_prefix` | lowercase letters, digits and single hyphens; max 40 chars | Every Sprite name starts with `<prefix>-` instead of `hermes-`: `<prefix>-{task}` on the default profile, `<prefix>-{display}-{digest12}` on named profiles, `<prefix>-eph-{task}-{nonce}` for ephemeral runs. The prefix is never truncated, and the plugin refuses to create or resume any Sprite outside it. |
+| `image` | OCI reference with an explicit tag (not `latest`) or a digest | Image for Sprites this plugin creates. Prefer a digest pin (`name@sha256:...`) so every new Sprite gets the same bytes. Unset: the Sprites base image (Ubuntu, `sprite` user, sudo). |
+| `max_cpus` | 1 to 128 | vCPUs for newly created Sprites. Unset: Sprites default. |
+| `max_ram_gb` | 1 to 1024 | Memory (GB) for newly created Sprites. Unset: Sprites default. |
+| `max_disk_gb` | 1 to 1024, no smaller than the image | Root filesystem (GB) for newly created Sprites. Unset: Sprites default. |
 | `scope` | `session` (default) \| `instance` | `instance` makes every task id on a profile (gateway sessions, cron jobs, `delegate_task` children, CLI) resume the same persistent Sprite: `<prefix>-default` (or `hermes-default` without a prefix) on the default profile, the usual digest-scoped `-default` name on a named profile. Each session still gets its own shell; they share the VM and filesystem (file sync into the Sprite is serialised across sessions in one process). |
 
 An invalid value for either key is an error, not a fallback: the backend
@@ -54,6 +59,23 @@ then runs on a fallback copy of the config that may not contain the settings
 you just wrote. Ignoring a bad prefix would create Sprites outside the namespace you meant
 to confine this install to; ignoring a misspelt scope would quietly start
 creating one Sprite per session.
+
+`image`, `max_cpus`, `max_ram_gb` and `max_disk_gb` apply only when the plugin
+creates a Sprite. An existing Sprite is resumed as it is; the plugin never
+updates its config (on Sprites 2.0 the image and disk size are fixed at
+creation). To move to a new image or size, delete the Sprite (or change
+`name_prefix`) so the next session creates a fresh one. Creating from an image
+Sprites has not pulled before can take a minute or more; the plugin waits up to
+10 minutes for that create. Most non-base images run commands as root, and some
+leave `$HOME` unset: the plugin then uses `/root` as the home directory and
+passes `HOME=/root` to its commands.
+
+```bash
+hermes config set plugins.entries.sprites.settings.image 'nousresearch/hermes-sandbox@sha256:<digest>'
+hermes config set plugins.entries.sprites.settings.max_cpus 2
+hermes config set plugins.entries.sprites.settings.max_ram_gb 4
+hermes config set plugins.entries.sprites.settings.max_disk_gb 20
+```
 
 `scope` only affects persistent Sprites. Ephemeral mode
 (`terminal.container_persistent: false`) keeps its run-unique names under either
@@ -89,6 +111,21 @@ deterministic name. Notes:
 - Changing either setting changes which Sprite is resumed. The previous
   Sprite is not deleted; remove it with the Sprites CLI or API if you no longer
   need its files.
+
+## Sprites 2.0 runtime
+
+Sprites now run on the 2.0 runtime, behind the same `https://api.sprites.dev/v1`
+paths. Of the filesystem API it keeps only `fs/write`, which creates missing
+parent directories itself. The plugin's file sync (skills, credential files and
+caches copied into `~/.hermes` on the Sprite before each command) therefore:
+
+- uploads each file with one `fs/write` (`mode=0644`, `mkdirParents=true`, the
+  same request as before, minus the separate directory check that needed
+  `fs/list`);
+- deletes files that disappeared on the host with one exec per batch,
+  `rm -f -- <paths>`, retried as `sudo -n rm -f -- <paths>` because `fs/write`
+  creates root-owned files while the base image runs commands as `sprite`. A
+  missing file is fine; any other failure is retried on the next sync.
 
 ## Tests
 

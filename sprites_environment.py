@@ -17,11 +17,21 @@ the naming: ``name_prefix`` replaces the leading ``hermes`` of every name so
 one deployment's Sprites are confined to ``<prefix>-*``, and ``scope:
 instance`` makes every task id share one persistent Sprite per profile (see
 ``resolve_naming_settings``).
+
+Four more optional settings (``image``, ``max_cpus``, ``max_ram_gb``,
+``max_disk_gb``) choose the image and sizing of Sprites this plugin creates
+(see ``resolve_create_settings``). With none set, creation sends exactly the
+request it always has.
+
+Sprites 2.0 runtime: the only filesystem endpoint is ``fs/write`` (it creates
+parent directories itself); there is no read, list, stat or delete endpoint.
+File sync therefore uploads with ``fs/write`` alone and deletes through exec.
 """
 
 import hashlib
 import logging
 import re
+import shlex
 import threading
 import uuid
 from pathlib import Path
@@ -72,6 +82,94 @@ _SCOPES = frozenset({"session", "instance"})
 
 #: Task id every persistent environment resolves under in ``instance`` scope.
 _INSTANCE_TASK_ID = "default"
+
+#: Create-time limits from the Sprites 2.0 API docs (``config`` on create).
+_MAX_CPUS_RANGE = (1, 128)
+_MAX_GB_RANGE = (1, 1024)
+
+#: Client wait for a create that sends ``config``. Pulling an image the
+#: platform has not cached yet can take minutes (a first pull of a ~GB image
+#: measured 73 s; cached, under 5 s), well past the SDK's 120 s create timeout.
+_CREATE_WITH_CONFIG_TIMEOUT = 600.0
+
+#: Client wait for the exec that deletes synced files.
+_DELETE_TIMEOUT = 60.0
+
+#: Upper bound on the quoted paths in one delete exec. The command travels in
+#: the exec URL, so a very large batch is split into several execs.
+_DELETE_BATCH_CHARS = 6000
+
+
+def _validate_image_ref(image) -> str:
+    """Return ``image`` if it is a pinned OCI reference, else raise ``ValueError``.
+
+    Sprites requires an explicit tag (not ``latest``) or a digest.
+    """
+    if not isinstance(image, str):
+        raise ValueError(
+            "Sprites plugin setting image must be a string, got "
+            f"{type(image).__name__} ({image!r})"
+        )
+    if image != image.strip() or any(c.isspace() for c in image):
+        raise ValueError(f"Sprites plugin setting image {image!r} must not contain whitespace")
+    name, _, digest = image.partition("@")
+    if digest:
+        if not name or ":" not in digest:
+            raise ValueError(
+                f"Sprites plugin setting image {image!r} is invalid: a digest "
+                "looks like name@sha256:<hex>"
+            )
+        return image
+    last = name.rsplit("/", 1)[-1]
+    repo, sep, tag = last.partition(":")
+    if not repo or not sep or not tag:
+        raise ValueError(
+            f"Sprites plugin setting image {image!r} needs an explicit tag or "
+            "digest (for example ubuntu:24.04 or name@sha256:<hex>)"
+        )
+    if tag == "latest":
+        raise ValueError(
+            f"Sprites plugin setting image {image!r} uses the latest tag, which "
+            "Sprites rejects: pin a version tag or a digest"
+        )
+    return image
+
+
+def _validate_int_setting(key: str, value, bounds: tuple[int, int]) -> int:
+    lo, hi = bounds
+    # bool is an int subclass; ``true`` in YAML is not a size.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"Sprites plugin setting {key} must be a whole number, got "
+            f"{type(value).__name__} ({value!r})"
+        )
+    if not lo <= value <= hi:
+        raise ValueError(
+            f"Sprites plugin setting {key} {value} is out of range ({lo} to {hi})"
+        )
+    return value
+
+
+def resolve_create_settings(image=None, max_cpus=None, max_ram_gb=None,
+                            max_disk_gb=None) -> dict:
+    """Validate the create-time plugin settings.
+
+    Returns the Sprites ``config`` object to send on create, holding only the
+    keys that are set (``None`` and ``""`` mean unset). An empty dict means
+    "create exactly as before". An invalid value raises ``ValueError``: a
+    typo must not silently create a Sprite with a different image or size.
+    """
+    config: dict = {}
+    if image not in (None, ""):
+        config["image_url"] = _validate_image_ref(image)
+    for key, value, bounds in (
+        ("max_cpus", max_cpus, _MAX_CPUS_RANGE),
+        ("max_ram_gb", max_ram_gb, _MAX_GB_RANGE),
+        ("max_disk_gb", max_disk_gb, _MAX_GB_RANGE),
+    ):
+        if value not in (None, ""):
+            config[key] = _validate_int_setting(key, value, bounds)
+    return config
 
 
 def resolve_naming_settings(name_prefix=None, scope=None) -> tuple[str | None, str]:
@@ -316,6 +414,23 @@ def _ephemeral_sprite_name(task_id: str, prefix: str | None = None) -> str:
     return _bounded_name(f"eph-{display}", nonce, prefix or _DEFAULT_HEAD)
 
 
+def _delete_batches(paths: list[str]) -> list[list[str]]:
+    """Split ``paths`` so each delete command stays under ``_DELETE_BATCH_CHARS``."""
+    batches: list[list[str]] = []
+    current: list[str] = []
+    size = 0
+    for p in paths:
+        n = len(shlex.quote(p)) + 1
+        if current and size + n > _DELETE_BATCH_CHARS:
+            batches.append(current)
+            current, size = [], 0
+        current.append(p)
+        size += n
+    if current:
+        batches.append(current)
+    return batches
+
+
 class SpritesEnvironment(BaseEnvironment):
     """Sprites backend: stateful cloud sandboxes on Fly.io.
 
@@ -334,12 +449,19 @@ class SpritesEnvironment(BaseEnvironment):
         task_id: str = "default",
         name_prefix: str | None = None,
         scope: str | None = None,
+        image: str | None = None,
+        max_cpus: int | None = None,
+        max_ram_gb: int | None = None,
+        max_disk_gb: int | None = None,
     ):
         requested_cwd = cwd
-        # Validate naming settings before anything else (including the SDK
-        # import and token lookup) so misconfiguration fails closed with a
-        # clear message and no Sprites API call is ever made.
+        # Validate settings before anything else (including the SDK import
+        # and token lookup) so misconfiguration fails closed with a clear
+        # message and no Sprites API call is ever made.
         prefix, scope = resolve_naming_settings(name_prefix, scope)
+        create_config = resolve_create_settings(
+            image, max_cpus, max_ram_gb, max_disk_gb
+        )
         super().__init__(cwd=cwd, timeout=timeout)
 
         # Standalone plugin dependencies are installed alongside the plugin,
@@ -365,13 +487,13 @@ class SpritesEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._name_prefix = prefix
         self._scope = scope
+        self._create_config = create_config
         self._lock = threading.Lock()
         self._sprite = None
+        # Extra environment for every exec; set only when the Sprite reports
+        # no $HOME (see below). None keeps exec requests unchanged.
+        self._exec_env: dict | None = None
 
-        # Sprites does not yet honor SpriteConfig sizing knobs (cpu / ram /
-        # storage / region) — sandboxes get default sizing. We omit SpriteConfig
-        # entirely so the wire format stays minimal until the platform exposes
-        # these knobs.
         if persistent_filesystem:
             # ``instance`` scope: every task id (gateway sessions, cron,
             # delegate_task children) resumes the same per-profile Sprite.
@@ -385,6 +507,12 @@ class SpritesEnvironment(BaseEnvironment):
                     "Sprites: resumed existing sprite %s for task %s",
                     self._sprite.name, task_id,
                 )
+                if create_config:
+                    logger.debug(
+                        "Sprites: image/sizing settings apply only when a "
+                        "Sprite is created; existing sprite %s is used as-is",
+                        self._sprite.name,
+                    )
             except NotFoundError:
                 # Cross-process first-use race: two processes can both see
                 # 404 here; one create wins and the other gets a duplicate-
@@ -393,7 +521,7 @@ class SpritesEnvironment(BaseEnvironment):
                 # error if the Sprite genuinely does not exist (a real
                 # create failure, not a race).
                 try:
-                    self._sprite = self._client.create_sprite(sprite_name)
+                    self._sprite = self._create_sprite(sprite_name)
                     logger.info(
                         "Sprites: created sprite %s for task %s",
                         self._sprite.name, task_id,
@@ -421,7 +549,7 @@ class SpritesEnvironment(BaseEnvironment):
             sprite_name = _ephemeral_sprite_name(task_id, prefix)
             _require_within_prefix(sprite_name, prefix)
             self._sprite_name = sprite_name
-            self._sprite = self._client.create_sprite(sprite_name)
+            self._sprite = self._create_sprite(sprite_name)
             logger.info(
                 "Sprites: created ephemeral sprite %s for task %s",
                 self._sprite.name, task_id,
@@ -436,6 +564,8 @@ class SpritesEnvironment(BaseEnvironment):
                 self._remote_home = home
                 if requested_cwd in {"~", "/root"}:
                     self.cwd = home
+            else:
+                self._apply_home_fallback()
         except Exception:
             pass
 
@@ -450,28 +580,122 @@ class SpritesEnvironment(BaseEnvironment):
         self.init_session()
 
     # ------------------------------------------------------------------
+    # Creation and exec helpers
+    # ------------------------------------------------------------------
+
+    def _create_sprite(self, sprite_name: str):
+        """Create ``sprite_name``, with the configured image/sizing if any.
+
+        With no create settings this is the SDK's plain ``create_sprite(name)``
+        call, byte-for-byte the request the plugin has always sent.
+
+        With settings, POST /v1/sprites directly: sprites-py 0.5's
+        ``SpriteConfig`` sends ``ram_mb`` / ``cpus`` / ``storage_gb`` and has no
+        image field, while the API takes ``image_url`` / ``max_cpus`` /
+        ``max_ram_gb`` / ``max_disk_gb``. The settings apply at create only.
+        Never send ``PUT config`` to change an existing Sprite: a partial
+        config update was observed to drop ``image_url`` and leave the Sprite
+        unable to boot.
+        """
+        if not self._create_config:
+            return self._client.create_sprite(sprite_name)
+
+        import httpx
+
+        body = {"name": sprite_name, "config": dict(self._create_config)}
+        try:
+            response = self._client.http_client.post(
+                f"{self._client.base_url}/v1/sprites",
+                json=body,
+                timeout=_CREATE_WITH_CONFIG_TIMEOUT,
+            )
+        except httpx.RequestError as e:
+            raise self._SpriteError(f"Network error creating sprite: {e}") from e
+        if response.status_code == 401:
+            raise self._SpriteError("Authentication failed for create sprite")
+        if not response.is_success:
+            # A 409 (name taken) lands here like any other failure, so the
+            # caller's re-GET adopts a Sprite another process created.
+            raise self._SpriteError(
+                f"Failed create sprite (status {response.status_code}): {response.text}"
+            )
+        return self._client.get_sprite(sprite_name)
+
+    def _apply_home_fallback(self) -> None:
+        """Handle a Sprite whose commands run with ``$HOME`` unset.
+
+        Imported images can run commands as root with no ``HOME``. When the
+        user is root, use ``/root`` as the sync target and pass ``HOME`` on
+        every later exec so ``~`` resolves there. Otherwise keep the
+        ``/root`` fallback without changing exec.
+        """
+        try:
+            cmd = self._sprite.command("sh", "-c", "id -u", timeout=15)
+            uid = cmd.combined_output().decode().strip()
+        except Exception as e:
+            logger.debug("Sprites: could not read uid on %s: %s", self._sprite_name, e)
+            return
+        if uid == "0":
+            self._remote_home = "/root"
+            self._exec_env = {"HOME": "/root"}
+            logger.info(
+                "Sprites: %s reports no $HOME; using /root for exec and file sync",
+                self._sprite_name,
+            )
+
+    def _command_kwargs(self) -> dict:
+        """Extra ``sprite.command`` kwargs; empty unless the HOME fallback is active."""
+        return {"env": dict(self._exec_env)} if self._exec_env else {}
+
+    # ------------------------------------------------------------------
     # File sync callbacks
     # ------------------------------------------------------------------
 
     def _sprite_upload(self, host_path: str, remote_path: str) -> None:
-        """Upload a single file via the SpriteFilesystem API."""
+        """Upload a single file with ``fs/write``.
+
+        ``mkdir_parents=True`` makes the write create missing parent
+        directories, so no separate mkdir (which needs ``fs/list``, absent on
+        the Sprites 2.0 runtime) is made. Mode and parent creation are the
+        sprites-py defaults the plugin has always sent.
+        """
         data = Path(host_path).read_bytes()
         remote = self._fs / remote_path
-        remote.parent.mkdir(parents=True, exist_ok=True)
-        remote.write_bytes(data)
+        remote.write_bytes(data, mode=0o644, mkdir_parents=True)
 
     def _sprite_delete(self, remote_paths: list[str]) -> None:
-        """Delete remote files.
+        """Delete remote files with ``rm -f`` over exec.
 
-        Missing files are benign (``missing_ok=True``); any OTHER failure
-        must propagate so ``FileSyncManager`` rolls back and retries on the
-        next cycle. Swallowing errors here would falsely commit the deletion
-        — the manager drops the path from its synced set and never retries,
-        which can leave stale credential material in a durable Sprite
-        permanently.
+        Sprites 2.0 has no ``fs/delete``. Files written by ``fs/write`` are
+        owned by root, while commands on the base image run as ``sprite``, so
+        a failed ``rm`` is retried once with ``sudo -n``.
+
+        Missing files are benign (``rm -f``); any OTHER failure must propagate
+        so ``FileSyncManager`` rolls back and retries on the next cycle.
+        Swallowing errors here would falsely commit the deletion — the manager
+        drops the path from its synced set and never retries, which can leave
+        stale credential material in a durable Sprite permanently.
         """
-        for rp in remote_paths:
-            (self._fs / rp).unlink(missing_ok=True)
+        from sprites.exceptions import ExitError
+
+        for batch in _delete_batches(remote_paths):
+            quoted = " ".join(shlex.quote(p) for p in batch)
+            script = f"rm -f -- {quoted} || sudo -n rm -f -- {quoted}"
+            cmd = self._sprite.command(
+                "sh", "-c", script, timeout=_DELETE_TIMEOUT,
+                **self._command_kwargs(),
+            )
+            try:
+                cmd.combined_output()
+            except ExitError as e:
+                output = ((e.stdout or b"") + (e.stderr or b"")).decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                code = e.exit_code() if callable(getattr(e, "exit_code", None)) else "?"
+                raise RuntimeError(
+                    f"Sprites: deleting {len(batch)} synced file(s) failed "
+                    f"(exit {code}): {output}"
+                ) from e
 
     # ------------------------------------------------------------------
     # Execution
@@ -498,8 +722,10 @@ class SpritesEnvironment(BaseEnvironment):
         # timeouts get a fallback deadline; explicit positive values pass through.
         cmd_timeout = float(timeout) if timeout and timeout > 0 else 3600.0
 
+        cmd_kwargs = self._command_kwargs()
+
         def exec_fn() -> tuple[str, int]:
-            cmd = sprite.command(*shell_cmd, timeout=cmd_timeout)
+            cmd = sprite.command(*shell_cmd, timeout=cmd_timeout, **cmd_kwargs)
             try:
                 output = cmd.combined_output()
                 return (output.decode("utf-8", errors="replace"), 0)

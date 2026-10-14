@@ -25,3 +25,28 @@ config_schema:
       session, cron job and subagent.
     choices: [session, instance]
     default: session
+  image:
+    type: str
+    label: Sprite image
+    description: >-
+      OCI image for Sprites this plugin creates, with an explicit tag (not
+      "latest") or a digest; a digest pin (name@sha256:...) is recommended.
+      Unset uses the Sprites base image. Applies only when a Sprite is
+      created; an existing Sprite keeps its image.
+  max_cpus:
+    type: int
+    label: Sprite vCPUs
+    description: >-
+      vCPUs for newly created Sprites, 1 to 128. Unset uses the Sprites default.
+  max_ram_gb:
+    type: int
+    label: Sprite memory (GB)
+    description: >-
+      Memory in GB for newly created Sprites, 1 to 1024. Unset uses the
+      Sprites default.
+  max_disk_gb:
+    type: int
+    label: Sprite disk (GB)
+    description: >-
+      Root filesystem in GB for newly created Sprites, 1 to 1024 and no smaller
+      than the image. Unset uses the Sprites default.

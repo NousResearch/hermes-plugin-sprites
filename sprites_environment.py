@@ -32,12 +32,13 @@ import hashlib
 import logging
 import re
 import shlex
+import sys
 import threading
 import uuid
 from pathlib import Path
 from urllib.parse import quote as _url_quote
 
-from tools.environments.base import BaseEnvironment
+from tools.environments.base import BaseEnvironment, EnvironmentConnectionError
 
 try:
     from tools.environments.base_output import _ThreadedProcessHandle
@@ -88,10 +89,27 @@ _INSTANCE_TASK_ID = "default"
 _MAX_CPUS_RANGE = (1, 128)
 _MAX_GB_RANGE = (1, 1024)
 
-#: Client wait for a create that sends ``config``. Pulling an image the
-#: platform has not cached yet can take minutes (a first pull of a ~GB image
-#: measured 73 s; cached, under 5 s), well past the SDK's 120 s create timeout.
-_CREATE_WITH_CONFIG_TIMEOUT = 600.0
+#: Hermes's default deadline for one tool call (``agent/tool_executor.py``
+#: ``_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S``, also the sequential default). The
+#: Sprite is created inside the terminal tool call, so a create that outlives
+#: the deadline returns ``tool_timeout`` while the constructor keeps running
+#: and holds the task's creation lock.
+_TOOL_DEADLINE_DEFAULT = 420.0
+
+#: Part of the tool deadline kept for the rest of construction (GET, $HOME
+#: probe, file sync, session init) and the connect/write phases of the create.
+_CREATE_DEADLINE_MARGIN = 120.0
+
+#: Bounds on the create wait. Pulling an image the platform has not cached
+#: yet can take minutes (a first pull of a ~GB image measured 73 s; cached,
+#: under 5 s), past the SDK's 120 s create timeout. 600 s is the old fixed
+#: wait, kept when Hermes's tool deadline is disabled.
+_CREATE_WAIT_MIN = 30.0
+_CREATE_WAIT_MAX = 600.0
+
+#: Connect, write and pool limits for the create request, so the read wait
+#: dominates its total time.
+_CREATE_PHASE_TIMEOUT = 15.0
 
 #: Client wait for the exec that deletes synced files.
 _DELETE_TIMEOUT = 60.0
@@ -107,6 +125,88 @@ _TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 _DIGEST_RE = re.compile(r"[a-z0-9]+(?:[+._-][a-z0-9]+)*:[A-Fa-f0-9]{32,}")
 _DIGEST_HEX_LEN = {"sha256": 64, "sha512": 128}
 _REGISTRY_RE = re.compile(r"[A-Za-z0-9.-]+(?::[0-9]+)?|\[[0-9A-Fa-f:]+\](?::[0-9]+)?")
+
+
+def _tool_deadline() -> float | None:
+    """Deadline (seconds) Hermes puts on the tool call creating the Sprite.
+
+    Read from the running Hermes when ``agent.tool_executor`` is loaded
+    (``timeouts.tools.sequential_call`` / ``concurrent_batch``; the terminal
+    tool runs under either, so the shorter applies). ``None`` means both are
+    disabled. Falls back to the 420 s default when it cannot be read.
+    """
+    executor = sys.modules.get("agent.tool_executor")
+    resolvers = [
+        getattr(executor, name, None)
+        for name in ("_resolve_sequential_tool_timeout", "_resolve_concurrent_tool_timeout")
+    ]
+    if executor is None or not all(callable(fn) for fn in resolvers):
+        return _TOOL_DEADLINE_DEFAULT
+    try:
+        values = [fn() for fn in resolvers]
+    except Exception:
+        return _TOOL_DEADLINE_DEFAULT
+    finite = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return _TOOL_DEADLINE_DEFAULT
+        if value == value and value > 0:  # NaN and non-positive mean "no deadline"
+            finite.append(value)
+    return min(finite) if finite else None
+
+
+def _create_wait() -> float:
+    """Read wait for a create that sends ``config``: below the tool deadline.
+
+    300 s under the default 420 s deadline. A shorter configured deadline
+    shrinks it (to 30 s, or half the deadline when that is shorter still); a
+    disabled deadline restores the old 600 s.
+    """
+    deadline = _tool_deadline()
+    if deadline is None:
+        return _CREATE_WAIT_MAX
+    floor = min(_CREATE_WAIT_MIN, deadline / 2)
+    return min(_CREATE_WAIT_MAX, max(floor, deadline - _CREATE_DEADLINE_MARGIN))
+
+
+def _is_name_taken(err: BaseException) -> bool:
+    """True for a create rejected because the name exists (HTTP 409).
+
+    Both the SDK and the direct create format failures as
+    ``Failed create sprite (status <code>): <body>``.
+    """
+    return "(status 409)" in str(err)
+
+
+def _still_creating_error(sprite_name: str, create_config: dict, *,
+                          waited: float | None = None, cause: str | None = None,
+                          persistent: bool = True) -> EnvironmentConnectionError:
+    """Retryable error for a Sprite whose create has not finished yet.
+
+    Hermes's terminal tool reports it as ``status: degraded`` with the retry
+    hint and caches nothing, so the next call starts over. For a persistent
+    Sprite its GET resumes the Sprite once the platform has finished it.
+    """
+    image = create_config.get("image_url")
+    after = f" after {waited:.0f}s" if waited is not None else ""
+    pulling = f" (the first pull of image {image} can take a few minutes)" if image else ""
+    reason = f"Sprite {sprite_name} is still being created{after}{pulling}"
+    if cause:
+        reason += f"; create returned: {cause}"
+    if persistent:
+        next_step = ("the next attempt uses this Sprite once the platform has "
+                     "finished creating it.")
+    else:
+        next_step = "the next attempt creates a new Sprite."
+    return EnvironmentConnectionError(
+        reason,
+        retry_hint=("The Sprite is not ready yet; this is not a command failure. "
+                    f"Retry the same command shortly; {next_step}"),
+    )
 
 
 def _validate_image_ref(image) -> str:
@@ -546,21 +646,31 @@ class SpritesEnvironment(BaseEnvironment):
                 # the exact deterministic name, and only re-raise the create
                 # error if the Sprite genuinely does not exist (a real
                 # create failure, not a race).
+                # A create that outlived its wait (EnvironmentConnectionError)
+                # takes the same path: the platform may have finished it, and
+                # a later attempt's GET resumes it either way.
                 try:
                     self._sprite = self._create_sprite(sprite_name)
                     logger.info(
                         "Sprites: created sprite %s for task %s",
                         self._sprite.name, task_id,
                     )
-                except SpriteError as create_err:
+                except (SpriteError, EnvironmentConnectionError) as create_err:
                     try:
                         self._sprite = self._client.get_sprite(sprite_name)
                         logger.info(
                             "Sprites: adopted sprite %s created concurrently "
-                            "by another process (task %s)",
+                            "or by an earlier attempt (task %s)",
                             self._sprite.name, task_id,
                         )
                     except NotFoundError:
+                        if _is_name_taken(create_err):
+                            # Name taken but not visible yet: an earlier
+                            # attempt's create is still in progress.
+                            raise _still_creating_error(
+                                sprite_name, self._create_config,
+                                cause=str(create_err),
+                            ) from create_err
                         raise create_err
         else:
             # Ephemeral (container_persistent: false): the sandbox must not
@@ -575,7 +685,13 @@ class SpritesEnvironment(BaseEnvironment):
             sprite_name = _ephemeral_sprite_name(task_id, prefix)
             _require_within_prefix(sprite_name, prefix)
             self._sprite_name = sprite_name
-            self._sprite = self._create_sprite(sprite_name)
+            try:
+                self._sprite = self._create_sprite(sprite_name)
+            except EnvironmentConnectionError:
+                # Nothing will ever resume this unique name; do not leave a
+                # Sprite behind if the platform already has it.
+                self._delete_abandoned_sprite(sprite_name)
+                raise
             logger.info(
                 "Sprites: created ephemeral sprite %s for task %s",
                 self._sprite.name, task_id,
@@ -630,12 +746,24 @@ class SpritesEnvironment(BaseEnvironment):
         from sprites.exceptions import AuthenticationError, NetworkError
 
         body = {"name": sprite_name, "config": dict(self._create_config)}
+        # The wait stays below Hermes's tool deadline: past it the user gets
+        # tool_timeout while this constructor runs on and holds the task's
+        # creation lock, so every retry would queue behind it.
+        wait = _create_wait()
+        phase = min(_CREATE_PHASE_TIMEOUT, wait)
         try:
             response = self._client.http_client.post(
                 f"{self._client.base_url}/v1/sprites",
                 json=body,
-                timeout=_CREATE_WITH_CONFIG_TIMEOUT,
+                timeout=httpx.Timeout(wait, connect=phase, write=phase, pool=phase),
             )
+        except httpx.ReadTimeout as e:
+            # The request reached the platform, which may still finish the
+            # create. Say so in a retryable result instead of a stack trace.
+            raise _still_creating_error(
+                sprite_name, self._create_config, waited=wait,
+                persistent=self._persistent,
+            ) from e
         except httpx.RequestError as e:
             raise NetworkError(f"Network error creating sprite: {e}") from e
         # Same exception types as the SDK's create_sprite (all SpriteError
@@ -651,6 +779,22 @@ class SpritesEnvironment(BaseEnvironment):
                 f"Failed create sprite (status {response.status_code}): {response.text}"
             )
         return self._client.get_sprite(sprite_name)
+
+    def _delete_abandoned_sprite(self, sprite_name: str) -> None:
+        """Best-effort delete of an ephemeral Sprite whose create timed out."""
+        try:
+            self._client.delete_sprite(sprite_name)
+        except self._NotFoundError:
+            logger.warning(
+                "Sprites: create of ephemeral sprite %s timed out before it "
+                "existed; if the platform finishes it later, delete it by hand",
+                sprite_name,
+            )
+        except Exception as e:
+            logger.warning(
+                "Sprites: could not delete ephemeral sprite %s after its create "
+                "timed out (%s); delete it by hand", sprite_name, e,
+            )
 
     def _apply_home_fallback(self) -> None:
         """Handle a Sprite whose commands run with ``$HOME`` unset.

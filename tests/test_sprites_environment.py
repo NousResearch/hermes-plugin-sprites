@@ -1530,7 +1530,7 @@ class TestCreateWithSettings:
         assert url == "https://api.sprites.dev/v1/sprites"
         assert kwargs["json"] == {"name": "hermes-fresh",
                                   "config": {"max_cpus": 2, "max_disk_gb": 20}}
-        assert kwargs["timeout"] >= 600
+        assert kwargs["timeout"] == 240
         # The handle comes from the SDK (GET after create).
         assert client.get_sprite.call_args_list == [call("hermes-fresh"), call("hermes-fresh")]
         assert env._sprite.name == "hermes-fresh"
@@ -1602,12 +1602,73 @@ class TestCreateWithSettings:
         monkeypatch.setattr("sprites_environment._resolve_profile_identity", lambda: None)
         client = MagicMock()
         client.base_url = "https://api.sprites.dev"
-        client.http_client.post.side_effect = httpx.ReadTimeout("slow pull")
+        client.http_client.post.side_effect = httpx.ConnectError("refused")
         client.get_sprite.side_effect = _NotFoundError("not found")
         sprites_sdk[0].SpritesClient = MagicMock(return_value=client)
         from sprites_environment import SpritesEnvironment
-        with pytest.raises(_NetworkError, match="slow pull"):
+        with pytest.raises(_NetworkError, match="refused"):
             SpritesEnvironment(task_id="fresh", image="ubuntu:24.04")
+
+    _STILL_CREATING = ("Sprite {name} is still being created (the first pull of image "
+                       "ubuntu:24.04 can take a few minutes); retry the command shortly.")
+
+    def _timeout_client(self, sprites_sdk, monkeypatch):
+        import httpx
+        monkeypatch.setattr("sprites_environment._resolve_profile_identity", lambda: None)
+        client = MagicMock()
+        client.base_url = "https://api.sprites.dev"
+        client.http_client.post.side_effect = httpx.ReadTimeout("timed out")
+        client.get_sprite.side_effect = _NotFoundError("not found")
+        sprites_sdk[0].SpritesClient = MagicMock(return_value=client)
+        return client
+
+    def test_persistent_create_timeout_is_retryable(self, sprites_sdk, hermes_runtime, monkeypatch):
+        """A create that outlives the wait ends in one clear retry message."""
+        client = self._timeout_client(sprites_sdk, monkeypatch)
+        from sprites_environment import SpritesEnvironment, _CREATE_WITH_CONFIG_TIMEOUT
+        assert _CREATE_WITH_CONFIG_TIMEOUT == 240  # under Hermes's 420 s tool deadline
+        with pytest.raises(TimeoutError) as info:
+            SpritesEnvironment(task_id="fresh", image="ubuntu:24.04")
+        assert str(info.value) == self._STILL_CREATING.format(name="hermes-fresh")
+        assert not isinstance(info.value, _SpriteError)
+        # No re-GET of a half-created Sprite in the same call.
+        assert client.get_sprite.call_args_list == [call("hermes-fresh")]
+
+    def test_next_construction_adopts_finished_sprite(self, sprites_sdk, hermes_runtime, monkeypatch):
+        """After a timed-out create, the retry's first GET resumes the Sprite."""
+        client = self._timeout_client(sprites_sdk, monkeypatch)
+        from sprites_environment import SpritesEnvironment
+        with pytest.raises(TimeoutError):
+            SpritesEnvironment(task_id="fresh", image="ubuntu:24.04")
+        finished = _make_sprite("hermes-fresh")
+        client.get_sprite.side_effect = lambda name: finished
+        client.http_client.post.reset_mock()
+        env = SpritesEnvironment(task_id="fresh", image="ubuntu:24.04")
+        assert env._sprite is finished
+        client.http_client.post.assert_not_called()
+
+    def test_ephemeral_create_timeout_is_retryable_and_warns(
+        self, sprites_sdk, hermes_runtime, monkeypatch, caplog,
+    ):
+        client = self._timeout_client(sprites_sdk, monkeypatch)
+        from sprites_environment import SpritesEnvironment
+        with caplog.at_level("WARNING", logger="sprites_environment"):
+            with pytest.raises(TimeoutError) as info:
+                SpritesEnvironment(task_id="mine", persistent_filesystem=False,
+                                   image="ubuntu:24.04")
+        name = client.http_client.post.call_args.kwargs["json"]["name"]
+        assert str(info.value) == self._STILL_CREATING.format(name=name)
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1 and name in warnings[0].getMessage()
+        assert "orphaned" in warnings[0].getMessage()
+        client.get_sprite.assert_not_called()
+
+    def test_sizing_only_timeout_message_omits_image(self, sprites_sdk, hermes_runtime, monkeypatch):
+        self._timeout_client(sprites_sdk, monkeypatch)
+        from sprites_environment import SpritesEnvironment
+        with pytest.raises(TimeoutError, match=r"^Sprite hermes-fresh is still being "
+                                               r"created; retry the command shortly\.$"):
+            SpritesEnvironment(task_id="fresh", max_cpus=2)
 
     def test_invalid_settings_fail_before_any_api_call(self, make_env, sprites_sdk):
         with pytest.raises(ValueError, match="latest"):

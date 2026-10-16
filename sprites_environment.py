@@ -89,9 +89,17 @@ _MAX_CPUS_RANGE = (1, 128)
 _MAX_GB_RANGE = (1, 1024)
 
 #: Client wait for a create that sends ``config``. Pulling an image the
-#: platform has not cached yet can take minutes (a first pull of a ~GB image
-#: measured 73 s; cached, under 5 s), well past the SDK's 120 s create timeout.
-_CREATE_WITH_CONFIG_TIMEOUT = 600.0
+#: platform has not cached yet takes a while (first pulls of a ~GB image
+#: measured 64-73 s; cached, under 5 s), past the SDK's 120 s create timeout.
+#: Sprites 2.0 sends nothing until the Sprite is running, so this read
+#: timeout bounds the whole wait. Budget: Hermes's terminal tool deadline is
+#: 420 s by default; initial GET (well under a second) + 240 s create stays
+#: under it, so a slow pull ends in a retryable error, not a tool timeout.
+_CREATE_WITH_CONFIG_TIMEOUT = 240.0
+
+
+class SpriteStillCreating(TimeoutError):
+    """The configured create outlived its wait; the platform keeps going."""
 
 #: Client wait for the exec that deletes synced files.
 _DELETE_TIMEOUT = 60.0
@@ -636,6 +644,18 @@ class SpritesEnvironment(BaseEnvironment):
                 json=body,
                 timeout=_CREATE_WITH_CONFIG_TIMEOUT,
             )
+        except httpx.ReadTimeout as e:
+            # Not a SpriteError, so the persistent path does not re-GET a
+            # half-created Sprite now; the next construction's GET adopts it.
+            image = self._create_config.get("image_url")
+            pull = f" (the first pull of image {image} can take a few minutes)" if image else ""
+            if not self._persistent:
+                logger.warning("Sprites: ephemeral sprite %s may be orphaned if its "
+                               "create completes later", sprite_name)
+            raise SpriteStillCreating(
+                f"Sprite {sprite_name} is still being created{pull}; "
+                "retry the command shortly."
+            ) from e
         except httpx.RequestError as e:
             raise NetworkError(f"Network error creating sprite: {e}") from e
         # Same exception types as the SDK's create_sprite (all SpriteError

@@ -67,8 +67,9 @@ creation). To move to a new image or size, delete the Sprite (or change
 `name_prefix`) so the next session creates a fresh one. Creating from an image
 Sprites has not pulled before can take a minute or more; the plugin waits up to
 4 minutes (inside Hermes's 420 s terminal tool deadline). If the create is still
-running then, the command fails with a "still being created; retry" error and the
-next command picks up the Sprite once it exists. Most non-base images run commands as root, and some
+running then, the command fails with a "still being created; retry" error. In
+persistent mode the next command picks up the Sprite once it exists; in ephemeral
+mode the plugin logs the possibly orphaned Sprite's name for manual cleanup. Most non-base images run commands as root, and some
 leave `$HOME` unset: the plugin then uses `/root` as the home directory and
 passes `HOME=/root` to its commands.
 

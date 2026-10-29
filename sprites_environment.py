@@ -499,9 +499,12 @@ def _archive_batches(files: list[tuple[str, str]]) -> list[list[tuple[str, str]]
 
 
 def _build_archive(files: list[tuple[str, str]]) -> bytes:
-    """Uncompressed tar (no gzip needed on the Sprite) of ``files``: member name is the remote path without its leading
-    ``/``, mode 0644, owner root, the same file mode a single ``fs/write`` sets.
-    Host owner, permissions and file type are not carried over."""
+    """Uncompressed tar (the Sprite needs no gzip) of ``files``.
+
+    Each member is the remote path without its leading ``/``, mode 0644, owner
+    root: the file mode a single ``fs/write`` sets. Host owner, permissions
+    and file type are not carried over.
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         for host_path, remote_path in files:
@@ -514,34 +517,47 @@ def _build_archive(files: list[tuple[str, str]]) -> bytes:
     return buf.getvalue()
 
 
-#: Exit status of the unpack script when the Sprite has no ``tar``.
-_NO_TAR_EXIT = 127
+#: Archives older than this are leftovers of a sync whose unpack never ran
+#: (transport failure, killed process). Well past ``_UNPACK_TIMEOUT``, so a
+#: live sync's archive is never swept.
+_STALE_ARCHIVE_MINUTES = 30
+
+#: Exit status of the unpack script when the archive could not be removed.
+_ARCHIVE_LEFT_EXIT = 86
 
 
 def _unpack_script(archive_path: str) -> str:
     """Unpack the archive at ``/``, retrying with ``sudo -n``, then remove it.
 
-    Directories and files from earlier syncs were written by ``fs/write`` as
-    root while the base image runs commands as ``sprite``, hence the retry.
-    The exit status is tar's (``_NO_TAR_EXIT`` without tar), so a failed
-    unpack fails the sync; the archive is removed either way.
+    The archive is a root-owned 0600 ``fs/write`` file, so a non-root exec
+    user (the base image runs commands as ``sprite``) unpacks it through
+    ``sudo -n``; files from earlier syncs are root-owned for the same reason.
+    Exits with tar's status if the unpack fails, and ``_ARCHIVE_LEFT_EXIT``
+    if the archive could not be removed. Also removes archives in the same
+    directory left behind by earlier syncs whose unpack never ran.
     """
     q = shlex.quote(archive_path)
+    staging = shlex.quote(posixpath.dirname(archive_path))
     tar = f"tar -xf {q} -C / --no-same-owner"
+    sweep = (
+        f"find {staging} -maxdepth 1 -name '.sync-*.tar' "
+        f"-mmin +{_STALE_ARCHIVE_MINUTES} -exec rm -f -- {{}} +"
+    )
     return (
-        f"if command -v tar >/dev/null 2>&1; then "
-        f"{{ {tar} || sudo -n {tar}; }}; rc=$?; else rc={_NO_TAR_EXIT}; fi; "
-        f"rm -f -- {q} 2>/dev/null || sudo -n rm -f -- {q} 2>/dev/null; exit $rc"
+        f"{{ {tar} || sudo -n {tar}; }}; rc=$?; "
+        f"rm -f -- {q} 2>/dev/null || sudo -n rm -f -- {q} 2>/dev/null "
+        f"|| rc={_ARCHIVE_LEFT_EXIT}; "
+        f"{{ {sweep} || sudo -n {sweep}; }} >/dev/null 2>&1; "
+        f"exit $rc"
     )
 
 
 class _ExecFailed(RuntimeError):
-    """A sync exec exited non-zero; ``exit_code`` is its status (or None)."""
+    """A sync exec ran and exited non-zero; ``exit_code`` is its status."""
 
     def __init__(self, message: str, exit_code):
         super().__init__(message)
         self.exit_code = exit_code
-
 
 class SpritesEnvironment(BaseEnvironment):
     """Sprites backend: stateful cloud sandboxes on Fly.io.
@@ -682,6 +698,7 @@ class SpritesEnvironment(BaseEnvironment):
             pass
 
         self._fs = self._sprite.filesystem("/")
+        self._use_archives = True
         self._sync_manager = _SharedSpriteSyncManager(
             get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
             upload_fn=self._sprite_upload,
@@ -795,25 +812,37 @@ class SpritesEnvironment(BaseEnvironment):
 
     def _sprite_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         """Upload changed files as archives: per archive, one ``fs/write`` of a
-        tar into the remote ``~/.hermes`` and one exec that unpacks and
+        tar into ``~/.hermes/.sync-staging`` and one exec that unpacks and
         removes it.
 
         One ``fs/write`` per file made a sync cost as many requests as there
         are files. The skills tree alone is a few hundred files, past the
         per-Sprite request rate limit, so every sync was cut off by HTTP 429,
         rolled back, and resent in full on the next command (and the burst
-        could rate-limit the command itself). Any failure raises, so
-        ``FileSyncManager`` rolls back and retries. A Sprite image without
-        ``tar`` gets the old one ``fs/write`` per file.
+        could rate-limit the command itself).
+
+        When the unpack exec runs but fails (no ``tar``, a non-root user
+        without working sudo, a full disk), the batch is sent the old way,
+        one ``fs/write`` per file, which reports its own error if it fails
+        too. A transport failure raises at once. Either way a failure
+        reaches ``FileSyncManager``, which rolls back and retries.
+
+        If the archive could not be removed (a non-root user without sudo
+        cannot delete a root-owned file), it is overwritten with nothing and
+        this environment stops using archives, so they do not pile up.
         """
+        if not self._use_archives:
+            for host_path, remote_path in files:
+                self._sprite_upload(host_path, remote_path)
+            return
         for batch in _archive_batches(files):
-            # Beside the files it carries, so it is no more readable than
-            # they are; 0644 (like them) so a non-root user without sudo can
-            # read it.
+            # 0600: only root can read the archive, which may hold credential
+            # files whose own directories are more restrictive than its own.
             archive = posixpath.join(
-                self._remote_home, ".hermes", f".sync-{uuid.uuid4().hex}.tar")
+                self._remote_home, ".hermes", ".sync-staging",
+                f".sync-{uuid.uuid4().hex}.tar")
             (self._fs / archive).write_bytes(
-                _build_archive(batch), mode=0o644, mkdir_parents=True
+                _build_archive(batch), mode=0o600, mkdir_parents=True
             )
             try:
                 self._exec_or_raise(
@@ -821,12 +850,12 @@ class SpritesEnvironment(BaseEnvironment):
                     f"unpacking {len(batch)} synced file(s)",
                 )
             except _ExecFailed as e:
-                if e.exit_code != _NO_TAR_EXIT:
-                    raise
                 logger.warning(
-                    "Sprites: %s has no tar; uploading %d file(s) one by one",
-                    self._sprite_name, len(batch),
+                    "%s; uploading the %d file(s) one by one instead", e, len(batch),
                 )
+                if e.exit_code == _ARCHIVE_LEFT_EXIT:
+                    self._use_archives = False
+                    (self._fs / archive).write_bytes(b"", mode=0o600, mkdir_parents=True)
                 for host_path, remote_path in batch:
                     self._sprite_upload(host_path, remote_path)
 
@@ -845,7 +874,7 @@ class SpritesEnvironment(BaseEnvironment):
             ).strip()
             code = e.exit_code() if callable(getattr(e, "exit_code", None)) else None
             raise _ExecFailed(
-                f"Sprites: {what} failed (exit {code if code is not None else '?'}): {output}",
+                f"Sprites: {what} failed (exit {'?' if code is None else code}): {output}",
                 code,
             ) from e
 

@@ -906,9 +906,9 @@ class _RateLimitedSprite:
     """Sprite double that counts requests against a per-Sprite limit.
 
     Every ``fs/write`` and every exec counts, like the Sprites API's
-    per-Sprite request limit (300 per minute). Writes land in ``files``;
-    an unpack exec extracts the written archive into ``files`` the way
-    ``tar -xzf ... -C /`` would.
+    per-Sprite request limit (300 per minute). Writes land in ``writes``
+    with their mode in ``modes``; an unpack exec extracts the written
+    archive into ``files`` the way ``tar -xf ... -C /`` would.
     """
 
     def __init__(self, limit=300, name="hermes-default"):
@@ -916,9 +916,13 @@ class _RateLimitedSprite:
         self.limit = limit
         self.requests = 0
         self.writes: dict[str, bytes] = {}
+        self.modes: dict[str, int] = {}
         self.files: dict[str, bytes] = {}
-        self.unpack_fails = False
-        self.no_tar = False
+        self.unpacks = 0
+        self.unpack_exit = 0         # non-zero: the unpack exec fails with it
+        self.archive_left = False    # unpack works, archive removal does not
+        self.unpack_transport_error = False
+        self.fail_file_writes = False
 
     def _count(self):
         self.requests += 1
@@ -935,7 +939,10 @@ class _RateLimitedSprite:
 
             def write_bytes(self, data, mode=0o644, mkdir_parents=True):
                 sprite._count()
+                if sprite.fail_file_writes and ".sync-staging" not in self.path:
+                    raise RuntimeError("fs/write failed")
                 sprite.writes[self.path] = data
+                sprite.modes[self.path] = mode
 
         class _Fs:
             def __truediv__(self, path):
@@ -957,15 +964,19 @@ class _RateLimitedSprite:
                 return b"/home/sprite\n"
             sprite._count()
             if "tar -xf" in script:
-                if sprite.unpack_fails:
-                    raise _ExitError("exit status 2", 2, b"tar: write error\n")
-                if sprite.no_tar:
-                    raise _ExitError("exit status 127", 127, b"")
+                sprite.unpacks += 1
+                if sprite.unpack_transport_error:
+                    raise OSError("websocket dropped")
+                if sprite.unpack_exit:
+                    raise _ExitError("exit", sprite.unpack_exit, b"tar: write error\n")
                 archive = shlex.split(script.split("tar -xf", 1)[1])[0]
-                data = sprite.writes.pop(archive)
+                data = sprite.writes[archive]
                 with tarfile.open(fileobj=io.BytesIO(data)) as tar:
                     for member in tar.getmembers():
                         sprite.files["/" + member.name] = tar.extractfile(member).read()
+                if sprite.archive_left:
+                    raise _ExitError("exit", 86, b"rm: Permission denied\n")
+                del sprite.writes[archive]
                 return b""
             return b"\n__HERMES_CWD_xxx__/home/sprite__HERMES_CWD_xxx__\n"
 
@@ -987,100 +998,116 @@ class TestFileSyncBulkUpload:
             files.append((str(host), f"/home/sprite/.hermes/skills/skill-{i:03d}/SKILL.md"))
         return files
 
+    @staticmethod
+    def _env(make_env, monkeypatch, files, sprite, task="t"):
+        import sprites_environment as se
+
+        monkeypatch.setattr(se, "iter_sync_files", lambda _root: list(files))
+        return make_env(task_id=task, sprite=sprite)
+
+    @staticmethod
+    def _archives(sprite):
+        return [p for p in sprite.writes if ".sync-staging/" in p]
+
     def test_sync_of_more_files_than_the_request_limit_commits(
         self, make_env, monkeypatch, tmp_path
     ):
         """305 skill files (the count on a live Hermes Cloud instance) against a
         300-request limit: one request per file never finished a sync."""
-        import sprites_environment as se
-
         files = self._host_tree(tmp_path, 305)
-        monkeypatch.setattr(se, "iter_sync_files", lambda _root: list(files))
         sprite = _RateLimitedSprite(limit=300)
 
-        env = make_env(task_id="many", sprite=sprite)
+        env = self._env(make_env, monkeypatch, files, sprite)
 
         assert set(env._sync_manager._synced_files) == {r for _, r in files}, (
             "initial sync must commit every file")
         for host, remote in files:
             assert sprite.files[remote] == Path(host).read_bytes()
         assert sprite.writes == {}, "the uploaded archive must be consumed"
-        assert all(not p.endswith(".tar") for p in sprite.files)
         # One fs/write + one unpack exec for the whole tree, + init_session.
         assert sprite.requests <= 3
 
-    def test_unpack_failure_rolls_back_and_next_sync_retries(
+    def test_archive_is_root_only_in_a_staging_dir(self, make_env, monkeypatch, tmp_path):
+        """The archive can carry credential files whose own directories are
+        more restrictive than anything the archive inherits, so it is 0600."""
+        files = self._host_tree(tmp_path, 2)
+        sprite = _RateLimitedSprite(limit=10_000)
+        sprite.unpack_exit = 2  # keep the archive in ``writes`` for inspection
+        self._env(make_env, monkeypatch, files, sprite)
+        (archive,) = self._archives(sprite)
+        assert archive.startswith("/home/sprite/.hermes/.sync-staging/.sync-")
+        assert archive.endswith(".tar")
+        assert sprite.modes[archive] == 0o600
+
+    @pytest.mark.parametrize("exit_code", [2, 127])
+    def test_failed_unpack_falls_back_to_one_write_per_file(
+        self, make_env, monkeypatch, tmp_path, caplog, exit_code
+    ):
+        """No tar (127), or tar refused (no sudo, full disk): the old path."""
+        files = self._host_tree(tmp_path, 3)
+        sprite = _RateLimitedSprite(limit=10_000)
+        sprite.unpack_exit = exit_code
+
+        with caplog.at_level("WARNING"):
+            env = self._env(make_env, monkeypatch, files, sprite)
+        assert set(env._sync_manager._synced_files) == {r for _, r in files}
+        for host, remote in files:
+            assert sprite.writes[remote] == Path(host).read_bytes()
+            assert sprite.modes[remote] == 0o644
+        assert "tar: write error" in caplog.text
+        assert env._use_archives, "an unpack failure alone keeps archives in use"
+
+    def test_failed_fallback_rolls_back_and_next_sync_retries(
         self, make_env, monkeypatch, tmp_path
     ):
-        import sprites_environment as se
-
         files = self._host_tree(tmp_path, 3)
-        monkeypatch.setattr(se, "iter_sync_files", lambda _root: list(files))
         sprite = _RateLimitedSprite(limit=10_000)
-        sprite.unpack_fails = True
+        sprite.unpack_exit = 2
+        sprite.fail_file_writes = True
 
-        env = make_env(task_id="retry", sprite=sprite)
-        assert env._sync_manager._synced_files == {}, "failed unpack must not commit"
+        env = self._env(make_env, monkeypatch, files, sprite)
+        assert env._sync_manager._synced_files == {}, "a failed sync must not commit"
 
-        sprite.unpack_fails = False
+        sprite.unpack_exit = 0
+        sprite.fail_file_writes = False
         env._sync_manager.sync(force=True)
         assert set(env._sync_manager._synced_files) == {r for _, r in files}
         assert {r for _, r in files} <= set(sprite.files)
 
-    def test_archive_lives_under_remote_hermes_home(self, make_env, monkeypatch, tmp_path):
-        """Not in a world-readable /tmp: the archive carries credential files."""
-        import sprites_environment as se
-
-        files = self._host_tree(tmp_path, 2)
-        monkeypatch.setattr(se, "iter_sync_files", lambda _root: list(files))
+    def test_transport_failure_raises_without_fallback(self, make_env, monkeypatch, tmp_path):
+        files = self._host_tree(tmp_path, 3)
         sprite = _RateLimitedSprite(limit=10_000)
-        written = []
-        orig = sprite.filesystem
+        sprite.unpack_transport_error = True
 
-        def _fs(root):
-            fs = orig(root)
+        env = self._env(make_env, monkeypatch, files, sprite)
+        assert env._sync_manager._synced_files == {}
+        assert not any(r in sprite.writes for _, r in files), "no per-file fallback"
 
-            class _Spy:
-                def __truediv__(self, path):
-                    written.append(path)
-                    return fs / path
-            return _Spy()
-
-        sprite.filesystem = _fs
-        make_env(task_id="where", sprite=sprite)
-        assert len(written) == 1
-        assert written[0].startswith("/home/sprite/.hermes/.sync-")
-        assert written[0].endswith(".tar")
-
-    def test_sprite_without_tar_falls_back_to_one_write_per_file(
+    def test_archive_that_cannot_be_removed_is_blanked_and_archives_stop(
         self, make_env, monkeypatch, tmp_path
     ):
-        import sprites_environment as se
-
+        """A non-root user without sudo cannot delete the root-owned archive:
+        empty it, and send this environment's later syncs file by file so
+        archives do not pile up."""
         files = self._host_tree(tmp_path, 3)
-        monkeypatch.setattr(se, "iter_sync_files", lambda _root: list(files))
         sprite = _RateLimitedSprite(limit=10_000)
-        sprite.no_tar = True
+        sprite.archive_left = True
 
-        env = make_env(task_id="notar", sprite=sprite)
+        env = self._env(make_env, monkeypatch, files, sprite)
         assert set(env._sync_manager._synced_files) == {r for _, r in files}
-        for host, remote in files:
-            assert sprite.writes[remote] == Path(host).read_bytes()
+        (archive,) = self._archives(sprite)
+        assert sprite.writes[archive] == b"", "no credential bytes left behind"
+        assert env._use_archives is False
 
-    def test_unpack_failure_raises_with_output(self, make_env, tmp_path):
-        env = make_env(task_id="raise")
-        host = tmp_path / "a.txt"
-        host.write_text("a")
-        env._fs = MagicMock()
-        cmd = MagicMock()
-        cmd.combined_output.side_effect = _ExitError(
-            "exit status 2", 2, b"tar: No space left on device\n")
-        env._mock_sprite.command = MagicMock(return_value=cmd)
-        with pytest.raises(RuntimeError, match="No space left on device"):
-            env._sprite_bulk_upload([(str(host), "/home/sprite/.hermes/a.txt")])
+        Path(files[0][0]).write_text("changed\n")
+        unpacks = sprite.unpacks
+        env._sync_manager.sync(force=True)
+        assert sprite.unpacks == unpacks, "no further archives"
+        assert sprite.writes[files[0][1]] == b"changed\n"
+        assert len(self._archives(sprite)) == 1
 
     def test_archive_unpacks_with_real_tar(self, tmp_path):
-        """The archive unpacks with GNU/BSD tar to the remote paths, mode 0644."""
+        """The archive unpacks with tar to the remote paths, mode 0644."""
         import stat
         import subprocess
 
@@ -1090,14 +1117,14 @@ class TestFileSyncBulkUpload:
             pytest.skip("tar not available")
         src = tmp_path / "src"
         src.mkdir()
-        names = ["plain.txt", "with space.txt", "it's \"quoted\".txt", "-dash"]
+        names = ["plain.txt", "with space.txt", "it's \"quoted\".txt", "-dash", "$(touch pwned)"]
         files = []
         for name in names:
             host = src / name
             host.write_bytes(name.encode() * 3)
             host.chmod(0o600)
             files.append((str(host), f"/home/sprite/.hermes/sub dir/{name}"))
-        archive = tmp_path / "a.tar.gz"
+        archive = tmp_path / "a.tar"
         archive.write_bytes(_build_archive(files))
         dest = tmp_path / "root"
         dest.mkdir()
@@ -1107,22 +1134,28 @@ class TestFileSyncBulkUpload:
         for host, remote in files:
             out = dest / remote.lstrip("/")
             assert out.read_bytes() == Path(host).read_bytes()
-            assert stat.S_IMODE(out.stat().st_mode) & 0o777 == 0o644 & ~_umask()
+            assert stat.S_IMODE(out.stat().st_mode) == 0o644 & ~_umask()
 
     @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
     @pytest.mark.parametrize(
-        "tar_ok,sudo_ok,expect_rc",
-        [(True, False, 0), (False, True, 0), (False, False, 1), (None, True, 127)],
+        "tar_ok,sudo_ok,rm_ok,expect_rc",
+        [
+            (True, False, True, 0),     # root, or the archive was readable
+            (False, True, True, 0),     # non-root with sudo
+            (False, False, True, 1),    # non-root, sudo refused: non-zero
+            (None, False, True, None),  # no tar at all: non-zero
+            (True, False, False, 86),   # unpacked, archive not removable
+        ],
     )
-    def test_unpack_script_falls_back_to_sudo_and_always_removes_archive(
-        self, tmp_path, tar_ok, sudo_ok, expect_rc
-    ):
-        """tar_ok=None: the Sprite has no tar at all."""
+    def test_unpack_script(self, tmp_path, tar_ok, sudo_ok, rm_ok, expect_rc):
+        """tar_ok=None: the Sprite has no tar. Real sh and find, stub tar/sudo/rm."""
         import os
         import subprocess
 
         from sprites_environment import _unpack_script
 
+        if shutil.which("find") is None:
+            pytest.skip("find not available")
         bindir = tmp_path / "bin"
         bindir.mkdir()
         log = tmp_path / "log"
@@ -1134,24 +1167,35 @@ class TestFileSyncBulkUpload:
 
         if tar_ok is not None:
             stub("tar", f'echo "tar $*" >> {log}\nexit {0 if tar_ok else 2}\n')
-        stub("sudo", f'echo "sudo $*" >> {log}\n'
-                     f'case "$2" in rm) shift 1; exec "$@";; esac\n'
-                     f'exit {0 if sudo_ok else 1}\n')
-        archive = tmp_path / "it's an archive.tar.gz"
-        archive.write_bytes(b"x")
-        if tar_ok is None:
-            # Only the stubs and the commands the script needs besides tar.
-            for tool in ("rm",):
-                (bindir / tool).symlink_to(shutil.which(tool))
-            path = str(bindir)
+        stub("sudo", f'echo "sudo $*" >> {log}\nexit {0 if sudo_ok else 1}\n')
+        if rm_ok:
+            (bindir / "rm").symlink_to(shutil.which("rm"))
         else:
-            path = f"{bindir}{os.pathsep}{os.environ['PATH']}"
-        env = {**os.environ, "PATH": path}
+            stub("rm", "exit 1\n")
+        (bindir / "find").symlink_to(shutil.which("find"))
+
+        staging = tmp_path / "it's staging"
+        staging.mkdir()
+        archive = staging / ".sync-current.tar"
+        archive.write_bytes(b"x")
+        stale = staging / ".sync-stale.tar"
+        stale.write_bytes(b"old secret")
+        os.utime(stale, (0, 0))
+        fresh = staging / ".sync-other-live-sync.tar"
+        fresh.write_bytes(b"in flight")
+
+        env = {**os.environ, "PATH": str(bindir)}
         rc = subprocess.run(
             [shutil.which("sh"), "-c", _unpack_script(str(archive))], env=env,
             check=False).returncode
-        assert rc == expect_rc if expect_rc in (0, 127) else rc != 0
-        assert not archive.exists(), "archive must be removed whatever tar did"
+        if expect_rc is None:
+            assert rc != 0
+        else:
+            assert rc == expect_rc
+        assert fresh.exists(), "another sync's live archive must survive the sweep"
+        if rm_ok:
+            assert not archive.exists(), "archive must be removed whatever tar did"
+            assert not stale.exists(), "a leftover from an earlier sync is swept"
         if tar_ok is None:
             return
         calls = log.read_text()

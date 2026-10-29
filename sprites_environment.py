@@ -25,13 +25,19 @@ request it always has.
 
 Sprites 2.0 runtime: the only filesystem endpoint is ``fs/write`` (it creates
 parent directories itself); there is no read, list, stat or delete endpoint.
-File sync therefore uploads with ``fs/write`` alone and deletes through exec.
+File sync therefore uploads with ``fs/write`` and unpacks or deletes through
+exec. Each ``fs/write`` and each exec counts against a per-Sprite request rate
+limit, so changed files travel as tar archives: one ``fs/write`` and
+one exec per archive, however many files it holds.
 """
 
 import hashlib
+import io
 import logging
+import posixpath
 import re
 import shlex
+import tarfile
 import threading
 import uuid
 from pathlib import Path
@@ -103,6 +109,13 @@ class SpriteStillCreating(TimeoutError):
 
 #: Client wait for the exec that deletes synced files.
 _DELETE_TIMEOUT = 60.0
+
+#: Client wait for the exec that unpacks a sync archive.
+_UNPACK_TIMEOUT = 120.0
+
+#: Uncompressed bytes packed into one sync archive before starting another.
+#: A file larger than this travels alone in its own archive.
+_ARCHIVE_MAX_BYTES = 32 * 1024 * 1024
 
 #: Upper bound on one delete command, measured URL-encoded (the command
 #: travels in the exec URL), so a very large batch is split into several execs.
@@ -465,6 +478,71 @@ def _delete_batches(paths: list[str]) -> list[list[str]]:
     return batches
 
 
+def _archive_batches(files: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
+    """Split ``files`` so each archive holds at most ``_ARCHIVE_MAX_BYTES`` of input.
+
+    A single file larger than the budget still gets its own archive.
+    """
+    batches: list[list[tuple[str, str]]] = []
+    current: list[tuple[str, str]] = []
+    size = 0
+    for host_path, remote_path in files:
+        file_size = Path(host_path).stat().st_size
+        if current and size + file_size > _ARCHIVE_MAX_BYTES:
+            batches.append(current)
+            current, size = [], 0
+        current.append((host_path, remote_path))
+        size += file_size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _build_archive(files: list[tuple[str, str]]) -> bytes:
+    """Uncompressed tar (no gzip needed on the Sprite) of ``files``: member name is the remote path without its leading
+    ``/``, mode 0644, owner root, the same file mode a single ``fs/write`` sets.
+    Host owner, permissions and file type are not carried over."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for host_path, remote_path in files:
+            data = Path(host_path).read_bytes()
+            info = tarfile.TarInfo(remote_path.lstrip("/"))
+            info.size = len(data)
+            info.mode = 0o644
+            info.mtime = int(Path(host_path).stat().st_mtime)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+#: Exit status of the unpack script when the Sprite has no ``tar``.
+_NO_TAR_EXIT = 127
+
+
+def _unpack_script(archive_path: str) -> str:
+    """Unpack the archive at ``/``, retrying with ``sudo -n``, then remove it.
+
+    Directories and files from earlier syncs were written by ``fs/write`` as
+    root while the base image runs commands as ``sprite``, hence the retry.
+    The exit status is tar's (``_NO_TAR_EXIT`` without tar), so a failed
+    unpack fails the sync; the archive is removed either way.
+    """
+    q = shlex.quote(archive_path)
+    tar = f"tar -xf {q} -C / --no-same-owner"
+    return (
+        f"if command -v tar >/dev/null 2>&1; then "
+        f"{{ {tar} || sudo -n {tar}; }}; rc=$?; else rc={_NO_TAR_EXIT}; fi; "
+        f"rm -f -- {q} 2>/dev/null || sudo -n rm -f -- {q} 2>/dev/null; exit $rc"
+    )
+
+
+class _ExecFailed(RuntimeError):
+    """A sync exec exited non-zero; ``exit_code`` is its status (or None)."""
+
+    def __init__(self, message: str, exit_code):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
 class SpritesEnvironment(BaseEnvironment):
     """Sprites backend: stateful cloud sandboxes on Fly.io.
 
@@ -607,6 +685,7 @@ class SpritesEnvironment(BaseEnvironment):
         self._sync_manager = _SharedSpriteSyncManager(
             get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
             upload_fn=self._sprite_upload,
+            bulk_upload_fn=self._sprite_bulk_upload,
             delete_fn=self._sprite_delete,
             shared_lock=_shared_sync_lock(sprite_name),
         )
@@ -714,6 +793,62 @@ class SpritesEnvironment(BaseEnvironment):
         remote = self._fs / remote_path
         remote.write_bytes(data, mode=0o644, mkdir_parents=True)
 
+    def _sprite_bulk_upload(self, files: list[tuple[str, str]]) -> None:
+        """Upload changed files as archives: per archive, one ``fs/write`` of a
+        tar into the remote ``~/.hermes`` and one exec that unpacks and
+        removes it.
+
+        One ``fs/write`` per file made a sync cost as many requests as there
+        are files. The skills tree alone is a few hundred files, past the
+        per-Sprite request rate limit, so every sync was cut off by HTTP 429,
+        rolled back, and resent in full on the next command (and the burst
+        could rate-limit the command itself). Any failure raises, so
+        ``FileSyncManager`` rolls back and retries. A Sprite image without
+        ``tar`` gets the old one ``fs/write`` per file.
+        """
+        for batch in _archive_batches(files):
+            # Beside the files it carries, so it is no more readable than
+            # they are; 0644 (like them) so a non-root user without sudo can
+            # read it.
+            archive = posixpath.join(
+                self._remote_home, ".hermes", f".sync-{uuid.uuid4().hex}.tar")
+            (self._fs / archive).write_bytes(
+                _build_archive(batch), mode=0o644, mkdir_parents=True
+            )
+            try:
+                self._exec_or_raise(
+                    _unpack_script(archive), _UNPACK_TIMEOUT,
+                    f"unpacking {len(batch)} synced file(s)",
+                )
+            except _ExecFailed as e:
+                if e.exit_code != _NO_TAR_EXIT:
+                    raise
+                logger.warning(
+                    "Sprites: %s has no tar; uploading %d file(s) one by one",
+                    self._sprite_name, len(batch),
+                )
+                for host_path, remote_path in batch:
+                    self._sprite_upload(host_path, remote_path)
+
+    def _exec_or_raise(self, script: str, timeout: float, what: str) -> None:
+        """Run ``script`` with ``sh -c``; a non-zero exit raises ``_ExecFailed``."""
+        from sprites.exceptions import ExitError
+
+        cmd = self._sprite.command(
+            "sh", "-c", script, timeout=timeout, **self._command_kwargs(),
+        )
+        try:
+            cmd.combined_output()
+        except ExitError as e:
+            output = ((e.stdout or b"") + (e.stderr or b"")).decode(
+                "utf-8", errors="replace"
+            ).strip()
+            code = e.exit_code() if callable(getattr(e, "exit_code", None)) else None
+            raise _ExecFailed(
+                f"Sprites: {what} failed (exit {code if code is not None else '?'}): {output}",
+                code,
+            ) from e
+
     def _sprite_delete(self, remote_paths: list[str]) -> None:
         """Delete remote files with ``rm -f`` over exec.
 
@@ -727,25 +862,11 @@ class SpritesEnvironment(BaseEnvironment):
         drops the path from its synced set and never retries, which can leave
         stale credential material in a durable Sprite permanently.
         """
-        from sprites.exceptions import ExitError
-
         for batch in _delete_batches(remote_paths):
-            script = _delete_script(batch)
-            cmd = self._sprite.command(
-                "sh", "-c", script, timeout=_DELETE_TIMEOUT,
-                **self._command_kwargs(),
+            self._exec_or_raise(
+                _delete_script(batch), _DELETE_TIMEOUT,
+                f"deleting {len(batch)} synced file(s)",
             )
-            try:
-                cmd.combined_output()
-            except ExitError as e:
-                output = ((e.stdout or b"") + (e.stderr or b"")).decode(
-                    "utf-8", errors="replace"
-                ).strip()
-                code = e.exit_code() if callable(getattr(e, "exit_code", None)) else "?"
-                raise RuntimeError(
-                    f"Sprites: deleting {len(batch)} synced file(s) failed "
-                    f"(exit {code}): {output}"
-                ) from e
 
     # ------------------------------------------------------------------
     # Execution

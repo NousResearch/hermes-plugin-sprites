@@ -122,9 +122,18 @@ paths. Of the filesystem API it keeps only `fs/write`, which creates missing
 parent directories itself. The plugin's file sync (skills, credential files and
 caches copied into `~/.hermes` on the Sprite before each command) therefore:
 
-- uploads each file with one `fs/write` (`mode=0644`, `mkdirParents=true`, the
-  same request as before, minus the separate directory check that needed
-  `fs/list`);
+- uploads changed files as a tar archive: one `fs/write` of the archive
+  (root-only, mode 0600) into `~/.hermes/.sync-staging` on the Sprite and one
+  exec that unpacks it at `/` (retried with `sudo -n`) and removes it. Files
+  land with mode `0644`, as a single `fs/write` sets. If the unpack fails (no
+  `tar`, a non-root user without working sudo), that batch is sent one
+  `fs/write` per file; if the archive cannot be removed, it is emptied and the
+  session sends files one by one from then on. Archives left by a sync whose
+  unpack never ran are removed by a later sync after 30 minutes.
+  Each `fs/write` and exec counts against the per-Sprite request rate limit
+  (300 per minute), and the skills tree alone is a few hundred files, so one
+  request per file left every sync cut off by HTTP 429 and resent in full.
+  Archives hold up to 32 MiB of file data each;
 - deletes files that disappeared on the host with one exec per batch,
   `rm -f -- <paths>`, retried as `sudo -n rm -f -- <paths>` because `fs/write`
   creates root-owned files while the base image runs commands as `sprite`. A

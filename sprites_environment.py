@@ -517,9 +517,11 @@ def _build_archive(files: list[tuple[str, str]]) -> bytes:
     return buf.getvalue()
 
 
-#: Archives older than this are leftovers of a sync whose unpack never ran
-#: (transport failure, killed process). Well past ``_UNPACK_TIMEOUT``, so a
-#: live sync's archive is never swept.
+#: Archives older than this are taken to be leftovers of a sync whose unpack
+#: never ran (transport failure, killed process). Best effort: well past
+#: ``_UNPACK_TIMEOUT``, but a sync stalled for longer between its upload and
+#: its unpack can lose its archive; its unpack then fails and the batch is
+#: sent file by file.
 _STALE_ARCHIVE_MINUTES = 30
 
 #: Exit status of the unpack script when the archive could not be removed.
@@ -831,11 +833,11 @@ class SpritesEnvironment(BaseEnvironment):
         cannot delete a root-owned file), it is overwritten with nothing and
         this environment stops using archives, so they do not pile up.
         """
-        if not self._use_archives:
-            for host_path, remote_path in files:
-                self._sprite_upload(host_path, remote_path)
-            return
         for batch in _archive_batches(files):
+            if not self._use_archives:
+                for host_path, remote_path in batch:
+                    self._sprite_upload(host_path, remote_path)
+                continue
             # 0600: only root can read the archive, which may hold credential
             # files whose own directories are more restrictive than its own.
             archive = posixpath.join(

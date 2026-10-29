@@ -1106,6 +1106,21 @@ class TestFileSyncBulkUpload:
         assert sprite.writes[files[0][1]] == b"changed\n"
         assert len(self._archives(sprite)) == 1
 
+    def test_later_batches_of_the_same_sync_skip_archives_once_one_is_left(
+        self, make_env, monkeypatch, tmp_path
+    ):
+        import sprites_environment as se
+
+        monkeypatch.setattr(se, "_ARCHIVE_MAX_BYTES", 1)  # one file per archive
+        files = self._host_tree(tmp_path, 3)
+        sprite = _RateLimitedSprite(limit=10_000)
+        sprite.archive_left = True
+
+        env = self._env(make_env, monkeypatch, files, sprite)
+        assert set(env._sync_manager._synced_files) == {r for _, r in files}
+        assert sprite.unpacks == 1
+        assert len(self._archives(sprite)) == 1
+
     def test_archive_unpacks_with_real_tar(self, tmp_path):
         """The archive unpacks with tar to the remote paths, mode 0644."""
         import stat

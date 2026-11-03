@@ -57,12 +57,23 @@ reads the token from there instead of `SPRITES_TOKEN`:
   fallback, because a leftover env token may be a broader legacy token. The
   file path is fixed when an environment is created (in that profile's secret
   scope); a retry re-reads the same file and never switches credentials.
-- File sync never uploads the token file (under any name, including symlinks
-  and hard links) or the other files in its directory, whatever upload roots
-  are configured. Token files read earlier stay excluded too, so an old token
-  left behind by a renewal (a symlink's previous target, a hard link to the
-  replaced file) is not uploaded either. (The directory is still synced when it holds the Hermes
-  home; only the token file is skipped then.)
+- Keep the token file in a directory of its own, such as
+  `$HERMES_HOME/secrets/`. When an environment is created, the plugin resolves
+  `SPRITES_TOKEN_FILE` (following symlinks) and file sync then never uploads
+  anything in that file's directory, so the current token, a renewed one and
+  the writer's temp files are all covered. Nothing else is excluded, and
+  nothing the plugin reads changes what is synced.
+- The plugin refuses (the backend reports `needs_setup`) a token file whose
+  directory is the Hermes home or above it, is inside or above a skills or
+  cache directory that file sync uploads, or holds a credential file listed in
+  `terminal.credential_files`. Such a directory could hold files that should
+  sync, and excluding it would hide them.
+- After an environment is created, the token is only read from inside that
+  directory: if `SPRITES_TOKEN_FILE` comes to resolve somewhere else (a
+  retargeted symlink), the re-read fails rather than using a token file sync
+  might upload. Create a new environment to pick up the new location.
+- Copies of the token placed elsewhere (a hard link or copy in a skills
+  directory) are not tracked: writing them needs write access on the machine.
 - Error messages name the path, never the file's contents. An API error that
   quotes the token is replaced by one that does not.
 - Replace the file atomically (write a temp file in the same directory, then

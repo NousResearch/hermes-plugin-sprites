@@ -80,27 +80,6 @@ _TOKEN_NOT_FROM_ENV = (
     f"SPRITES_TOKEN is not used while {SPRITES_TOKEN_FILE_ENV} is set."
 )
 
-#: Every token file this process has read: canonical paths and file
-#: identities ``(st_dev, st_ino, st_size, st_mtime_ns)``. File sync excludes
-#: all of them, not just the token path's current target, so a token that
-#: was renewed (file replaced, symlink retargeted) stays protected wherever
-#: an old copy or hard link of it remains. Size and mtime are part of the
-#: identity so a reused inode number is not mistaken for an old token.
-_seen_token_paths: set = set()
-_seen_token_ids: set = set()
-_seen_token_lock = threading.Lock()
-
-
-def _file_id(st) -> tuple:
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-
-
-def _record_token_file(path: str, st) -> None:
-    with _seen_token_lock:
-        _seen_token_paths.add(os.path.realpath(path))
-        _seen_token_ids.add(_file_id(st))
-
-
 class SpritesTokenError(ValueError):
     """No usable Sprites token. The message never contains the token."""
 
@@ -134,13 +113,12 @@ def _read_token_file(path: str) -> str:
              | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0))
     try:
         fd = os.open(path, flags)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         raise fail(f"the file could not be opened ({type(e).__name__})") from None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise fail("it is not a regular file")
-        _record_token_file(path, st)
         chunks, size = [], 0
         while size <= _TOKEN_FILE_MAX_BYTES:
             chunk = os.read(fd, _TOKEN_FILE_MAX_BYTES + 1 - size)
@@ -175,23 +153,134 @@ class _TokenSource:
     Decided once, in the caller's secret scope, when the environment is
     created. Later reads (after a 401, possibly on a worker thread that has
     no secret scope) re-read the same file and never look up variables again,
-    so they cannot switch to a different credential. ``repr`` shows the path
-    only.
+    so they cannot switch to a different credential. ``exclusion`` is what
+    file sync must never upload (``None`` for an env token). ``repr`` shows
+    the path only.
     """
 
-    __slots__ = ("_env_token", "path")
+    __slots__ = ("_env_token", "exclusion", "path")
 
-    def __init__(self, path: "str | None" = None, env_token: "str | None" = None):
+    def __init__(self, path: "str | None" = None, env_token: "str | None" = None,
+                 exclusion: "_TokenFileExclusion | None" = None):
         self.path = path
         self._env_token = env_token
+        self.exclusion = exclusion
 
     def read(self) -> str:
-        if self.path is not None:
-            return _read_token_file(self.path)
-        return self._env_token
+        if self.path is None:
+            return self._env_token
+        token = _read_token_file(self.path)
+        # Only a token that lives inside the excluded directory is used, so
+        # this environment never sends a token that file sync might upload.
+        if self.exclusion is not None and not self.exclusion.holds(self.path):
+            raise SpritesTokenError(
+                f"{SPRITES_TOKEN_FILE_ENV} is set to {self.path!r}, which now "
+                f"resolves outside {self.exclusion.token_dir!r}, the directory "
+                "it named when this environment was created. "
+                + _TOKEN_NOT_FROM_ENV
+            )
+        return token
 
     def __repr__(self) -> str:
         return f"_TokenSource(path={self.path!r})"
+
+
+class _TokenFileExclusion:
+    """The token file's location, fixed from configuration: never uploaded.
+
+    ``token_path`` is the realpath of ``SPRITES_TOKEN_FILE`` and ``token_dir``
+    its parent. File sync skips every file whose path, or resolved path, is
+    ``token_path`` or lies inside ``token_dir``. The writer replaces the file
+    with a temp file renamed in that same directory, so the current, the
+    renewed and any half-written token are all covered without remembering
+    which files were read. Nothing else is ever excluded, and
+    ``_check_token_dir`` refuses a ``token_dir`` that could hold normal
+    upload files.
+    """
+
+    __slots__ = ("token_dir", "token_path")
+
+    def __init__(self, configured: str):
+        try:
+            self.token_path = os.path.realpath(configured)
+        except (OSError, ValueError):
+            # Unresolvable: reading fails closed anyway; still keep the
+            # literal path and its literal parent out of sync.
+            self.token_path = os.path.normpath(configured)
+        self.token_dir = os.path.dirname(self.token_path)
+
+    def holds(self, path: str) -> bool:
+        """True when ``path`` resolves to a file inside ``token_dir``."""
+        try:
+            return _is_within(os.path.realpath(path), self.token_dir)
+        except (OSError, ValueError):
+            return False
+
+    def covers(self, host_path: str) -> bool:
+        """True when file sync must skip ``host_path`` (by name or resolved)."""
+        try:
+            candidates = {os.path.abspath(host_path), os.path.realpath(host_path)}
+        except (OSError, ValueError):
+            return True  # unresolvable: do not upload it
+        return any(c == self.token_path or _is_within(c, self.token_dir)
+                   for c in candidates)
+
+
+def _upload_roots() -> list:
+    """Directories file sync uploads from: skill and cache roots (realpaths).
+
+    Includes ``$HERMES_HOME/skills`` and ``$HERMES_HOME/cache`` even when they
+    do not exist yet.
+    """
+    from hermes_constants import get_hermes_home
+    from tools import credential_files as cf
+
+    home = Path(get_hermes_home())
+    roots = [home / "skills", home / "cache"]
+    roots += [d for d, _ in cf._skill_dir_roots("/root/.hermes")]
+    roots += [d for d, _ in cf._cache_dir_roots("/root/.hermes", create_missing=False)]
+    return [os.path.realpath(str(r)) for r in roots]
+
+
+def _check_token_dir(configured: str, exclusion: _TokenFileExclusion) -> None:
+    """Refuse a token file whose directory could hold files that should sync.
+
+    Everything in ``token_dir`` is kept out of file sync, so it must be a
+    directory of its own: not the Hermes home (nor above it), not inside or
+    above a skills or cache root, and holding no configured credential file.
+    ``$HERMES_HOME/secrets/`` is fine.
+    """
+    token_dir = exclusion.token_dir
+
+    def refuse(problem: str) -> SpritesTokenError:
+        return SpritesTokenError(
+            f"{SPRITES_TOKEN_FILE_ENV} is set to {configured!r}, but its "
+            f"directory {token_dir!r} {problem}. Everything in that directory "
+            "is kept out of file sync, so the token file must be in a "
+            "directory of its own (for example $HERMES_HOME/secrets/). "
+            + _TOKEN_NOT_FROM_ENV
+        )
+
+    try:
+        from hermes_constants import get_hermes_home
+        from tools.credential_files import get_credential_file_mounts
+
+        home = os.path.realpath(str(get_hermes_home()))
+        roots = _upload_roots()
+        credentials = [os.path.realpath(m["host_path"])
+                       for m in get_credential_file_mounts() if m.get("host_path")]
+    except Exception as e:
+        raise refuse(
+            f"could not be checked against the file sync roots ({type(e).__name__})"
+        ) from None
+    if _is_within(home, token_dir):
+        raise refuse("is (or contains) the Hermes home")
+    for root in roots:
+        if _is_within(root, token_dir) or _is_within(token_dir, root):
+            raise refuse(f"overlaps the file sync root {root!r}")
+    for path in credentials:
+        if _is_within(path, token_dir):
+            raise refuse(f"holds the credential file {path!r}, which file sync uploads")
 
 
 def _token_source(lookup=None) -> _TokenSource:
@@ -210,7 +299,9 @@ def _token_source(lookup=None) -> _TokenSource:
         path = os.path.expanduser(path)
         if not os.path.isabs(path):
             path = os.path.join(os.getcwd(), path)
-        return _TokenSource(path=path)
+        exclusion = _TokenFileExclusion(path)
+        _check_token_dir(path, exclusion)
+        return _TokenSource(path=path, exclusion=exclusion)
     token = lookup("SPRITES_TOKEN") or lookup("SPRITE_TOKEN")
     if not token:
         raise SpritesTokenError(
@@ -248,56 +339,18 @@ def resolve_sprites_token(lookup=None) -> str:
     return _token_source(lookup).read()
 
 
-def _without_token_file(files, token_path: "str | None"):
-    """``files`` minus anything that is, or sits beside, a token file.
+def _without_token_file(files, exclusion: "_TokenFileExclusion | None"):
+    """``files`` (``(host_path, remote_path)`` pairs) minus the token file's directory.
 
-    ``files`` is ``(host_path, remote_path)`` pairs from file sync. Excluded:
-    the configured token file and every token file this process has read
-    before (``_seen_token_paths`` / ``_seen_token_ids``), under any name
-    (symlink, hard link, ``..`` path), and every file in a directory holding
-    one (a ``secrets`` directory, the writer's temp files). A directory that
-    holds the Hermes home is not excluded (a token file placed directly in
-    the home would otherwise stop all file sync); the token file itself
-    still is.
+    See ``_TokenFileExclusion``: the exclusion comes from configuration only.
     """
-    if not token_path:
+    if exclusion is None:
         return list(files)
-    names = {os.path.realpath(token_path)}
-    ids = set()
-    try:
-        ids.add(_file_id(os.stat(token_path)))
-    except OSError:
-        pass
-    with _seen_token_lock:
-        names |= _seen_token_paths
-        ids |= _seen_token_ids
-    try:
-        from hermes_constants import get_hermes_home
-        home = os.path.realpath(str(get_hermes_home()))
-    except Exception:
-        home = None
-    dirs = set()
-    for d in {os.path.dirname(n) for n in names} | {
-        os.path.realpath(os.path.dirname(token_path))
-    }:
-        if d and d != os.path.dirname(d) and not (home and _is_within(home, d)):
-            dirs.add(d)
-    kept = []
-    for host_path, remote_path in files:
-        candidates = {os.path.abspath(host_path), os.path.realpath(host_path)}
-        if candidates & names or any(
-            _is_within(c, d) for c in candidates for d in dirs
-        ):
-            continue
-        try:
-            if _file_id(os.stat(host_path)) in ids:
-                continue
-        except OSError:
-            pass
-        kept.append((host_path, remote_path))
+    files = list(files)
+    kept = [(h, r) for h, r in files if not exclusion.covers(h)]
     if len(kept) != len(files):
         logger.debug(
-            "Sprites: file sync skipped %d file(s) at or beside %s",
+            "Sprites: file sync skipped %d file(s) in the %s directory",
             len(files) - len(kept), SPRITES_TOKEN_FILE_ENV,
         )
     return kept
@@ -1011,11 +1064,12 @@ class SpritesEnvironment(BaseEnvironment):
         self._fs = self._sprite.filesystem("/")
         self._use_archives = True
         self._sync_manager = _SharedSpriteSyncManager(
-            # Never ship the token file (or its directory) into the Sprite,
-            # whatever upload roots are configured.
+            # Never ship the token file's directory into the Sprite. This is
+            # the one place host paths are seen: FileSyncManager copies each
+            # file to a staging dir before upload_fn / bulk_upload_fn run.
             get_files_fn=lambda: _without_token_file(
                 iter_sync_files(f"{self._remote_home}/.hermes"),
-                self._token_source.path),
+                self._token_source.exclusion),
             upload_fn=self._sprite_upload,
             bulk_upload_fn=self._sprite_bulk_upload,
             delete_fn=self._sprite_delete,

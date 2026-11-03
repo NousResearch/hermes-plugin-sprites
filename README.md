@@ -34,7 +34,26 @@ discovery and terminal dispatch with mocked SDK transport.
 - **Ephemeral mode** (`terminal.container_persistent: false`): run-unique Sprite names (never adopted, deleted on cleanup), with per-session sandbox identities so two ephemeral runs can never attach the same live VM.
 - **Client-side exec timeouts.** SDK calls without a positive timeout use a 3600s client timeout. This is not a guarantee that the remote process stops at that instant; the plugin has no explicit kill hook for an in-flight command.
 - **Sharing model:** gateway/WebUI sessions each get their own Sprite; `delegate_task` children share their parent's; key-less flows (CLI, cron) share the profile-default Sprite.
-- `SPRITES_TOKEN` / `SPRITE_TOKEN` are stripped from every subprocess the agent spawns.
+- `SPRITES_TOKEN` / `SPRITE_TOKEN` (and `SPRITES_TOKEN_FILE`) are stripped from every subprocess the agent spawns.
+
+## Token from a file (`SPRITES_TOKEN_FILE`)
+
+Set `SPRITES_TOKEN_FILE` to the path of a file holding the token (the whole
+file, surrounding whitespace ignored) and the plugin reads the token from there
+instead of `SPRITES_TOKEN`:
+
+- The file is read again whenever a Sprites environment is created, and after
+  an HTTP 401 from the Sprites API: if the token in the file changed, the
+  failed call is retried once with a new client. A token rewritten in place
+  (Hermes Cloud renews its short-lived per-instance token weekly) therefore
+  takes effect without restarting Hermes.
+- While `SPRITES_TOKEN_FILE` is set, a missing, unreadable or empty file is an
+  error that names `SPRITES_TOKEN_FILE`; `SPRITES_TOKEN` is **not** used as a
+  fallback, because a leftover env token may be a broader legacy token.
+- Replace the file atomically (write a temp file in the same directory, then
+  rename it over the old one) so the plugin never reads a half-written token.
+  Keep it mode `0600`, owned by the user Hermes runs as.
+- Unset, `SPRITES_TOKEN` / `SPRITE_TOKEN` work exactly as before.
 
 ## Settings
 

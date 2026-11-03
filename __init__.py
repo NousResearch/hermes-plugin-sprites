@@ -8,7 +8,8 @@ Install into ``~/.hermes/plugins/sprites/`` and enable via
 ``hermes plugins enable sprites``, then:
 
     hermes config set terminal.backend sprites
-    # SPRITES_TOKEN in ~/.hermes/.env (get one with `sprite login`)
+    # SPRITES_TOKEN in ~/.hermes/.env (get one with `sprite login`), or
+    # SPRITES_TOKEN_FILE naming a file that holds it (re-read on change)
 
 Optional settings (``plugins.entries.sprites.settings.*`` in config.yaml):
 ``name_prefix`` confines every Sprite name to ``<prefix>-*`` and ``scope``
@@ -137,13 +138,33 @@ def _sdk_installed() -> bool:
         return False
 
 
-def _get_token() -> Optional[str]:
+def _lookup(name: str) -> Optional[str]:
     try:
         from agent.secret_scope import get_secret
 
-        return get_secret("SPRITES_TOKEN") or get_secret("SPRITE_TOKEN")
+        return get_secret(name)
     except Exception:
-        return os.getenv("SPRITES_TOKEN") or os.getenv("SPRITE_TOKEN")
+        return os.getenv(name)
+
+
+def _token_status() -> tuple:
+    """``(token or None, problem)``: the token, read fresh, or why there is none.
+
+    ``SPRITES_TOKEN_FILE`` (a readable, non-empty file) wins over
+    ``SPRITES_TOKEN`` / ``SPRITE_TOKEN``; see ``resolve_sprites_token``.
+    """
+    if __package__:
+        from .sprites_environment import SpritesTokenError, resolve_sprites_token
+    else:
+        from sprites_environment import SpritesTokenError, resolve_sprites_token
+    try:
+        return resolve_sprites_token(_lookup), ""
+    except SpritesTokenError as e:
+        return None, str(e)
+
+
+def _get_token() -> Optional[str]:
+    return _token_status()[0]
 
 
 class SpritesProvider(TerminalEnvironmentProvider):
@@ -213,7 +234,7 @@ class SpritesProvider(TerminalEnvironmentProvider):
 
     @property
     def strip_env_keys(self) -> frozenset:
-        return frozenset({"SPRITES_TOKEN", "SPRITE_TOKEN"})
+        return frozenset({"SPRITES_TOKEN", "SPRITE_TOKEN", "SPRITES_TOKEN_FILE"})
 
     def is_available(self) -> bool:
         return (
@@ -231,10 +252,12 @@ class SpritesProvider(TerminalEnvironmentProvider):
                 "pip install '%s'", _SPRITES_SPEC,
             )
             return False
-        if not _get_token():
+        token, problem = _token_status()
+        if not token:
             logger.error(
-                "Sprites backend requires SPRITES_TOKEN. Run `sprite login` "
-                "and put the token in ~/.hermes/.env as SPRITES_TOKEN."
+                "%s Run `sprite login` and put the token in ~/.hermes/.env as "
+                "SPRITES_TOKEN, or point SPRITES_TOKEN_FILE at a file holding it.",
+                problem,
             )
             return False
         return True
@@ -245,8 +268,11 @@ class SpritesProvider(TerminalEnvironmentProvider):
                 "needs_setup",
                 f"sprites-py SDK not installed — pip install '{_SPRITES_SPEC}'.",
             )
-        if _get_token():
+        token, problem = _token_status()
+        if token:
             return ("ready", "")
+        if (_lookup("SPRITES_TOKEN_FILE") or "").strip():
+            return ("needs_setup", problem)
         return ("needs_setup", "Set SPRITES_TOKEN to use the Sprites backend.")
 
     def setup_instructions(self):
@@ -257,7 +283,8 @@ class SpritesProvider(TerminalEnvironmentProvider):
             "Get a token with: sprite login  (or `sprite auth setup --token ...`)",
             "Tip: mint a Restricted Token with prefix=hermes to scope it to",
             "     hermes-* sprites only. Recommended for CI / shared use.",
-            "Save it in ~/.hermes/.env as SPRITES_TOKEN.",
+            "Save it in ~/.hermes/.env as SPRITES_TOKEN (or set SPRITES_TOKEN_FILE",
+            "     to a file holding it; the file is re-read when it changes).",
             "Note: Sprites allocates compute dynamically (up to 8 CPU / 16 GB RAM).",
         ]
 

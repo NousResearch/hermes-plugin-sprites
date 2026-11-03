@@ -29,11 +29,18 @@ File sync therefore uploads with ``fs/write`` and unpacks or deletes through
 exec. Each ``fs/write`` and each exec counts against a per-Sprite request rate
 limit, so changed files travel as tar archives: one ``fs/write`` and
 one exec per archive, however many files it holds.
+
+Token: ``SPRITES_TOKEN_FILE``, when set, names a file holding the token. The
+file is read again for every new environment and after an HTTP 401, so a
+token rewritten in place (Hermes Cloud renews it weekly) is used without a
+restart. Unset, ``SPRITES_TOKEN`` / ``SPRITE_TOKEN`` are read as before (see
+``resolve_sprites_token``).
 """
 
 import hashlib
 import io
 import logging
+import os
 import posixpath
 import re
 import shlex
@@ -59,6 +66,84 @@ from tools.environments.file_sync import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Names a file holding the Sprites token (Hermes Cloud writes a short-lived,
+#: per-instance token there and rewrites it on renewal). Not a secret itself.
+SPRITES_TOKEN_FILE_ENV = "SPRITES_TOKEN_FILE"
+
+
+class SpritesTokenError(ValueError):
+    """No usable Sprites token. The message never contains the token."""
+
+
+def _default_lookup(name: str):
+    from agent.secret_scope import get_secret
+
+    return get_secret(name)
+
+
+def resolve_sprites_token(lookup=None) -> str:
+    """Return the Sprites token, read fresh on every call.
+
+    When ``SPRITES_TOKEN_FILE`` is set, the token is the whole file with
+    surrounding whitespace removed. A missing, unreadable or empty file is an
+    error: ``SPRITES_TOKEN`` is deliberately NOT used as a fallback, since a
+    leftover env token may be a broader legacy token than the scoped one the
+    file holds. Whoever writes the file must replace it atomically (write a
+    temp file, then rename), so a read never sees a half-written token.
+
+    When ``SPRITES_TOKEN_FILE`` is unset, ``SPRITES_TOKEN`` or
+    ``SPRITE_TOKEN`` is used, as before.
+
+    ``lookup(name)`` reads a variable (default: ``agent.secret_scope.get_secret``).
+    Raises ``SpritesTokenError`` when no token is found.
+    """
+    lookup = lookup or _default_lookup
+    path = (lookup(SPRITES_TOKEN_FILE_ENV) or "").strip()
+    if path:
+        try:
+            with open(os.path.expanduser(path), encoding="utf-8") as f:
+                token = f.read().strip()
+        except (OSError, UnicodeDecodeError) as e:
+            raise SpritesTokenError(
+                f"{SPRITES_TOKEN_FILE_ENV} is set to {path!r} but the file could "
+                f"not be read ({type(e).__name__}). SPRITES_TOKEN is not used "
+                f"while {SPRITES_TOKEN_FILE_ENV} is set."
+            ) from None
+        if not token:
+            raise SpritesTokenError(
+                f"{SPRITES_TOKEN_FILE_ENV} is set to {path!r} but the file is "
+                f"empty. SPRITES_TOKEN is not used while {SPRITES_TOKEN_FILE_ENV} "
+                "is set."
+            )
+        return token
+    token = lookup("SPRITES_TOKEN") or lookup("SPRITE_TOKEN")
+    if not token:
+        raise SpritesTokenError(
+            "Sprites backend requires SPRITES_TOKEN (or SPRITES_TOKEN_FILE). "
+            "Run `hermes setup terminal` or set SPRITES_TOKEN in .env."
+        )
+    return token
+
+
+def _is_auth_error(exc: "BaseException | None") -> bool:
+    """True for a Sprites API 401, however the SDK surfaced it."""
+    try:
+        from sprites.exceptions import AuthenticationError
+    except ImportError:
+        AuthenticationError = ()
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if AuthenticationError and isinstance(exc, AuthenticationError):
+            return True
+        if getattr(exc, "status_code", None) == 401:
+            return True
+        # Follow the chain a traceback would show (``raise ... from None`` stops it).
+        exc = exc.__cause__ if exc.__cause__ is not None else (
+            None if exc.__suppress_context__ else exc.__context__
+        )
+    return False
 
 
 #: Hard bound on generated Sprite names. The name feeds the
@@ -602,17 +687,16 @@ class SpritesEnvironment(BaseEnvironment):
         self._NotFoundError = NotFoundError
         self._SpriteError = SpriteError
 
-        from agent.secret_scope import get_secret
-        token = get_secret("SPRITES_TOKEN") or get_secret("SPRITE_TOKEN")
-        if not token:
-            raise ValueError(
-                "Sprites backend requires SPRITES_TOKEN. "
-                "Run `hermes setup terminal` or set SPRITES_TOKEN in .env."
-            )
+        # Read the token fresh for every environment (SPRITES_TOKEN_FILE may
+        # have been rewritten since the last one).
+        self._SpritesClient = SpritesClient
+        self._client_timeout = max(30.0, float(timeout))
+        self._token = resolve_sprites_token()
         self._client = SpritesClient(
-            token=token,
-            timeout=max(30.0, float(timeout)),
+            token=self._token,
+            timeout=self._client_timeout,
         )
+        self._auth_lock = threading.Lock()
         self._persistent = persistent_filesystem
         self._task_id = task_id
         self._name_prefix = prefix
@@ -712,6 +796,62 @@ class SpritesEnvironment(BaseEnvironment):
         self.init_session()
 
     # ------------------------------------------------------------------
+    # Token renewal
+    # ------------------------------------------------------------------
+
+    def _with_auth_retry(self, fn):
+        """Call ``fn()``; after an HTTP 401, retry it once if the token changed.
+
+        ``fn`` must read ``self._sprite`` / ``self._fs`` when called, so the
+        retry goes through the new client. With an unchanged token (or no
+        readable token) the 401 is raised as is.
+        """
+        client = self._client
+        try:
+            return fn()
+        except Exception as e:
+            if not _is_auth_error(e) or not self._refresh_client_after_401(client):
+                raise
+        return fn()
+
+    def _refresh_client_after_401(self, failed_client) -> bool:
+        """Re-read the token; on a change, switch to a new client. True to retry."""
+        with self._auth_lock:
+            if self._client is not failed_client:
+                return True  # another call already switched clients
+            try:
+                token = resolve_sprites_token()
+            except SpritesTokenError as e:
+                logger.warning("Sprites: HTTP 401 and the token could not be re-read: %s", e)
+                return False
+            if token == self._token:
+                return False
+            client = self._SpritesClient(token=token, timeout=self._client_timeout)
+            try:
+                sprite = client.get_sprite(self._sprite_name) if self._sprite is not None else None
+            except Exception as e:
+                logger.warning(
+                    "Sprites: token changed after HTTP 401, but %s could not be "
+                    "reopened with it: %s", self._sprite_name, type(e).__name__,
+                )
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                return False
+            old_client = self._client
+            self._client, self._token = client, token
+            if sprite is not None:
+                self._sprite = sprite
+                self._fs = sprite.filesystem("/")
+            try:
+                old_client.close()
+            except Exception:
+                pass
+            logger.info("Sprites: token changed after HTTP 401; retrying with the new token")
+            return True
+
+    # ------------------------------------------------------------------
     # Creation and exec helpers
     # ------------------------------------------------------------------
 
@@ -809,8 +949,9 @@ class SpritesEnvironment(BaseEnvironment):
         sprites-py defaults the plugin has always sent.
         """
         data = Path(host_path).read_bytes()
-        remote = self._fs / remote_path
-        remote.write_bytes(data, mode=0o644, mkdir_parents=True)
+        self._with_auth_retry(
+            lambda: (self._fs / remote_path).write_bytes(data, mode=0o644, mkdir_parents=True)
+        )
 
     def _sprite_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         """Upload changed files as archives: per archive, one ``fs/write`` of a
@@ -843,8 +984,9 @@ class SpritesEnvironment(BaseEnvironment):
             archive = posixpath.join(
                 self._remote_home, ".hermes", ".sync-staging",
                 f".sync-{uuid.uuid4().hex}.tar")
-            (self._fs / archive).write_bytes(
-                _build_archive(batch), mode=0o600, mkdir_parents=True
+            payload = _build_archive(batch)
+            self._with_auth_retry(
+                lambda: (self._fs / archive).write_bytes(payload, mode=0o600, mkdir_parents=True)
             )
             try:
                 self._exec_or_raise(
@@ -865,11 +1007,13 @@ class SpritesEnvironment(BaseEnvironment):
         """Run ``script`` with ``sh -c``; a non-zero exit raises ``_ExecFailed``."""
         from sprites.exceptions import ExitError
 
-        cmd = self._sprite.command(
-            "sh", "-c", script, timeout=timeout, **self._command_kwargs(),
-        )
+        def run():
+            return self._sprite.command(
+                "sh", "-c", script, timeout=timeout, **self._command_kwargs(),
+            ).combined_output()
+
         try:
-            cmd.combined_output()
+            self._with_auth_retry(run)
         except ExitError as e:
             output = ((e.stdout or b"") + (e.stderr or b"")).decode(
                 "utf-8", errors="replace"
@@ -926,10 +1070,14 @@ class SpritesEnvironment(BaseEnvironment):
 
         cmd_kwargs = self._command_kwargs()
 
+        def run():
+            # After a token switch, self._sprite is bound to the new client.
+            current = self._sprite or sprite
+            return current.command(*shell_cmd, timeout=cmd_timeout, **cmd_kwargs).combined_output()
+
         def exec_fn() -> tuple[str, int]:
-            cmd = sprite.command(*shell_cmd, timeout=cmd_timeout, **cmd_kwargs)
             try:
-                output = cmd.combined_output()
+                output = self._with_auth_retry(run)
                 return (output.decode("utf-8", errors="replace"), 0)
             except ExitError as e:
                 # ``e.stdout`` carries the combined output when raised from

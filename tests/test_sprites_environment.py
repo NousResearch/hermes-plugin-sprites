@@ -103,6 +103,7 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("SPRITES_TOKEN", raising=False)
     monkeypatch.delenv("SPRITE_TOKEN", raising=False)
+    monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
     return home
 
 @pytest.fixture()
@@ -2134,3 +2135,277 @@ class TestProviderCreateSettings:
         assert fields["image"]["type"] == "string"
         for key in ("max_cpus", "max_ram_gb", "max_disk_gb"):
             assert fields[key]["type"] == "number"
+
+
+# ---------------------------------------------------------------------------
+# SPRITES_TOKEN_FILE: token read from a file, re-read on change and after 401
+# ---------------------------------------------------------------------------
+
+def _write_token(path, token):
+    """Replace ``path`` atomically (temp + rename), as Hermes Cloud does."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(token)
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
+def _ok_cmd(output=b"ok\n"):
+    cmd = MagicMock()
+    cmd.combined_output.return_value = output
+    return cmd
+
+
+def _auth_cmd():
+    cmd = MagicMock()
+    cmd.combined_output.side_effect = _AuthenticationError("Authentication failed")
+    return cmd
+
+
+class _APIError401(_SpriteError):
+    """Like sprites.exceptions.APIError for a 401 (websocket / fs paths)."""
+
+    status_code = 401
+
+
+class TestTokenFile:
+    @pytest.fixture()
+    def token_file(self, tmp_path, monkeypatch):
+        path = tmp_path / "secrets" / "sprites-token"
+        path.parent.mkdir()
+        _write_token(path, "file-token-1\n")
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(path))
+        return path
+
+    def test_token_read_from_file_stripped(self, token_file):
+        from sprites_environment import resolve_sprites_token
+        assert resolve_sprites_token() == "file-token-1"
+
+    def test_file_wins_over_env_token(self, token_file, monkeypatch):
+        monkeypatch.setenv("SPRITES_TOKEN", "legacy-env-token")
+        from sprites_environment import resolve_sprites_token
+        assert resolve_sprites_token() == "file-token-1"
+
+    @pytest.mark.parametrize("content", [None, "", "  \n\t"], ids=["missing", "empty", "blank"])
+    def test_missing_or_empty_file_errors_without_env_fallback(self, tmp_path, monkeypatch, content):
+        path = tmp_path / "sprites-token"
+        if content is not None:
+            path.write_text(content)
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(path))
+        monkeypatch.setenv("SPRITES_TOKEN", "legacy-env-token")
+        monkeypatch.setenv("SPRITE_TOKEN", "legacy-env-token")
+        from sprites_environment import SpritesTokenError, resolve_sprites_token
+        with pytest.raises(SpritesTokenError, match="SPRITES_TOKEN_FILE") as info:
+            resolve_sprites_token()
+        assert "legacy-env-token" not in str(info.value)
+
+    def test_unreadable_path_errors(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(tmp_path))  # a directory
+        monkeypatch.setenv("SPRITES_TOKEN", "legacy-env-token")
+        from sprites_environment import SpritesTokenError, resolve_sprites_token
+        with pytest.raises(SpritesTokenError, match="SPRITES_TOKEN_FILE"):
+            resolve_sprites_token()
+
+    def test_unset_file_uses_env_token(self, monkeypatch):
+        monkeypatch.setenv("SPRITES_TOKEN", "env-token")
+        from sprites_environment import resolve_sprites_token
+        assert resolve_sprites_token() == "env-token"
+        monkeypatch.delenv("SPRITES_TOKEN")
+        monkeypatch.setenv("SPRITE_TOKEN", "alt-token")
+        assert resolve_sprites_token() == "alt-token"
+
+    def test_unset_file_env_token_reaches_client(self, make_env, sprites_sdk):
+        """hermes_runtime sets SPRITES_TOKEN only: the old path is unchanged."""
+        make_env(task_id="legacy")
+        sprites_mod, _ = sprites_sdk
+        assert sprites_mod.SpritesClient.call_args.kwargs["token"] == "test-token"
+
+    def test_environment_uses_file_token(self, make_env, sprites_sdk, token_file):
+        make_env(task_id="tf")
+        sprites_mod, _ = sprites_sdk
+        assert sprites_mod.SpritesClient.call_args.kwargs["token"] == "file-token-1"
+
+    def test_replaced_file_used_by_next_environment(self, make_env, sprites_sdk, token_file):
+        make_env(task_id="tf1")
+        sprites_mod, _ = sprites_sdk
+        assert sprites_mod.SpritesClient.call_args.kwargs["token"] == "file-token-1"
+        _write_token(token_file, "file-token-2")
+        make_env(task_id="tf2")
+        sprites_mod, _ = sprites_sdk
+        assert sprites_mod.SpritesClient.call_args.kwargs["token"] == "file-token-2"
+
+    def test_bad_file_refuses_environment_even_with_env_token(self, sprites_sdk, hermes_runtime,
+                                                             tmp_path, monkeypatch):
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(tmp_path / "absent"))
+        sprites_mod, _ = sprites_sdk
+        from sprites_environment import SpritesEnvironment
+        with pytest.raises(ValueError, match="SPRITES_TOKEN_FILE"):
+            SpritesEnvironment(task_id="x")
+        sprites_mod.SpritesClient.assert_not_called()
+
+    def _swap_in_new_client(self, env, new_sprite):
+        """Clients made after this return ``new_sprite`` from get_sprite."""
+        new_client = MagicMock(name="new_client")
+        new_client.get_sprite.return_value = new_sprite
+        env._SpritesClient = MagicMock(return_value=new_client)
+        return env._SpritesClient, new_client
+
+    def test_401_rereads_file_and_retries_once_with_new_token(self, make_env, sprites_sdk, token_file):
+        env = make_env(task_id="r401")
+        old_client, old_sprite = env._mock_client, env._mock_sprite
+        old_sprite.command = MagicMock(return_value=_auth_cmd())
+        new_sprite = MagicMock(name="new_sprite")
+        new_sprite.command = MagicMock(return_value=_ok_cmd(b"fresh\n"))
+        factory, new_client = self._swap_in_new_client(env, new_sprite)
+        _write_token(token_file, "file-token-2")
+
+        handle = env._run_bash("echo fresh", timeout=10)
+        handle.wait()
+        assert handle.stdout.read() == "fresh\n"
+        assert handle.returncode == 0
+        factory.assert_called_once()
+        assert factory.call_args.kwargs["token"] == "file-token-2"
+        new_client.get_sprite.assert_called_once_with(env._sprite_name)
+        assert old_sprite.command.call_count == 1
+        assert new_sprite.command.call_count == 1
+        assert env._sprite is new_sprite and env._client is new_client
+        old_client.close.assert_called_once()
+
+        # Later calls keep using the new client without another re-read.
+        handle = env._run_bash("echo again", timeout=10)
+        handle.wait()
+        assert new_sprite.command.call_count == 2
+        factory.assert_called_once()
+
+    def test_401_with_unchanged_token_is_not_retried(self, make_env, sprites_sdk, token_file):
+        env = make_env(task_id="same")
+        env._mock_sprite.command = MagicMock(return_value=_auth_cmd())
+        factory, _ = self._swap_in_new_client(env, MagicMock())
+
+        with pytest.raises(_AuthenticationError):
+            env._exec_or_raise("true", 5, "probe")
+        assert env._mock_sprite.command.call_count == 1
+        factory.assert_not_called()
+
+    def test_retry_happens_only_once(self, make_env, sprites_sdk, token_file):
+        env = make_env(task_id="once")
+        env._mock_sprite.command = MagicMock(return_value=_auth_cmd())
+        new_sprite = MagicMock(name="new_sprite")
+        new_sprite.command = MagicMock(return_value=_auth_cmd())
+        factory, _ = self._swap_in_new_client(env, new_sprite)
+        _write_token(token_file, "file-token-2")
+
+        with pytest.raises(_AuthenticationError):
+            env._exec_or_raise("true", 5, "probe")
+        assert env._mock_sprite.command.call_count == 1
+        assert new_sprite.command.call_count == 1
+        factory.assert_called_once()
+
+    def test_401_with_status_code_on_upload_is_retried(self, make_env, sprites_sdk, token_file, tmp_path):
+        env = make_env(task_id="fs401")
+        host = tmp_path / "f.txt"
+        host.write_bytes(b"data")
+        old_remote = MagicMock()
+        old_remote.write_bytes.side_effect = _APIError401("API error (status 401)")
+        env._fs = MagicMock()
+        env._fs.__truediv__.return_value = old_remote
+        new_remote = MagicMock()
+        new_sprite = MagicMock(name="new_sprite")
+        new_sprite.filesystem.return_value.__truediv__.return_value = new_remote
+        factory, _ = self._swap_in_new_client(env, new_sprite)
+        _write_token(token_file, "file-token-2")
+
+        env._sprite_upload(str(host), "/home/sprite/.hermes/f.txt")
+        new_remote.write_bytes.assert_called_once_with(b"data", mode=0o644, mkdir_parents=True)
+        assert factory.call_args.kwargs["token"] == "file-token-2"
+
+    def test_401_when_file_turns_bad_is_not_retried(self, make_env, sprites_sdk, token_file):
+        env = make_env(task_id="gone")
+        env._mock_sprite.command = MagicMock(return_value=_auth_cmd())
+        factory, _ = self._swap_in_new_client(env, MagicMock())
+        token_file.unlink()
+        with pytest.raises(_AuthenticationError):
+            env._exec_or_raise("true", 5, "probe")
+        factory.assert_not_called()
+
+    def test_token_never_logged(self, make_env, sprites_sdk, token_file, caplog):
+        import logging
+        caplog.set_level(logging.DEBUG)
+        env = make_env(task_id="quiet")
+        env._mock_sprite.command = MagicMock(return_value=_auth_cmd())
+        new_sprite = MagicMock(name="new_sprite")
+        new_sprite.command = MagicMock(return_value=_ok_cmd())
+        self._swap_in_new_client(env, new_sprite)
+        _write_token(token_file, "file-token-2")
+        env._exec_or_raise("true", 5, "probe")
+        assert "file-token" not in caplog.text
+
+    def test_401_detection(self, sprites_sdk):
+        from sprites_environment import _is_auth_error
+        assert _is_auth_error(_AuthenticationError("x"))
+        assert _is_auth_error(_APIError401("x"))
+        try:
+            try:
+                raise _APIError401("handshake 401")
+            except _APIError401 as inner:
+                raise _NetworkError("WebSocket command failed") from inner
+        except _NetworkError as wrapped:
+            assert _is_auth_error(wrapped)
+        try:
+            try:
+                raise _APIError401("old")
+            except _APIError401:
+                raise _NetworkError("unrelated") from None
+        except _NetworkError as suppressed:
+            assert not _is_auth_error(suppressed)
+        assert not _is_auth_error(_NetworkError("boom"))
+
+    def test_non_auth_errors_are_not_retried(self, make_env, sprites_sdk, token_file):
+        env = make_env(task_id="other")
+        cmd = MagicMock()
+        cmd.combined_output.side_effect = _NetworkError("boom")
+        env._mock_sprite.command = MagicMock(return_value=cmd)
+        factory, _ = self._swap_in_new_client(env, MagicMock())
+        _write_token(token_file, "file-token-2")
+        with pytest.raises(_NetworkError):
+            env._exec_or_raise("true", 5, "probe")
+        factory.assert_not_called()
+
+
+class TestProviderTokenFile:
+    def test_file_only_counts_as_configured(self, sprites_sdk, tmp_path, monkeypatch):
+        import __init__ as plugin_pkg
+        path = tmp_path / "sprites-token"
+        _write_token(path, "file-token-1")
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(path))
+        provider = plugin_pkg.SpritesProvider()
+        assert provider.is_available() is True
+        assert provider.probe() == ("ready", "")
+        assert provider.check_requirements({}) is True
+        row = [r for r in provider.doctor_checks() if r[1] == "Sprites token"][0]
+        assert row[0] is True
+
+    def test_bad_file_is_not_configured_and_names_the_variable(self, sprites_sdk, tmp_path, monkeypatch):
+        import __init__ as plugin_pkg
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(tmp_path / "absent"))
+        monkeypatch.setenv("SPRITES_TOKEN", "legacy-env-token")
+        provider = plugin_pkg.SpritesProvider()
+        assert provider.is_available() is False
+        assert provider.check_requirements({}) is False
+        status, message = provider.probe()
+        assert status == "needs_setup" and "SPRITES_TOKEN_FILE" in message
+
+    def test_env_token_still_configures_when_file_unset(self, sprites_sdk, monkeypatch):
+        import __init__ as plugin_pkg
+        monkeypatch.setenv("SPRITES_TOKEN", "env-token")
+        assert plugin_pkg.SpritesProvider().probe() == ("ready", "")
+
+    def test_token_file_variable_stripped_from_subprocesses(self):
+        import __init__ as plugin_pkg
+        keys = plugin_pkg.SpritesProvider().strip_env_keys
+        assert {"SPRITES_TOKEN", "SPRITE_TOKEN", "SPRITES_TOKEN_FILE"} <= keys
+
+    def test_nas_detection_marker_present(self):
+        """Hermes Cloud detects support with grep -rqs --include='*.py' SPRITES_TOKEN_FILE."""
+        root = Path(__file__).resolve().parents[1]
+        sources = [p for p in root.glob("*.py") if "SPRITES_TOKEN_FILE" in p.read_text()]
+        assert sources

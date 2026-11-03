@@ -150,8 +150,8 @@ def _lookup(name: str) -> Optional[str]:
 def _token_status() -> tuple:
     """``(token or None, problem)``: the token, read fresh, or why there is none.
 
-    ``SPRITES_TOKEN_FILE`` (a readable, non-empty file) wins over
-    ``SPRITES_TOKEN`` / ``SPRITE_TOKEN``; see ``resolve_sprites_token``.
+    While ``SPRITES_TOKEN_FILE`` is set, only that file counts (never
+    ``SPRITES_TOKEN`` / ``SPRITE_TOKEN``); see ``resolve_sprites_token``.
     """
     if __package__:
         from .sprites_environment import SpritesTokenError, resolve_sprites_token
@@ -271,7 +271,7 @@ class SpritesProvider(TerminalEnvironmentProvider):
         token, problem = _token_status()
         if token:
             return ("ready", "")
-        if (_lookup("SPRITES_TOKEN_FILE") or "").strip():
+        if _lookup("SPRITES_TOKEN_FILE") is not None:
             return ("needs_setup", problem)
         return ("needs_setup", "Set SPRITES_TOKEN to use the Sprites backend.")
 

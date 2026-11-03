@@ -2906,6 +2906,188 @@ class TestLifecycle401:
         assert factory.call_args.kwargs["token"] == "file-token-2"
 
 
+class TestRound2:
+    """Review round 2: path meaning, renewed tokens in sync, create replay, scrub."""
+
+    @pytest.fixture()
+    def token_file(self, tmp_path, monkeypatch):
+        path = tmp_path / "secrets" / "sprites-token"
+        path.parent.mkdir()
+        _write_token(path, "file-token-1")
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(path))
+        return path
+
+    def test_symlink_dotdot_path_reads_the_file_the_os_opens(self, tmp_path, monkeypatch):
+        from sprites_environment import resolve_sprites_token
+        local, foreign = tmp_path / "local", tmp_path / "foreign"
+        (foreign / "child").mkdir(parents=True)
+        local.mkdir()
+        (local / "link").symlink_to(foreign / "child", target_is_directory=True)
+        (foreign / "token").write_text("intended-token")
+        (local / "token").write_text("other-token")
+        configured = local / "link" / ".." / "token"
+        assert configured.read_text() == "intended-token"
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(configured))
+        assert resolve_sprites_token() == "intended-token"
+
+    def test_retargeted_symlink_keeps_old_token_out_of_sync(self, make_env, sprites_sdk,
+                                                            isolated_home, tmp_path, monkeypatch):
+        import io
+        import tarfile
+        from sprites_environment import _build_archive
+        from tools.environments.file_sync import FileSyncManager
+        first = isolated_home / "skills" / "first" / "token"
+        second = isolated_home / "skills" / "second" / "token"
+        kept = isolated_home / "skills" / "kept" / "SKILL.md"
+        for f, text in ((first, "old-active-token"), (second, "new-token"), (kept, "kept")):
+            f.parent.mkdir(parents=True)
+            f.write_text(text)
+        pointer = tmp_path / "pointer"
+        pointer.symlink_to(first)
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(pointer))
+        env = make_env(task_id="retarget")
+        assert env._token == "old-active-token"
+        pointer.unlink()
+        pointer.symlink_to(second)  # renewal by retargeting, no 401 yet
+        _use_real_sync_sources(monkeypatch)
+        shipped = []
+
+        def upload(pairs):
+            with tarfile.open(fileobj=io.BytesIO(_build_archive(pairs))) as tar:
+                shipped.extend(tar.extractfile(m).read() for m in tar.getmembers())
+
+        FileSyncManager(get_files_fn=env._sync_manager._get_files_fn,
+                        upload_fn=lambda *_: None, delete_fn=lambda *_: None,
+                        bulk_upload_fn=upload).sync(force=True)
+        assert b"kept" in shipped
+        assert not any(b"token" in data for data in shipped)
+
+    def test_hardlink_of_replaced_token_stays_out_of_sync(self, make_env, sprites_sdk, isolated_home,
+                                                          token_file, monkeypatch):
+        alias = isolated_home / "skills" / "alias" / "token"
+        alias.parent.mkdir(parents=True)
+        os.link(token_file, alias)
+        env = make_env(task_id="hardlink")
+        _write_token(token_file, "file-token-2")  # atomic replace: new inode
+        _use_real_sync_sources(monkeypatch)
+        hosts = {Path(h) for h, _ in env._sync_manager._get_files_fn()}
+        assert alias.read_text() == env._token
+        assert alias not in hosts
+
+    def test_configured_create_get_401_does_not_repeat_the_post(self, sprites_sdk, hermes_runtime,
+                                                                token_file, monkeypatch):
+        monkeypatch.setattr("sprites_environment._resolve_profile_identity", lambda: None)
+        sprite = _make_sprite("hermes-made")
+        first, second = MagicMock(name="first"), MagicMock(name="second")
+        first.http_client.post.return_value = MagicMock(status_code=200, is_success=True)
+
+        def renew_then_401(name):
+            _write_token(token_file, "file-token-2")
+            raise _AuthenticationError("Authentication failed for get sprite")
+
+        first.get_sprite.side_effect = renew_then_401
+        second.get_sprite.return_value = sprite
+        sprites_mod, _ = sprites_sdk
+        sprites_mod.SpritesClient = MagicMock(side_effect=[first, second])
+        from sprites_environment import SpritesEnvironment
+        env = SpritesEnvironment(task_id="made", persistent_filesystem=False,
+                                 image="registry.example/img:1")
+        assert first.http_client.post.call_count == 1
+        second.http_client.post.assert_not_called()
+        assert env._sprite is sprite
+
+    def test_configured_create_post_401_is_retried(self, sprites_sdk, hermes_runtime, token_file,
+                                                   monkeypatch):
+        monkeypatch.setattr("sprites_environment._resolve_profile_identity", lambda: None)
+        sprite = _make_sprite("hermes-made")
+        first, second = MagicMock(name="first"), MagicMock(name="second")
+
+        def renew_then_401(*args, **kwargs):
+            _write_token(token_file, "file-token-2")
+            return MagicMock(status_code=401, is_success=False)
+
+        first.http_client.post.side_effect = renew_then_401
+        second.http_client.post.return_value = MagicMock(status_code=200, is_success=True)
+        second.get_sprite.return_value = sprite
+        sprites_mod, _ = sprites_sdk
+        sprites_mod.SpritesClient = MagicMock(side_effect=[first, second])
+        from sprites_environment import SpritesEnvironment
+        env = SpritesEnvironment(task_id="made", persistent_filesystem=False,
+                                 image="registry.example/img:1")
+        assert first.http_client.post.call_count == 1
+        assert second.http_client.post.call_count == 1
+        first.get_sprite.assert_not_called()
+        assert env._sprite is sprite
+
+    def test_archive_clear_error_quoting_token_is_withheld(self, make_env, sprites_sdk, token_file,
+                                                           tmp_path, caplog):
+        import logging
+        from sprites_environment import _ARCHIVE_LEFT_EXIT, SpritesApiError, _ExecFailed
+        from tools.environments.file_sync import FileSyncManager
+        env = make_env(task_id="clear")
+
+        def write(data, **kwargs):
+            if data == b"":
+                raise _SpriteError("write: credential rejected: file-token-1")
+
+        remote = MagicMock()
+        remote.write_bytes.side_effect = write
+        env._fs = MagicMock()
+        env._fs.__truediv__.return_value = remote
+
+        def unpack_left_archive(*args, **kwargs):
+            raise _ExecFailed("archive could not be removed", _ARCHIVE_LEFT_EXIT)
+
+        env._exec_or_raise = unpack_left_archive
+        host = tmp_path / "ordinary"
+        host.write_text("ordinary")
+        with pytest.raises(SpritesApiError):
+            env._sprite_bulk_upload([(str(host), "/home/sprite/.hermes/ordinary")])
+        caplog.set_level(logging.DEBUG)
+        env._use_archives = True
+        FileSyncManager(get_files_fn=lambda: [(str(host), "/home/sprite/.hermes/ordinary")],
+                        upload_fn=env._sprite_upload, delete_fn=lambda *_: None,
+                        bulk_upload_fn=env._sprite_bulk_upload).sync(force=True)
+        assert "file-token-1" not in caplog.text
+
+    def _failing_exec(self, env, error):
+        cmd = MagicMock()
+        cmd.combined_output.side_effect = error
+        env._mock_sprite.command = MagicMock(return_value=cmd)
+
+    def test_withheld_error_keeps_no_link_to_the_original(self, make_env, sprites_sdk, token_file):
+        from sprites_environment import SpritesApiError
+        env = make_env(task_id="ctx")
+        self._failing_exec(env, _NetworkError("header Bearer file-token-1"))
+        with pytest.raises(SpritesApiError) as info:
+            env._exec_or_raise("true", 5, "probe")
+        assert info.value.__context__ is None and info.value.__cause__ is None
+
+    def test_token_in_exception_notes_is_withheld(self, make_env, sprites_sdk, token_file):
+        from sprites_environment import SpritesApiError
+        env = make_env(task_id="notes")
+        error = _NetworkError("boom")
+        error.add_note("sent Bearer file-token-1")
+        self._failing_exec(env, error)
+        with pytest.raises(SpritesApiError):
+            env._exec_or_raise("true", 5, "probe")
+
+    def test_token_in_command_output_is_withheld(self, make_env, sprites_sdk, token_file):
+        from sprites_environment import SpritesApiError
+        env = make_env(task_id="out")
+        self._failing_exec(env, _ExitError("exit 1", 1, stdout=b"file-token-1\n"))
+        with pytest.raises(SpritesApiError):
+            env._exec_or_raise("true", 5, "probe")
+
+    def test_ordinary_command_failure_unchanged(self, make_env, sprites_sdk, token_file):
+        from sprites_environment import _ExecFailed
+        env = make_env(task_id="plain")
+        self._failing_exec(env, _ExitError("exit 3", 3, stdout=b"no such file\n"))
+        with pytest.raises(_ExecFailed, match="no such file") as info:
+            env._exec_or_raise("true", 5, "probe")
+        assert info.value.exit_code == 3
+
+
 @pytest.fixture()
 def real_sprites_sdk(monkeypatch):
     """The installed sprites-py (skips when absent); drops any stub first."""
@@ -2960,6 +3142,47 @@ class TestRealSdk401:
         env._sprite_upload(str(data), "/home/sprite/file")
         assert env._SpritesClient.call_args.kwargs["token"] == "file-token-new"
         new_sprite.filesystem.return_value.__truediv__.return_value.write_bytes.assert_called_once()
+
+    def test_real_configured_create_never_repeats_a_successful_post(self, real_sprites_sdk, tmp_path,
+                                                                     monkeypatch):
+        import httpx
+        from sprites.exceptions import NotFoundError, SpriteError
+        token = tmp_path / "sprites-token"
+        token.write_text("file-token-old")
+        requests = []
+
+        def handler(request):
+            requests.append((request.method, request.headers.get("authorization")))
+            if request.method == "POST":
+                return httpx.Response(200, json={"name": "offline-probe"})
+            if request.headers.get("authorization") == "Bearer file-token-old":
+                token.write_text("file-token-new")
+                return httpx.Response(401, json={"error": "Unauthorized"})
+            return httpx.Response(200, json={"name": "offline-probe"})
+
+        def make_client(token, timeout):
+            client = real_sprites_sdk.SpritesClient(token=token, timeout=timeout)
+            client._client.close()
+            client._client = httpx.Client(transport=httpx.MockTransport(handler))
+            return client
+
+        env = self._env(make_client("file-token-old", 30), token, monkeypatch)
+        env._SpritesClient = make_client
+        env._client = env._new_client("file-token-old")
+        env._token = "file-token-old"
+        env._sprite = None
+        env._create_config = {"image_url": "registry.example/img:1"}
+        env._persistent = False
+        env._NotFoundError, env._SpriteError = NotFoundError, SpriteError
+        try:
+            env._create_sprite("offline-probe")
+        finally:
+            env._client.close()
+        assert requests == [
+            ("POST", "Bearer file-token-old"),
+            ("GET", "Bearer file-token-old"),
+            ("GET", "Bearer file-token-new"),
+        ]
 
     def test_new_client_hooks_real_httpx_client(self, real_sprites_sdk, tmp_path, monkeypatch):
         from sprites_environment import _note_http_status

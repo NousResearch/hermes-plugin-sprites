@@ -80,6 +80,26 @@ _TOKEN_NOT_FROM_ENV = (
     f"SPRITES_TOKEN is not used while {SPRITES_TOKEN_FILE_ENV} is set."
 )
 
+#: Every token file this process has read: canonical paths and file
+#: identities ``(st_dev, st_ino, st_size, st_mtime_ns)``. File sync excludes
+#: all of them, not just the token path's current target, so a token that
+#: was renewed (file replaced, symlink retargeted) stays protected wherever
+#: an old copy or hard link of it remains. Size and mtime are part of the
+#: identity so a reused inode number is not mistaken for an old token.
+_seen_token_paths: set = set()
+_seen_token_ids: set = set()
+_seen_token_lock = threading.Lock()
+
+
+def _file_id(st) -> tuple:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _record_token_file(path: str, st) -> None:
+    with _seen_token_lock:
+        _seen_token_paths.add(os.path.realpath(path))
+        _seen_token_ids.add(_file_id(st))
+
 
 class SpritesTokenError(ValueError):
     """No usable Sprites token. The message never contains the token."""
@@ -117,8 +137,10 @@ def _read_token_file(path: str) -> str:
     except OSError as e:
         raise fail(f"the file could not be opened ({type(e).__name__})") from None
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             raise fail("it is not a regular file")
+        _record_token_file(path, st)
         chunks, size = [], 0
         while size <= _TOKEN_FILE_MAX_BYTES:
             chunk = os.read(fd, _TOKEN_FILE_MAX_BYTES + 1 - size)
@@ -157,7 +179,7 @@ class _TokenSource:
     only.
     """
 
-    __slots__ = ("path", "_env_token")
+    __slots__ = ("_env_token", "path")
 
     def __init__(self, path: "str | None" = None, env_token: "str | None" = None):
         self.path = path
@@ -182,8 +204,13 @@ def _token_source(lookup=None) -> _TokenSource:
             raise SpritesTokenError(
                 f"{SPRITES_TOKEN_FILE_ENV} is set but empty. " + _TOKEN_NOT_FROM_ENV
             )
-        # Absolute now: a relative path must not follow later cwd changes.
-        return _TokenSource(path=os.path.abspath(os.path.expanduser(path)))
+        # Absolute now, so a relative path does not follow later cwd changes.
+        # Not normalised: ``link/../x`` must keep meaning what the OS makes
+        # of it (``..`` of the symlink's target), as an open() would.
+        path = os.path.expanduser(path)
+        if not os.path.isabs(path):
+            path = os.path.join(os.getcwd(), path)
+        return _TokenSource(path=path)
     token = lookup("SPRITES_TOKEN") or lookup("SPRITE_TOKEN")
     if not token:
         raise SpritesTokenError(
@@ -222,30 +249,37 @@ def resolve_sprites_token(lookup=None) -> str:
 
 
 def _without_token_file(files, token_path: "str | None"):
-    """``files`` minus anything that is, or sits beside, the token file.
+    """``files`` minus anything that is, or sits beside, a token file.
 
     ``files`` is ``(host_path, remote_path)`` pairs from file sync. Excluded:
-    the token file under any name (symlink, hard link, ``..`` path), and every
-    file in the directory holding it (a ``secrets`` directory). That directory
-    is not excluded when it holds the Hermes home (a token file placed
-    directly in the home would otherwise stop all file sync); the token file
-    itself still is.
+    the configured token file and every token file this process has read
+    before (``_seen_token_paths`` / ``_seen_token_ids``), under any name
+    (symlink, hard link, ``..`` path), and every file in a directory holding
+    one (a ``secrets`` directory, the writer's temp files). A directory that
+    holds the Hermes home is not excluded (a token file placed directly in
+    the home would otherwise stop all file sync); the token file itself
+    still is.
     """
     if not token_path:
         return list(files)
-    names = {os.path.abspath(token_path), os.path.realpath(token_path)}
+    names = {os.path.realpath(token_path)}
+    ids = set()
     try:
-        token_stat = os.stat(token_path)
+        ids.add(_file_id(os.stat(token_path)))
     except OSError:
-        token_stat = None
+        pass
+    with _seen_token_lock:
+        names |= _seen_token_paths
+        ids |= _seen_token_ids
     try:
         from hermes_constants import get_hermes_home
         home = os.path.realpath(str(get_hermes_home()))
     except Exception:
         home = None
     dirs = set()
-    for name in names:
-        d = os.path.dirname(name)
+    for d in {os.path.dirname(n) for n in names} | {
+        os.path.realpath(os.path.dirname(token_path))
+    }:
         if d and d != os.path.dirname(d) and not (home and _is_within(home, d)):
             dirs.add(d)
     kept = []
@@ -255,12 +289,11 @@ def _without_token_file(files, token_path: "str | None"):
             _is_within(c, d) for c in candidates for d in dirs
         ):
             continue
-        if token_stat is not None:
-            try:
-                if os.path.samestat(os.stat(host_path), token_stat):
-                    continue
-            except OSError:
-                pass
+        try:
+            if _file_id(os.stat(host_path)) in ids:
+                continue
+        except OSError:
+            pass
         kept.append((host_path, remote_path))
     if len(kept) != len(files):
         logger.debug(
@@ -319,7 +352,14 @@ def _mentions(exc: BaseException, secrets) -> bool:
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
         try:
-            text = f"{exc}\n{exc!r}"
+            parts = [str(exc), repr(exc), *map(str, getattr(exc, "__notes__", ()) or ())]
+            for attr in ("stdout", "stderr"):
+                value = getattr(exc, attr, None)
+                if isinstance(value, (bytes, bytearray)):
+                    parts.append(bytes(value).decode("utf-8", errors="replace"))
+                elif isinstance(value, str):
+                    parts.append(value)
+            text = "\n".join(parts)
         except Exception:
             return True  # unprintable: assume the worst
         if any(s and s in text for s in secrets):
@@ -917,8 +957,7 @@ class SpritesEnvironment(BaseEnvironment):
                 # error if the Sprite genuinely does not exist (a real
                 # create failure, not a race).
                 try:
-                    self._sprite = self._with_auth_retry(
-                        lambda: self._create_sprite(sprite_name))
+                    self._sprite = self._create_sprite(sprite_name)
                     logger.info(
                         "Sprites: created sprite %s for task %s",
                         self._sprite.name, task_id,
@@ -947,8 +986,7 @@ class SpritesEnvironment(BaseEnvironment):
             sprite_name = _ephemeral_sprite_name(task_id, prefix)
             _require_within_prefix(sprite_name, prefix)
             self._sprite_name = sprite_name
-            self._sprite = self._with_auth_retry(
-                lambda: self._create_sprite(sprite_name))
+            self._sprite = self._create_sprite(sprite_name)
             logger.info(
                 "Sprites: created ephemeral sprite %s for task %s",
                 self._sprite.name, task_id,
@@ -1013,14 +1051,22 @@ class SpritesEnvironment(BaseEnvironment):
         try:
             return self._call_once(fn)
         except Exception as e:
-            if not self._was_auth_error(e) or not self._refresh_client_after_401(client):
-                self._raise_without_token(e, token)
-                raise
-        try:
-            return self._call_once(fn)
-        except Exception as e:
-            self._raise_without_token(e, token)
-            raise
+            error = e
+        if self._was_auth_error(error) and self._refresh_client_after_401(client):
+            try:
+                return self._call_once(fn)
+            except Exception as e:
+                error = e
+        if _mentions(error, (token, self._token)):
+            # Raised outside the except blocks: no __context__ links back
+            # to the original error.
+            name = type(error).__name__
+            error = None
+            raise SpritesApiError(
+                f"Sprites API call failed ({name}); its message was withheld "
+                "because it contained the Sprites token."
+            )
+        raise error
 
     @staticmethod
     def _call_once(fn):
@@ -1030,13 +1076,6 @@ class SpritesEnvironment(BaseEnvironment):
     @staticmethod
     def _was_auth_error(exc: BaseException) -> bool:
         return _is_auth_error(exc) or bool(getattr(_http_auth, "saw_401", False))
-
-    def _raise_without_token(self, exc: BaseException, old_token: str) -> None:
-        if _mentions(exc, (old_token, self._token)):
-            raise SpritesApiError(
-                f"Sprites API call failed ({type(exc).__name__}); its message "
-                "was withheld because it contained the Sprites token."
-            ) from None
 
     def _refresh_client_after_401(self, failed_client) -> bool:
         """Re-read the token file; on a change, switch to a new client. True to retry."""
@@ -1094,14 +1133,22 @@ class SpritesEnvironment(BaseEnvironment):
         Never send ``PUT config`` to change an existing Sprite: a partial
         config update was observed to drop ``image_url`` and leave the Sprite
         unable to boot.
+
+        Each request retries on its own after a 401 (``_with_auth_retry``):
+        the GET after a successful POST never repeats the POST.
         """
         if not self._create_config:
-            return self._client.create_sprite(sprite_name)
+            return self._with_auth_retry(lambda: self._client.create_sprite(sprite_name))
 
+        body = {"name": sprite_name, "config": dict(self._create_config)}
+        self._with_auth_retry(lambda: self._post_create(sprite_name, body))
+        return self._with_auth_retry(lambda: self._client.get_sprite(sprite_name))
+
+    def _post_create(self, sprite_name: str, body: dict) -> None:
+        """POST /v1/sprites once; raise the SDK's exception types on failure."""
         import httpx
         from sprites.exceptions import AuthenticationError, NetworkError
 
-        body = {"name": sprite_name, "config": dict(self._create_config)}
         try:
             response = self._client.http_client.post(
                 f"{self._client.base_url}/v1/sprites",
@@ -1134,7 +1181,6 @@ class SpritesEnvironment(BaseEnvironment):
             raise self._SpriteError(
                 f"Failed create sprite (status {response.status_code}): {response.text}"
             )
-        return self._client.get_sprite(sprite_name)
 
     def _apply_home_fallback(self) -> None:
         """Handle a Sprite whose commands run with ``$HOME`` unset.
@@ -1227,7 +1273,9 @@ class SpritesEnvironment(BaseEnvironment):
                 )
                 if e.exit_code == _ARCHIVE_LEFT_EXIT:
                     self._use_archives = False
-                    (self._fs / archive).write_bytes(b"", mode=0o600, mkdir_parents=True)
+                    self._with_auth_retry(
+                        lambda: (self._fs / archive).write_bytes(
+                            b"", mode=0o600, mkdir_parents=True))
                 for host_path, remote_path in batch:
                     self._sprite_upload(host_path, remote_path)
 

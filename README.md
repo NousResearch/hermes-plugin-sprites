@@ -59,7 +59,9 @@ reads the token from there instead of `SPRITES_TOKEN`:
   scope); a retry re-reads the same file and never switches credentials.
 - File sync never uploads the token file (under any name, including symlinks
   and hard links) or the other files in its directory, whatever upload roots
-  are configured. (The directory is still synced when it holds the Hermes
+  are configured. Token files read earlier stay excluded too, so an old token
+  left behind by a renewal (a symlink's previous target, a hard link to the
+  replaced file) is not uploaded either. (The directory is still synced when it holds the Hermes
   home; only the token file is skipped then.)
 - Error messages name the path, never the file's contents. An API error that
   quotes the token is replaced by one that does not.

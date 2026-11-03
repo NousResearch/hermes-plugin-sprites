@@ -6,6 +6,7 @@ tests/test_sprites_terminal_live.py.
 """
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -2143,7 +2144,7 @@ class TestProviderCreateSettings:
 # ---------------------------------------------------------------------------
 
 def _secrets_dir(tmp_path):
-    """A dedicated token directory (the plugin refuses one that holds HERMES_HOME)."""
+    """A dedicated token directory (everything in it stays out of file sync)."""
     path = tmp_path / "secrets"
     path.mkdir(exist_ok=True)
     return path
@@ -2569,9 +2570,9 @@ class TestTokenFileNotSynced:
         hosts = {Path(h) for h, _ in env._sync_manager._get_files_fn()}
         assert skill_dir / "via-symlink" not in hosts
         assert skill_dir / "SKILL.md" in hosts
-        from sprites_environment import _without_token_file
+        from sprites_environment import _without_token_dir
         pairs = [(str(skill_dir / "via-symlink"), "/r/via-symlink")]
-        assert _without_token_file(pairs, env._token_source.exclusion) == []
+        assert _without_token_dir(pairs, env._token_source.token_dir) == []
 
 
 class TestTokenFileContents:
@@ -2874,18 +2875,21 @@ class TestRound2:
         monkeypatch.setenv("SPRITES_TOKEN_FILE", str(path))
         return path
 
-    def test_symlink_dotdot_path_reads_the_file_the_os_opens(self, tmp_path, monkeypatch):
-        from sprites_environment import resolve_sprites_token
+    def test_symlink_dotdot_path_is_refused(self, tmp_path, monkeypatch):
+        """Round 5: ``link/..`` would differ from its lexical meaning, so it is refused."""
+        from sprites_environment import SpritesTokenError, resolve_sprites_token
         local, foreign = tmp_path / "local", tmp_path / "foreign"
         (foreign / "child").mkdir(parents=True)
         local.mkdir()
         (local / "link").symlink_to(foreign / "child", target_is_directory=True)
         (foreign / "token").write_text("intended-token")
         (local / "token").write_text("other-token")
-        configured = local / "link" / ".." / "token"
-        assert configured.read_text() == "intended-token"
-        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(configured))
-        assert resolve_sprites_token() == "intended-token"
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(local / "link" / ".." / "token"))
+        monkeypatch.setenv("SPRITES_TOKEN", "legacy-env-token")
+        with pytest.raises(SpritesTokenError, match="no symlinks") as info:
+            resolve_sprites_token()
+        for secret in ("intended-token", "other-token", "legacy-env-token"):
+            assert secret not in str(info.value)
 
     def test_configured_create_get_401_does_not_repeat_the_post(self, sprites_sdk, hermes_runtime,
                                                                 token_file, monkeypatch):
@@ -3001,19 +3005,21 @@ class TestRound2:
         assert info.value.exit_code == 3
 
 
-class TestStaticTokenExclusion:
-    """Review round 4: the excluded set comes from configuration only.
+class TestTokenDirRule:
+    """Review round 5: two rules, nothing else.
 
-    No file read, accepted or rejected, changes what file sync uploads; only
-    the configured token file's own directory is excluded, and a directory
-    that could hold normal upload files is refused.
+    1. ``SPRITES_TOKEN_FILE`` is absolute and crosses no symlink (``lstat``
+       on every component), so the configured path is the resolved path.
+    2. File sync never uploads a file whose realpath is inside the token
+       file's directory, and warns once per skipped path.
     """
 
     @pytest.fixture()
     def layout(self, tmp_path, monkeypatch):
         """The Hermes Cloud layout: HERMES_HOME=/opt/data, token in /opt/data/secrets."""
-        home = tmp_path / "opt-data"
+        home = tmp_path.resolve() / "opt-data"
         (home / "secrets").mkdir(parents=True)
+        (home / "secrets").chmod(0o700)
         skill = home / "skills" / "weather"
         skill.mkdir(parents=True)
         (skill / "SKILL.md").write_text("weather skill")
@@ -3030,6 +3036,11 @@ class TestStaticTokenExclusion:
             _use_real_sync_sources(monkeypatch)
             return env
         return _build
+
+    @pytest.fixture(autouse=True)
+    def _fresh_skip_warnings(self, monkeypatch):
+        import sprites_environment
+        monkeypatch.setattr(sprites_environment, "_skip_warned", set())
 
     @staticmethod
     def _sync(env):
@@ -3060,75 +3071,178 @@ class TestStaticTokenExclusion:
         env._sync_manager.sync(force=True)
         return shipped, deleted
 
+    @staticmethod
+    def _skip_warnings(caplog):
+        return [r.getMessage() for r in caplog.records
+                if r.levelno == logging.WARNING and "file sync skipped" in r.getMessage()]
+
     def test_cloud_layout_is_allowed_and_skills_sync(self, layout, build):
         env = build(layout / "secrets" / "sprites-token")
         assert env._token == "cloud-token-1"
+        assert env._token_source.token_dir == str(layout / "secrets")
         shipped, _ = self._sync(env)
         assert shipped["/home/sprite/.hermes/skills/weather/SKILL.md"] == b"weather skill"
         assert shipped["/home/sprite/.hermes/skills/weather/forecast.py"] == b"print('sunny')"
         assert not any(b"cloud-token" in d for d in shipped.values())
 
-    def test_renewal_temp_and_old_files_never_synced(self, layout, build, monkeypatch):
-        """Every token-dir file, through every upload route that can name it."""
+    def test_renewal_temp_and_rename_never_synced(self, layout, build, monkeypatch, caplog):
+        """The NAS writer (0600 temp in the token dir, renamed over the token).
+
+        Every route that could name a token-dir file is opened: registered
+        credential files and an external skills root over the whole home.
+        """
         from tools.credential_files import register_credential_file
         secrets = layout / "secrets"
-        env = build(secrets / "sprites-token")
-        old_copy = secrets / "sprites-token.old"
-        old_copy.write_text("cloud-token-1")       # a kept previous token
-        tmp = secrets / ".sprites-token.Ab12Cd"
-        tmp.write_text("cloud-token-2")             # writer's temp, before rename
-        _write_token(secrets / "sprites-token", "cloud-token-3")  # renewed in place
-        # Routes that would enumerate the token dir after creation: an
-        # external skills root added to config, and registered credential files.
+        token = secrets / "sprites-token"
+        env = build(token)
         (layout / "config.yaml").write_text(
             "skills:\n  external_dirs:\n    - " + str(layout) + "\n")
         _use_real_sync_sources(monkeypatch)
-        for name in ("secrets/sprites-token", "secrets/sprites-token.old",
-                     "secrets/.sprites-token.Ab12Cd"):
+        tmp = secrets / ".sprites-token.Ab12Cd"
+        tmp.write_text("cloud-token-2")             # writer's temp, before rename
+        tmp.chmod(0o600)
+        for name in ("secrets/sprites-token", "secrets/.sprites-token.Ab12Cd"):
             assert register_credential_file(name)
-        shipped, _ = self._sync(env)
-        assert any(k.endswith("weather/SKILL.md") for k in shipped)
-        assert not any(b"cloud-token" in d for d in shipped.values())
-        assert not any("/secrets/" in k for k in shipped)
+        caplog.set_level(logging.WARNING, logger="sprites_environment")
+        before, _ = self._sync(env)
+        tmp.replace(token)                          # the rename
+        _write_token(token, "cloud-token-3")        # and a second renewal
+        after, _ = self._sync(env)
+        for shipped in (before, after):
+            assert not any(b"cloud-token" in d for d in shipped.values())
+            assert not any("sprites-token" in k for k in shipped)
+        assert any(k.endswith("weather/SKILL.md") for k in before)
+        warnings = self._skip_warnings(caplog)
+        assert warnings and all(str(secrets) in w for w in warnings)
+        assert not any("cloud-token" in w for w in warnings)
+        assert env._token_source.read() == "cloud-token-3"
 
-    def test_symlinked_setting_excludes_the_real_directory_only(self, layout, build, tmp_path,
-                                                                monkeypatch):
-        ext = tmp_path / "ext-skills"
-        (ext / "tool").mkdir(parents=True)
-        (ext / "tool" / "SKILL.md").write_text("external skill")
-        pointer = ext / "sprites-token-link"           # the link sits in an upload root
-        pointer.symlink_to(layout / "secrets" / "sprites-token")
-        (layout / "config.yaml").write_text(
-            "skills:\n  external_dirs:\n    - " + str(ext) + "\n")
-        env = build(pointer)
-        exclusion = env._token_source.exclusion
-        assert exclusion.token_path == os.path.realpath(layout / "secrets" / "sprites-token")
-        assert exclusion.token_dir == os.path.realpath(layout / "secrets")
-        shipped, _ = self._sync(env)
-        assert shipped["/home/sprite/.hermes/external_skills/0/tool/SKILL.md"] == b"external skill"
-        assert not any(b"cloud-token" in d for d in shipped.values())
+    @pytest.mark.parametrize("shape", ["file", "parent", "home"])
+    def test_symlinked_component_is_refused(self, layout, tmp_path, monkeypatch, sprites_sdk,
+                                            hermes_runtime, shape):
+        """A symlinked file, parent directory or HERMES_HOME-style ancestor."""
+        import __init__ as plugin_pkg
+        from sprites_environment import SpritesEnvironment, SpritesTokenError, resolve_sprites_token
+        base = tmp_path.resolve()
+        if shape == "file":
+            configured = base / "token-link"
+            configured.symlink_to(layout / "secrets" / "sprites-token")
+        elif shape == "parent":
+            configured = base / "secrets-link" / "sprites-token"
+            (base / "secrets-link").symlink_to(layout / "secrets", target_is_directory=True)
+        else:
+            (base / "home-link").symlink_to(layout, target_is_directory=True)
+            configured = base / "home-link" / "secrets" / "sprites-token"
+        assert configured.read_text() == "cloud-token-1"
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(configured))
+        monkeypatch.setenv("SPRITES_TOKEN", "legacy-env-token")
+        with pytest.raises(SpritesTokenError, match="has a symlink at") as info:
+            resolve_sprites_token()
+        assert "cloud-token" not in str(info.value)
+        assert "legacy-env-token" not in str(info.value)
+        sprites_mod, _ = sprites_sdk
+        with pytest.raises(SpritesTokenError):
+            SpritesEnvironment(task_id="refused")
+        sprites_mod.SpritesClient.assert_not_called()
+        provider = plugin_pkg.SpritesProvider()
+        assert provider.is_available() is False
+        status, message = provider.probe()
+        assert status == "needs_setup" and "no symlinks" in message
 
-    def test_setting_retargeted_to_another_directory_is_not_read(self, layout, build, tmp_path):
+    @pytest.mark.parametrize("value", ["secrets/sprites-token", "~/secrets/sprites-token",
+                                       "{home}/secrets/../secrets/sprites-token",
+                                       "{home}/secrets//sprites-token",
+                                       "{home}/./secrets/sprites-token"],
+                             ids=["relative", "tilde", "dotdot", "double-slash", "dot"])
+    def test_non_canonical_path_is_refused(self, layout, monkeypatch, value):
+        from sprites_environment import SpritesTokenError, resolve_sprites_token
+        monkeypatch.chdir(layout)
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", value.format(home=layout))
+        monkeypatch.setenv("SPRITES_TOKEN", "legacy-env-token")
+        with pytest.raises(SpritesTokenError, match="no symlinks") as info:
+            resolve_sprites_token()
+        problem = ("is not an absolute path" if not value.startswith("{home}")
+                   else "contains '.', '..'")
+        assert problem in str(info.value)
+        assert "cloud-token" not in str(info.value)
+        assert "legacy-env-token" not in str(info.value)
+
+    def test_component_turned_symlink_after_creation_fails_closed(self, layout, build, tmp_path):
         from sprites_environment import SpritesTokenError
-        pointer = tmp_path / "pointer"
-        pointer.symlink_to(layout / "secrets" / "sprites-token")
-        env = build(pointer)
-        other = tmp_path / "other"
+        env = build(layout / "secrets" / "sprites-token")
+        other = tmp_path.resolve() / "other"
         other.mkdir()
         _write_token(other / "sprites-token", "elsewhere-token")
-        pointer.unlink()
-        pointer.symlink_to(other / "sprites-token")
-        with pytest.raises(SpritesTokenError, match="resolves outside") as info:
+        shutil.rmtree(layout / "secrets")
+        (layout / "secrets").symlink_to(other, target_is_directory=True)
+        with pytest.raises(SpritesTokenError, match="has a symlink at") as info:
             env._token_source.read()
         assert "elsewhere-token" not in str(info.value)
+
+    def test_symlinked_hermes_home_keeps_its_skills(self, layout, build, tmp_path, monkeypatch):
+        """Round 4 B2 layout: HERMES_HOME is a symlink, the token sits beside it."""
+        user = tmp_path.resolve() / "user"
+        user.mkdir()
+        (user / ".hermes").symlink_to(layout, target_is_directory=True)
+        monkeypatch.setenv("HERMES_HOME", str(user / ".hermes"))
+        _write_token(user / ".sprites-token", "user-token-1")
+        env = build(user / ".sprites-token")
+        assert env._token_source.token_dir == str(user)
+        shipped, _ = self._sync(env)
+        assert shipped["/home/sprite/.hermes/skills/weather/SKILL.md"] == b"weather skill"
+        assert not any(b"user-token" in d for d in shipped.values())
+
+    def test_files_outside_token_dir_are_unaffected(self, layout, build, monkeypatch, caplog):
+        from tools.credential_files import register_credential_file
+        (layout / "credentials").mkdir()
+        (layout / "credentials" / "weather-api.json").write_text('{"k": "v"}')
+        (layout / "secrets-archive").mkdir()             # shares the name prefix only
+        (layout / "secrets-archive" / "notes.txt").write_text("notes")
+        env = build(layout / "secrets" / "sprites-token")
+        assert register_credential_file("credentials/weather-api.json")
+        assert register_credential_file("secrets-archive/notes.txt")
+        caplog.set_level(logging.WARNING, logger="sprites_environment")
+        shipped, _ = self._sync(env)
+        assert any(k.endswith("credentials/weather-api.json") for k in shipped)
+        assert any(k.endswith("secrets-archive/notes.txt") for k in shipped)
+        assert any(k.endswith("weather/SKILL.md") for k in shipped)
+        assert self._skip_warnings(caplog) == []
+
+    def test_file_in_token_dir_is_skipped_with_one_warning(self, layout, build, monkeypatch,
+                                                         caplog):
+        """Round 4 B3: a file kept in the token dir is skipped, never silently."""
+        from tools.credential_files import register_credential_file
+        env = build(layout / "secrets" / "sprites-token")
+        (layout / "secrets" / "weather-api.json").write_text('{"secret": "svc-cred"}')
+        assert register_credential_file("secrets/weather-api.json")
+        caplog.set_level(logging.WARNING, logger="sprites_environment")
+        shipped, _ = self._sync(env)
+        assert not any(k.endswith("weather-api.json") for k in shipped)
+        warnings = self._skip_warnings(caplog)
+        assert len(warnings) == 1
+        assert str(layout / "secrets" / "weather-api.json") in warnings[0]
+        assert "svc-cred" not in warnings[0]
+        caplog.clear()
+        (layout / "skills" / "weather" / "forecast.py").write_text("print('rain')")
+        self._sync(env)
+        assert self._skip_warnings(caplog) == []        # once per path
+
+    def test_symlink_into_token_dir_from_skills_is_skipped(self, layout, build):
+        alias = layout / "skills" / "weather" / "token-alias"
+        alias.symlink_to(layout / "secrets" / "sprites-token")
+        env = build(layout / "secrets" / "sprites-token")
+        shipped, _ = self._sync(env)
+        assert not any(k.endswith("token-alias") for k in shipped)
+        assert not any(b"cloud-token" in d for d in shipped.values())
+        assert any(k.endswith("weather/SKILL.md") for k in shipped)
 
     # --- review round 3 cases: no read changes sync -------------------------
 
     def test_rejected_setting_then_corrected_keeps_skill_synced(self, layout, build, monkeypatch):
         import __init__ as plugin_pkg
         monkeypatch.setenv("SPRITES_TOKEN_FILE", str(layout / "skills" / "weather" / "SKILL.md"))
-        status, message = plugin_pkg.SpritesProvider().probe()
-        assert status == "needs_setup" and "directory of its own" in message
+        status, _ = plugin_pkg.SpritesProvider().probe()
+        assert status == "needs_setup"
         env = build(layout / "secrets" / "sprites-token")
         shipped, _ = self._sync(env)
         assert any(k.endswith("weather/SKILL.md") for k in shipped)
@@ -3137,21 +3251,18 @@ class TestStaticTokenExclusion:
     def test_valid_token_read_from_any_file_leaves_no_exclusion(self, layout, build, tmp_path,
                                                                monkeypatch):
         from sprites_environment import resolve_sprites_token
-        # A token-shaped file read through a dedicated directory elsewhere.
-        stray = tmp_path / "stray" / "tok"
+        stray = tmp_path.resolve() / "stray" / "tok"
         stray.parent.mkdir()
         stray.write_text("stray-token")
         monkeypatch.setenv("SPRITES_TOKEN_FILE", str(stray))
         assert resolve_sprites_token() == "stray-token"
-        # Direct reads inside a skill directory, accepted and rejected (the
-        # guard would refuse such a setting; the reader alone must not care).
         from sprites_environment import SpritesTokenError, _read_token_file
         (layout / "skills" / "weather" / "tok").write_text("skill-dir-token")
         assert _read_token_file(str(layout / "skills" / "weather" / "tok")) == "skill-dir-token"
         with pytest.raises(SpritesTokenError):
             _read_token_file(str(layout / "skills" / "weather" / "SKILL.md"))
         env = build(layout / "secrets" / "sprites-token")
-        assert env._token_source.exclusion.token_dir == os.path.realpath(layout / "secrets")
+        assert env._token_source.token_dir == str(layout / "secrets")
         shipped, _ = self._sync(env)
         assert any(k.endswith("weather/SKILL.md") for k in shipped)
         assert any(k.endswith("weather/forecast.py") for k in shipped)
@@ -3173,73 +3284,16 @@ class TestStaticTokenExclusion:
         assert deleted == []
         assert shipped == {"/home/sprite/.hermes/skills/weather/forecast.py": b"print('rain')"}
 
-    def test_module_keeps_no_token_file_registry(self):
+    def test_module_keeps_no_guard_machinery(self):
         import sprites_environment as mod
-        assert not [n for n in vars(mod) if "seen_token" in n or n == "_record_token_file"]
-
-    # --- guard rail: the token directory must be dedicated --------------------
-
-    @pytest.mark.parametrize("where", [
-        "home", "above-home", "skills-root", "inside-skill", "cache-root", "inside-cache",
-    ])
-    def test_token_dir_overlapping_upload_roots_is_refused(self, layout, tmp_path, monkeypatch,
-                                                         sprites_sdk, where):
-        import __init__ as plugin_pkg
-        from sprites_environment import SpritesTokenError, resolve_sprites_token
-        target = {
-            "home": layout / "sprites-token",
-            "above-home": tmp_path / "sprites-token",
-            "skills-root": layout / "skills" / "sprites-token",
-            "inside-skill": layout / "skills" / "weather" / "sprites-token",
-            "cache-root": layout / "cache" / "sprites-token",
-            "inside-cache": layout / "cache" / "images" / "sprites-token",
-        }[where]
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _write_token(target, "misplaced-token")
-        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(target))
-        with pytest.raises(SpritesTokenError, match="directory of its own") as info:
-            resolve_sprites_token()
-        assert "misplaced-token" not in str(info.value)
-        provider = plugin_pkg.SpritesProvider()
-        assert provider.is_available() is False
-        assert provider.probe()[0] == "needs_setup"
-
-    def test_token_dir_containing_external_skills_root_is_refused(self, layout, tmp_path,
-                                                                 monkeypatch):
-        from sprites_environment import SpritesTokenError, resolve_sprites_token
-        ext = tmp_path / "shared" / "ext-skills"
-        ext.mkdir(parents=True)
-        (layout / "config.yaml").write_text(
-            "skills:\n  external_dirs:\n    - " + str(ext) + "\n")
-        _use_real_sync_sources(monkeypatch)
-        _write_token(tmp_path / "shared" / "sprites-token", "misplaced-token")
-        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(tmp_path / "shared" / "sprites-token"))
-        with pytest.raises(SpritesTokenError, match="overlaps the file sync root"):
-            resolve_sprites_token()
-
-    def test_token_dir_holding_a_configured_credential_file_is_refused(self, layout, monkeypatch):
-        from sprites_environment import SpritesTokenError, resolve_sprites_token
-        (layout / "secrets" / "service.json").write_text("{}")
-        (layout / "config.yaml").write_text(
-            "terminal:\n  credential_files:\n    - secrets/service.json\n")
-        _use_real_sync_sources(monkeypatch)
-        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(layout / "secrets" / "sprites-token"))
-        with pytest.raises(SpritesTokenError, match="credential file"):
-            resolve_sprites_token()
-
-    def test_symlinked_skills_root_onto_token_dir_is_refused(self, layout, monkeypatch):
-        from sprites_environment import SpritesTokenError, resolve_sprites_token
-        shutil.rmtree(layout / "skills")
-        (layout / "skills").symlink_to(layout / "secrets", target_is_directory=True)
-        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(layout / "secrets" / "sprites-token"))
-        with pytest.raises(SpritesTokenError, match="overlaps"):
-            resolve_sprites_token()
+        gone = ("_check_token_dir", "_upload_roots", "_TokenFileExclusion", "_record_token_file")
+        assert not [n for n in gone if hasattr(mod, n)]
 
     def test_env_token_mode_excludes_nothing(self, layout, build, monkeypatch, make_env):
         monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
         env = make_env(task_id="envtok")
         _use_real_sync_sources(monkeypatch)
-        assert env._token_source.exclusion is None
+        assert env._token_source.token_dir is None
         shipped, _ = self._sync(env)
         assert any(k.endswith("weather/SKILL.md") for k in shipped)
 

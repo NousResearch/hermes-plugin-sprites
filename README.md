@@ -57,23 +57,25 @@ reads the token from there instead of `SPRITES_TOKEN`:
   fallback, because a leftover env token may be a broader legacy token. The
   file path is fixed when an environment is created (in that profile's secret
   scope); a retry re-reads the same file and never switches credentials.
-- Keep the token file in a directory of its own, such as
-  `$HERMES_HOME/secrets/`. When an environment is created, the plugin resolves
-  `SPRITES_TOKEN_FILE` (following symlinks) and file sync then never uploads
-  anything in that file's directory, so the current token, a renewed one and
-  the writer's temp files are all covered. Nothing else is excluded, and
-  nothing the plugin reads changes what is synced.
-- The plugin refuses (the backend reports `needs_setup`) a token file whose
-  directory is the Hermes home or above it, is inside or above a skills or
-  cache directory that file sync uploads, or holds a credential file listed in
-  `terminal.credential_files`. Such a directory could hold files that should
-  sync, and excluding it would hide them.
-- After an environment is created, the token is only read from inside that
-  directory: if `SPRITES_TOKEN_FILE` comes to resolve somewhere else (a
-  retargeted symlink), the re-read fails rather than using a token file sync
-  might upload. Create a new environment to pick up the new location.
-- Copies of the token placed elsewhere (a hard link or copy in a skills
-  directory) are not tracked: writing them needs write access on the machine.
+- `SPRITES_TOKEN_FILE` must be an absolute path with no symlinks anywhere in
+  it (every component, the file included, is checked with `lstat`) and no
+  `.`, `..` or repeated `/`. Anything else is refused (the backend reports
+  `needs_setup`, and the error names the path, never the contents). The check
+  runs when an environment is created and again before every re-read.
+- **The token file's directory must be dedicated to the token** (Hermes Cloud
+  uses `/opt/data/secrets/`, a `0700` directory holding only the token and its
+  writer's temp files). File sync never uploads a file whose real path is
+  inside that directory, so the current token, a renewed one and a
+  half-written temp file never reach the Sprite. A file wrongly kept there
+  (for example a registered credential file) is skipped too, and each skipped
+  path is logged once as a warning (path only). Nothing outside the directory
+  is affected.
+- Out of scope: upload roots or credential files that an operator points into
+  the token directory, and hard links or copies of the token elsewhere. The
+  token Hermes Cloud writes only grants the instance's own Sprites (its own
+  name prefix) for at most 14 days, and the Sprite it would reach is that same
+  instance's sandbox, so such a misconfiguration is a bounded exposure; the
+  plugin does not try to detect it.
 - Error messages name the path, never the file's contents. An API error that
   quotes the token is replaced by one that does not.
 - Replace the file atomically (write a temp file in the same directory, then

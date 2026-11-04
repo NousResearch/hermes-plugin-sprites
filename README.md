@@ -34,7 +34,57 @@ discovery and terminal dispatch with mocked SDK transport.
 - **Ephemeral mode** (`terminal.container_persistent: false`): run-unique Sprite names (never adopted, deleted on cleanup), with per-session sandbox identities so two ephemeral runs can never attach the same live VM.
 - **Client-side exec timeouts.** SDK calls without a positive timeout use a 3600s client timeout. This is not a guarantee that the remote process stops at that instant; the plugin has no explicit kill hook for an in-flight command.
 - **Sharing model:** gateway/WebUI sessions each get their own Sprite; `delegate_task` children share their parent's; key-less flows (CLI, cron) share the profile-default Sprite.
-- `SPRITES_TOKEN` / `SPRITE_TOKEN` are stripped from every subprocess the agent spawns.
+- `SPRITES_TOKEN` / `SPRITE_TOKEN` (and `SPRITES_TOKEN_FILE`) are stripped from every subprocess the agent spawns.
+
+## Token from a file (`SPRITES_TOKEN_FILE`)
+
+Set `SPRITES_TOKEN_FILE` to the path of a file holding the token and the plugin
+reads the token from there instead of `SPRITES_TOKEN`:
+
+- The file holds the token alone (printable ASCII, no spaces), optionally
+  followed by one newline. It must be a regular file of at most 8 KiB; a
+  FIFO, device or directory is refused without blocking.
+- The file is read again whenever a Sprites environment is created, and after
+  an HTTP 401 from the Sprites API (any call: get, create, exec, file upload,
+  cleanup delete): if the token in the file changed, the failed call is
+  retried once with a new client. A 401 means the request was refused before
+  it ran, so the retry never runs a command twice. A token rewritten in place
+  (Hermes Cloud renews its short-lived per-instance token weekly) therefore
+  takes effect without restarting Hermes.
+- While `SPRITES_TOKEN_FILE` is set (even to an empty value), only the file
+  counts: a missing, unreadable, empty or malformed file is an error that
+  names `SPRITES_TOKEN_FILE`, and `SPRITES_TOKEN` is **not** used as a
+  fallback, because a leftover env token may be a broader legacy token. The
+  file path is fixed when an environment is created (in that profile's secret
+  scope); a retry re-reads the same file and never switches credentials.
+- `SPRITES_TOKEN_FILE` must be an absolute path with no symlinks anywhere in
+  it (every component, the file included, is checked with `lstat`) and no
+  `.`, `..` or repeated `/`. Anything else is refused (the backend reports
+  `needs_setup`, and the error names the path, never the contents). The check
+  runs when an environment is created and again before every re-read.
+- **The token file's directory must be dedicated to the token** (Hermes Cloud
+  uses `/opt/data/secrets/`, a `0700` directory holding only the token and its
+  writer's temp files). File sync never uploads a file whose real path is
+  inside that directory, so the current token, a renewed one and a
+  half-written temp file never reach the Sprite. A file wrongly kept there
+  (for example a registered credential file) is skipped too, and each skipped
+  path is logged once as a warning (path only). Nothing outside the directory
+  is affected.
+- Out of scope: upload roots or credential files that an operator points into
+  the token directory, and hard links or copies of the token elsewhere. The
+  token Hermes Cloud writes only grants the instance's own Sprites (its own
+  name prefix) for at most 14 days, and the Sprite it would reach is that same
+  instance's sandbox, so such a misconfiguration is a bounded exposure; the
+  plugin does not try to detect it.
+- Error messages name the path, never the file's contents. An API error that
+  quotes the token is replaced by one that does not.
+- Replace the file atomically (write a temp file in the same directory, then
+  rename it over the old one) so the plugin never reads a half-written token.
+  Keep it mode `0600`, owned by the user Hermes runs as.
+- Unset, `SPRITES_TOKEN` / `SPRITE_TOKEN` work as before (a value with control
+  characters, which no HTTP header can carry, is refused). Without a token
+  file a 401 is not retried: an env token cannot change under a running
+  process.
 
 ## Settings
 
@@ -155,6 +205,12 @@ the checkout if set; otherwise the current directory is used if it is a Hermes
 checkout, then `~/.hermes/hermes-agent`.
 Keep this plugin's clone outside the Hermes checkout and outside any other
 clone of this repo, or pytest also loads that other copy's `conftest.py`.
+
+`TestRealSdk401` checks 401 handling against the real sprites-py exception
+shapes and skips unless sprites-py (`>=0.5,<0.6`) is importable; the Hermes
+test environment does not include it. To run those too, invoke pytest with the
+test environment's interpreter and sprites-py on `PYTHONPATH`, with
+`HERMES_AGENT_REPO` set to the Hermes checkout.
 
 The legacy `tests/test_sprites_terminal_live.py` still assumes the pre-plugin
 Hermes layout and is not a supported standalone live-test recipe. Its rewrite

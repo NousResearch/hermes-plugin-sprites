@@ -2023,6 +2023,149 @@ class TestSyncRetryBackoff:
         env._before_execute()
         assert rig.attempts[name] == 2 and backoff.failures == 1
 
+    def _changed_file_pending(self, rig):
+        env = rig.build()  # succeeds at t=1000
+        rig.host.write_bytes(b"v2")
+        rig.clock.now += 5.0
+        return env, env._sync_manager
+
+    def test_cleanup_failure_after_upload_backs_off(self, rig, monkeypatch):
+        import tools.environments.file_sync as fs
+
+        env, manager = self._changed_file_pending(rig)
+        name = env._sprite_name
+        real = fs.tempfile.TemporaryDirectory
+
+        class FailedCleanup(real):
+            def __exit__(self, *args):
+                super().__exit__(*args)
+                raise PermissionError("staging cleanup failed")
+
+        monkeypatch.setattr(fs.tempfile, "TemporaryDirectory", FailedCleanup)
+        manager.sync()
+        assert rig.attempts[name] == 2, "the upload itself went through"
+        assert manager._last_sync_time == 1000.0, "core rolled back"
+        assert manager._backoff.failures == 1, "a rolled-back cycle is a failure"
+        first_wait = manager._backoff.deadline - rig.clock.now
+
+        rig.clock.now += 1.0
+        for _ in range(5):
+            env._before_execute()
+        assert rig.attempts[name] == 2, "no re-upload while backing off"
+        rig.clock.now = manager._backoff.deadline
+        env._before_execute()
+        assert rig.attempts[name] == 3
+        assert manager._backoff.failures == 2
+        assert manager._backoff.deadline - rig.clock.now == 2 * first_wait, "the wait grows"
+
+    def test_commit_failure_after_upload_backs_off(self, rig):
+        env, manager = self._changed_file_pending(rig)
+
+        class BrokenCommit(dict):
+            def update(self, *args, **kwargs):
+                raise OSError("cannot commit sync state")
+
+        manager._pushed_hashes = BrokenCommit(manager._pushed_hashes)
+        manager.sync()
+        assert rig.attempts[env._sprite_name] == 2
+        assert manager._last_sync_time == 1000.0, "core rolled back"
+        assert manager._backoff.failures == 1, "a rolled-back cycle is a failure"
+
+    def test_no_op_leaves_an_existing_backoff_alone(self, rig):
+        env = rig.build()  # nothing pending after this
+        manager = env._sync_manager
+        backoff = manager._backoff
+        backoff.failed(None)
+        backoff.deadline = 0.0  # expired, so the next sync runs
+        rig.clock.now += 5.0
+        manager.sync()
+        assert rig.attempts[env._sprite_name] == 1, "nothing was uploaded"
+        assert manager._last_sync_time == rig.clock.now, "core ran a no-op cycle"
+        assert backoff.failures == 1 and backoff.delay == 5.0
+
+    def test_real_success_clears_an_existing_backoff(self, rig):
+        env, manager = self._changed_file_pending(rig)
+        backoff = manager._backoff
+        backoff.failed(None)
+        backoff.failed(None)
+        backoff.deadline = 0.0
+        manager.sync()
+        assert rig.remote[rig.remote_path] == b"v2"
+        assert backoff.failures == 0 and backoff.delay == 0.0
+
+    def test_success_is_not_assumed_without_core_sync_state(self, rig, monkeypatch):
+        import sprites_environment as se
+
+        env, manager = self._changed_file_pending(rig)
+        backoff = manager._backoff
+        backoff.failed(None)
+        backoff.deadline = 0.0
+        monkeypatch.setattr(se._SharedSpriteSyncManager, "_commit_marker", lambda self: None)
+        manager.sync()
+        assert rig.remote[rig.remote_path] == b"v2"
+        assert backoff.failures == 1, "an unreadable outcome never clears the backoff"
+
+
+def test_polling_against_a_failing_sprite_builds_few_archives(
+        hermes_runtime, tmp_path, monkeypatch):
+    """The production pattern, on a simulated clock: three environments of
+    one Sprite, the background poller syncing twice per session every 2 s
+    for 10 minutes, and every upload failing. Without the backoff this
+    builds an archive on every one of the 1797 syncs."""
+    import threading
+
+    import sprites_environment as se
+    import tools.environments.file_sync as fs
+
+    clock = _Clock()
+    monkeypatch.setattr(se, "_monotonic", clock)
+    monkeypatch.setattr(fs, "_monotonic", clock)
+    monkeypatch.setattr(fs, "_credential_host_paths", lambda: set(), raising=False)
+    monkeypatch.delenv("HERMES_FORCE_FILE_SYNC", raising=False)
+    files = []
+    for i in range(8):
+        host = tmp_path / f"file-{i}"
+        host.write_bytes(b"x" * 1024)
+        files.append((str(host), f"/root/.hermes/skills/file-{i}"))
+
+    env = object.__new__(se.SpritesEnvironment)
+    env._remote_home = "/root"
+    env._use_archives = True
+    env._with_auth_retry = lambda fn: fn()
+
+    class FailingFS:
+        def __truediv__(self, _path):
+            return self
+
+        def write_bytes(self, payload, **kwargs):
+            raise AttributeError("'dict' object has no attribute 'lower'")
+
+    env._fs = FailingFS()
+    builds = []
+    real_archive = se._build_archive
+
+    def build_archive(batch):
+        builds.append(clock.now)
+        return real_archive(batch)
+
+    monkeypatch.setattr(se, "_build_archive", build_archive)
+    lock, backoff = threading.Lock(), se._SyncBackoff("polled-sprite")
+    managers = [
+        se._SharedSpriteSyncManager(
+            get_files_fn=lambda: files, upload_fn=lambda *_: None,
+            bulk_upload_fn=env._sprite_bulk_upload, delete_fn=lambda _: None,
+            shared_lock=lock, backoff=backoff)
+        for _ in range(3)
+    ]
+    for manager in managers:
+        manager.sync(force=True)  # environment creation
+    for seconds in range(2, 600, 2):
+        clock.now = 1000.0 + seconds
+        for manager in managers:
+            manager.sync()
+            manager.sync()
+    assert len(builds) <= 10, [t - 1000.0 for t in builds]
+
 
 # ---------------------------------------------------------------------------
 # Create-time settings: image, max_cpus, max_ram_gb, max_disk_gb

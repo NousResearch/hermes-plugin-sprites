@@ -682,11 +682,14 @@ class _SharedSpriteSyncManager(FileSyncManager):
     Forced syncs always run.
 
     Core swallows sync errors, so the outcome is read from the transport
-    callables handed to core, which are wrapped here: a cycle in which a
-    transport call raised is a failure; a cycle in which transport calls were
-    made and none raised (core then commits) is a success and clears the
-    backoff. A cycle that made no transport call leaves the backoff as it
-    is: that covers core's interval skip, a no-op with nothing pending (which
+    callables handed to core, which are wrapped here, and from core's synced
+    state: a cycle in which a transport call raised is a failure. A cycle in
+    which transport calls were made and none raised is a success only if core
+    then committed (see ``_commit_marker``); core can still roll back after
+    the transport returns (staging cleanup or the commit itself failing),
+    and that counts as a failure too, or a persistent cleanup error would
+    rebuild every archive before every command. A cycle that made no
+    transport call leaves the backoff as it is: that covers core's interval skip, a no-op with nothing pending (which
     says nothing about this Sprite's uploads, since every environment keeps
     its own synced state), and a local planning or staging failure (such as
     a file removed between listing and copying). Those local failures never
@@ -730,6 +733,7 @@ class _SharedSpriteSyncManager(FileSyncManager):
                 return
             attempt = self._attempt
             attempt.active, attempt.called, attempt.error = True, False, None
+            before = self._commit_marker()
             try:
                 super().sync(force=force)
             except Exception as exc:
@@ -741,7 +745,40 @@ class _SharedSpriteSyncManager(FileSyncManager):
                 if attempt.error is not None:
                     self._backoff.failed(attempt.error)
                 elif attempt.called:
-                    self._backoff.succeeded()
+                    after = self._commit_marker()
+                    if before is None or after is None:
+                        pass  # cannot tell; never clear the backoff on a guess
+                    elif after != before:
+                        self._backoff.succeeded()
+                    else:
+                        # Core rolled back after the transport returned.
+                        self._backoff.failed(None)
+
+    def _commit_marker(self):
+        """Read-only snapshot of the core state that changes only on commit.
+
+        In a cycle that reaches the transport, Hermes core assigns
+        ``_last_sync_time`` and the new ``_synced_files`` / ``_pushed_hashes``
+        only when it commits; on a failure it restores copies of the previous
+        state and leaves the clock alone. Comparing the clock and the content
+        before and after therefore tells a commit from a rollback. The content
+        also changes on a commit that uploaded (core only uploads a file whose
+        hash is new) or deleted (fewer keys), so equal clock readings are
+        covered; a commit that still looked unchanged would be counted as a
+        failure, which only delays the next retry. Returns ``None``
+        when core does not have these attributes, so the caller can leave
+        the backoff unchanged rather than clear it.
+        """
+        missing = object()
+        clock = getattr(self, "_last_sync_time", missing)
+        files = getattr(self, "_synced_files", missing)
+        hashes = getattr(self, "_pushed_hashes", missing)
+        if any(value is missing for value in (clock, files, hashes)):
+            return None
+        try:
+            return clock, dict(files), dict(hashes)
+        except (TypeError, ValueError):
+            return None
 
 
 def _collapse_slug(value: str) -> str:

@@ -410,9 +410,15 @@ _DELETE_TIMEOUT = 60.0
 #: Client wait for the exec that unpacks a sync archive.
 _UNPACK_TIMEOUT = 120.0
 
-#: Uncompressed bytes packed into one sync archive before starting another.
-#: A file larger than this travels alone in its own archive.
-_ARCHIVE_MAX_BYTES = 32 * 1024 * 1024
+#: Largest body one sync ``fs/write`` sends: a whole tar archive (headers,
+#: padding and end-of-archive blocks included), or one file in the
+#: one-by-one fallback. The Sprites 2 docs cap a write at 16 MiB ("Files":
+#: "Files are at most 16 MiB"; "Limits": "Files: 16 MiB per fs/write"), and
+#: a 17 MiB write gets 413 ``file_too_large``. Observed, not documented: a
+#: 5 MiB write came back 502 with an empty body after 8 s, while 4.75 MiB
+#: and below succeeded. 4 MiB stays under both. A file that does not fit is
+#: left out of the sync with a warning (see ``_within_write_limit``).
+_SYNC_WRITE_MAX_BYTES = 4 * 1024 * 1024
 
 #: Upper bound on one delete command, measured URL-encoded (the command
 #: travels in the exec URL), so a very large batch is split into several execs.
@@ -775,21 +781,101 @@ def _delete_batches(paths: list[str]) -> list[list[str]]:
     return batches
 
 
-def _archive_batches(files: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
-    """Split ``files`` so each archive holds at most ``_ARCHIVE_MAX_BYTES`` of input.
+#: Remote paths already reported as too large to sync.
+_oversize_warned: set = set()
+_oversize_warned_lock = threading.Lock()
 
-    A single file larger than the budget still gets its own archive.
+
+def _warn_oversized(remote_path: str, size: int) -> None:
+    """Log once per remote path per process that a file was left out of sync."""
+    with _oversize_warned_lock:
+        first = remote_path not in _oversize_warned
+        _oversize_warned.add(remote_path)
+    if first:
+        logger.warning(
+            "Sprites: file sync skipped %s: it is %d bytes, too large for one "
+            "upload to the Sprite (limit %d bytes)",
+            remote_path, size, _SYNC_WRITE_MAX_BYTES,
+        )
+
+
+def _tar_info(remote_path: str, size: int, mtime: float) -> tarfile.TarInfo:
+    """The member header ``_build_archive`` writes for one file."""
+    info = tarfile.TarInfo(remote_path.lstrip("/"))
+    info.size = size
+    info.mode = 0o644
+    info.mtime = int(mtime)
+    return info
+
+
+def _tar_member_bytes(remote_path: str, size: int, mtime: float) -> int:
+    """Bytes one member takes in the archive: its header blocks (more than one
+    for a long or non-ASCII name) plus its data padded to a whole block."""
+    header = _tar_info(remote_path, size, mtime).tobuf(
+        tarfile.DEFAULT_FORMAT, tarfile.ENCODING, "surrogateescape")
+    return len(header) + -(-size // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+
+
+def _tar_archive_bytes(members_bytes: int) -> int:
+    """Archive size for members totalling ``members_bytes``: tarfile ends the
+    archive with two zero blocks and pads it to a whole record."""
+    total = members_bytes + 2 * tarfile.BLOCKSIZE
+    return -(-total // tarfile.RECORDSIZE) * tarfile.RECORDSIZE
+
+
+def _fits_one_write(remote_path: str, size: int, mtime: float) -> bool:
+    """True when the file, alone in an archive, is within the write limit
+    (which also bounds it as a single ``fs/write``)."""
+    member = _tar_member_bytes(remote_path, size, mtime)
+    return _tar_archive_bytes(member) <= _SYNC_WRITE_MAX_BYTES
+
+
+def _within_write_limit(files):
+    """``files`` (``(host_path, remote_path)`` pairs) minus files too large to
+    upload, each warned about once (remote path and size, never contents).
+
+    The Sprite refuses a write over its limit, so one such file would fail
+    every sync. It is dropped here, from the file list ``FileSyncManager``
+    plans from, rather than inside the upload: the manager then never
+    records it as synced, removes an older copy it did sync, and uploads
+    the file on the first sync after it shrinks back under the limit.
+    A file that cannot be stat'ed is kept; the manager handles it as before.
+    """
+    kept = []
+    for host_path, remote_path in files:
+        try:
+            st = os.stat(host_path)
+        except OSError:
+            kept.append((host_path, remote_path))
+            continue
+        if _fits_one_write(remote_path, st.st_size, st.st_mtime):
+            kept.append((host_path, remote_path))
+        else:
+            _warn_oversized(remote_path, st.st_size)
+    return kept
+
+
+def _archive_batches(files: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
+    """Split ``files`` so each archive ``_build_archive`` makes, measured in
+    real tar bytes, is at most ``_SYNC_WRITE_MAX_BYTES``.
+
+    A file too large even for an archive of its own (it grew after
+    ``_within_write_limit`` checked it) is left out with a warning, not sent.
     """
     batches: list[list[tuple[str, str]]] = []
     current: list[tuple[str, str]] = []
     size = 0
     for host_path, remote_path in files:
-        file_size = Path(host_path).stat().st_size
-        if current and size + file_size > _ARCHIVE_MAX_BYTES:
+        st = Path(host_path).stat()
+        member = _tar_member_bytes(remote_path, st.st_size, st.st_mtime)
+        if _tar_archive_bytes(member) > _SYNC_WRITE_MAX_BYTES:
+            _warn_oversized(remote_path, st.st_size)
+            continue
+        if current and _tar_archive_bytes(size + member) > _SYNC_WRITE_MAX_BYTES:
             batches.append(current)
             current, size = [], 0
         current.append((host_path, remote_path))
-        size += file_size
+        size += member
     if current:
         batches.append(current)
     return batches
@@ -806,10 +892,7 @@ def _build_archive(files: list[tuple[str, str]]) -> bytes:
     with tarfile.open(fileobj=buf, mode="w") as tar:
         for host_path, remote_path in files:
             data = Path(host_path).read_bytes()
-            info = tarfile.TarInfo(remote_path.lstrip("/"))
-            info.size = len(data)
-            info.mode = 0o644
-            info.mtime = int(Path(host_path).stat().st_mtime)
+            info = _tar_info(remote_path, len(data), Path(host_path).stat().st_mtime)
             tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
 
@@ -1005,9 +1088,9 @@ class SpritesEnvironment(BaseEnvironment):
             # Never ship the token file's directory into the Sprite. This is
             # the one place host paths are seen: FileSyncManager copies each
             # file to a staging dir before upload_fn / bulk_upload_fn run.
-            get_files_fn=lambda: _without_token_dir(
+            get_files_fn=lambda: _within_write_limit(_without_token_dir(
                 iter_sync_files(f"{self._remote_home}/.hermes"),
-                self._token_source.token_dir),
+                self._token_source.token_dir)),
             upload_fn=self._sprite_upload,
             bulk_upload_fn=self._sprite_bulk_upload,
             delete_fn=self._sprite_delete,
@@ -1215,6 +1298,10 @@ class SpritesEnvironment(BaseEnvironment):
         sprites-py defaults the plugin has always sent.
         """
         data = Path(host_path).read_bytes()
+        if len(data) > _SYNC_WRITE_MAX_BYTES:
+            # The Sprite refuses it (see ``_SYNC_WRITE_MAX_BYTES``).
+            _warn_oversized(remote_path, len(data))
+            return
         self._with_auth_retry(
             lambda: (self._fs / remote_path).write_bytes(data, mode=0o644, mkdir_parents=True)
         )
@@ -1239,6 +1326,9 @@ class SpritesEnvironment(BaseEnvironment):
         If the archive could not be removed (a non-root user without sudo
         cannot delete a root-owned file), it is overwritten with nothing and
         this environment stops using archives, so they do not pile up.
+
+        No write is larger than ``_SYNC_WRITE_MAX_BYTES``; files too large
+        for it are already left out by ``_within_write_limit``.
         """
         for batch in _archive_batches(files):
             if not self._use_archives:
@@ -1251,6 +1341,12 @@ class SpritesEnvironment(BaseEnvironment):
                 self._remote_home, ".hermes", ".sync-staging",
                 f".sync-{uuid.uuid4().hex}.tar")
             payload = _build_archive(batch)
+            if len(payload) > _SYNC_WRITE_MAX_BYTES:
+                # Not reachable from the staged copies FileSyncManager passes
+                # in; a guard so a write the Sprite refuses is never sent.
+                raise RuntimeError(
+                    f"Sprites: sync archive is {len(payload)} bytes, over the "
+                    f"{_SYNC_WRITE_MAX_BYTES}-byte upload limit")
             self._with_auth_retry(
                 lambda: (self._fs / archive).write_bytes(payload, mode=0o600, mkdir_parents=True)
             )

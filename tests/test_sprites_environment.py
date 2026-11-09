@@ -1114,8 +1114,11 @@ class TestFileSyncBulkUpload:
     ):
         import sprites_environment as se
 
-        monkeypatch.setattr(se, "_ARCHIVE_MAX_BYTES", 1)  # one file per archive
+        # 5000-byte files: one fits a 10240-byte archive, two do not.
+        monkeypatch.setattr(se, "_SYNC_WRITE_MAX_BYTES", 10240)
         files = self._host_tree(tmp_path, 3)
+        for host, _ in files:
+            Path(host).write_bytes(b"x" * 5000)
         sprite = _RateLimitedSprite(limit=10_000)
         sprite.archive_left = True
 
@@ -1223,15 +1226,196 @@ class TestFileSyncBulkUpload:
     def test_archives_split_by_size(self, tmp_path, monkeypatch):
         import sprites_environment as se
 
-        monkeypatch.setattr(se, "_ARCHIVE_MAX_BYTES", 10)
+        # A 4-byte file takes 1024 tar bytes, an 8000-byte one 8704; the
+        # archive adds 1024 end-of-archive bytes. 10240 holds a+b, or c alone.
+        monkeypatch.setattr(se, "_SYNC_WRITE_MAX_BYTES", 10240)
         files = []
-        for name, size in [("a", 4), ("b", 4), ("c", 4), ("big", 25), ("d", 1)]:
+        for name, size in [("a", 4), ("b", 4), ("c", 8000), ("big", 25_000), ("d", 1)]:
             host = tmp_path / name
             host.write_bytes(b"x" * size)
             files.append((str(host), f"/r/{name}"))
         batches = se._archive_batches(files)
         assert [[r for _, r in b] for b in batches] == [
-            ["/r/a", "/r/b"], ["/r/c"], ["/r/big"], ["/r/d"]]
+            ["/r/a", "/r/b"], ["/r/c"], ["/r/d"]], "big is left out"
+        for batch in batches:
+            assert len(se._build_archive(batch)) <= 10240
+
+
+class TestSyncUnderWriteLimit:
+    """No sync write exceeds what the Sprite accepts (16 MiB documented, 502
+    observed at 5 MiB), and one oversized file cannot fail every sync."""
+
+    MiB = 1024 * 1024
+
+    @pytest.fixture(autouse=True)
+    def _fresh_oversize_warnings(self, monkeypatch):
+        import sprites_environment as se
+        monkeypatch.setattr(se, "_oversize_warned", set())
+
+    @staticmethod
+    def _files(tmp_path, sizes, name_len=8):
+        files = []
+        for i, size in enumerate(sizes):
+            host = tmp_path / f"f{i:05d}"
+            host.write_bytes(b"x" * size)
+            files.append((str(host), f"/home/sprite/.hermes/cache/{'n' * name_len}-{i:05d}"))
+        return files
+
+    def test_limit_is_under_the_documented_and_observed_limits(self):
+        import sprites_environment as se
+        assert se._SYNC_WRITE_MAX_BYTES < 16 * self.MiB, "docs: 16 MiB per fs/write"
+        assert se._SYNC_WRITE_MAX_BYTES < 4.75 * self.MiB, "observed: 502 at 5 MiB"
+
+    @pytest.mark.parametrize("sizes,name_len", [
+        ([1024 * 1024] * 9, 8),          # file data alone exactly fills archives
+        ([0] * 3000 + [1] * 3000, 200),  # many tiny files: tar headers dominate
+        ([3_900_000, 100_000, 1_000_000, 2_500, 4_100_000, 7, 1_500_000] * 2, 120),
+    ])
+    def test_every_archive_is_within_the_limit(self, tmp_path, sizes, name_len):
+        import sprites_environment as se
+
+        files = self._files(tmp_path, sizes, name_len)
+        batches = se._archive_batches(files)
+        assert sorted(f for b in batches for f in b) == sorted(files)
+        for batch in batches:
+            size = len(se._build_archive(batch))
+            assert size <= se._SYNC_WRITE_MAX_BYTES
+            assert size <= 4.75 * self.MiB, "largest write seen to succeed"
+
+    def test_many_small_files_are_split_by_their_real_tar_size(self, tmp_path, monkeypatch):
+        """Sum of file sizes is under the limit, the tar is not."""
+        import sprites_environment as se
+
+        monkeypatch.setattr(se, "_SYNC_WRITE_MAX_BYTES", 64 * 1024)
+        files = self._files(tmp_path, [10] * 400, name_len=150)
+        batches = se._archive_batches(files)
+        assert len(batches) > 1
+        assert sorted(f for b in batches for f in b) == sorted(files)
+        for batch in batches:
+            assert len(se._build_archive(batch)) <= 64 * 1024
+
+    def _env(self, make_env, monkeypatch, files, sprite):
+        import sprites_environment as se
+
+        monkeypatch.setattr(se, "iter_sync_files", lambda _root: list(files))
+        return make_env(task_id="limit", sprite=sprite)
+
+    @staticmethod
+    def _max_write(sprite, seen):
+        orig = sprite.filesystem
+
+        def filesystem(root):
+            fs = orig(root)
+
+            class _Fs:
+                def __truediv__(self, path):
+                    target = fs / path
+                    inner = target.write_bytes
+
+                    def write_bytes(data, **kw):
+                        seen.append(len(data))
+                        return inner(data, **kw)
+
+                    target.write_bytes = write_bytes
+                    return target
+
+            return _Fs()
+
+        sprite.filesystem = filesystem
+
+    def test_oversized_file_is_skipped_once_and_the_rest_upload(
+        self, make_env, monkeypatch, tmp_path, caplog
+    ):
+        import sprites_environment as se
+
+        files = self._files(tmp_path, [100, se._SYNC_WRITE_MAX_BYTES + 1, 200])
+        big_host, big_remote = files[1]
+        sprite = _RateLimitedSprite(limit=10_000)
+        writes = []
+        self._max_write(sprite, writes)
+
+        with caplog.at_level("WARNING"):
+            env = self._env(make_env, monkeypatch, files, sprite)
+        assert writes and max(writes) <= se._SYNC_WRITE_MAX_BYTES
+        for host, remote in (files[0], files[2]):
+            assert sprite.files[remote] == Path(host).read_bytes()
+        assert big_remote not in sprite.files
+        synced = env._sync_manager._synced_files
+        assert set(synced) == {files[0][1], files[2][1]}, (
+            "the sync commits; the skipped file is not recorded as synced")
+        skipped = [r for r in caplog.records if big_remote in r.getMessage()]
+        assert len(skipped) == 1
+        assert str(se._SYNC_WRITE_MAX_BYTES + 1) in skipped[0].getMessage()
+
+        caplog.clear()
+        Path(files[0][0]).write_bytes(b"changed")
+        with caplog.at_level("WARNING"):
+            env._sync_manager.sync(force=True)
+        assert sprite.files[files[0][1]] == b"changed", "later syncs still work"
+        assert big_remote not in caplog.text, "warned once per path, not every sync"
+
+        Path(big_host).write_bytes(b"small now")
+        env._sync_manager.sync(force=True)
+        assert sprite.files[big_remote] == b"small now", (
+            "the file is uploaded once it is back under the limit")
+        assert big_remote in env._sync_manager._synced_files
+
+    def test_file_that_grows_too_large_is_removed_then_resynced(
+        self, make_env, monkeypatch, tmp_path
+    ):
+        """No stale copy is left looking current, and no sync fails."""
+        import sprites_environment as se
+
+        files = self._files(tmp_path, [100, 300])
+        host, remote = files[1]
+        sprite = _RateLimitedSprite(limit=10_000)
+        deleted = []
+        env = self._env(make_env, monkeypatch, files, sprite)
+        monkeypatch.setattr(env._sync_manager, "_delete_fn", deleted.extend)
+        assert remote in env._sync_manager._synced_files
+
+        Path(host).write_bytes(b"x" * (se._SYNC_WRITE_MAX_BYTES + 1))
+        env._sync_manager.sync(force=True)
+        assert deleted == [remote]
+        assert remote not in env._sync_manager._synced_files
+
+        Path(host).write_bytes(b"fits again")
+        env._sync_manager.sync(force=True)
+        assert sprite.files[remote] == b"fits again"
+
+    def test_fallback_never_writes_more_than_the_limit(self, make_env, tmp_path, caplog):
+        import sprites_environment as se
+
+        env = make_env(task_id="fallback")
+        remote_obj = MagicMock()
+        env._fs = MagicMock()
+        env._fs.__truediv__.return_value = remote_obj
+        big = tmp_path / "big"
+        big.write_bytes(b"x" * (se._SYNC_WRITE_MAX_BYTES + 1))
+        small = tmp_path / "small"
+        small.write_bytes(b"x" * se._SYNC_WRITE_MAX_BYTES)
+
+        with caplog.at_level("WARNING"):
+            env._sprite_upload(str(big), "/home/sprite/.hermes/big")
+            env._sprite_upload(str(small), "/home/sprite/.hermes/small")
+        sizes = [len(c.args[0]) for c in remote_obj.write_bytes.call_args_list]
+        assert sizes == [se._SYNC_WRITE_MAX_BYTES]
+        assert "/home/sprite/.hermes/big" in caplog.text
+
+    def test_fallback_after_failed_unpack_stays_within_the_limit(
+        self, make_env, monkeypatch, tmp_path
+    ):
+        import sprites_environment as se
+
+        files = self._files(tmp_path, [100, se._SYNC_WRITE_MAX_BYTES + 1])
+        sprite = _RateLimitedSprite(limit=10_000)
+        sprite.unpack_exit = 2
+        writes = []
+        self._max_write(sprite, writes)
+        env = self._env(make_env, monkeypatch, files, sprite)
+        assert max(writes) <= se._SYNC_WRITE_MAX_BYTES
+        assert sprite.writes[files[0][1]] == b"x" * 100
+        assert set(env._sync_manager._synced_files) == {files[0][1]}
 
 
 def _umask() -> int:

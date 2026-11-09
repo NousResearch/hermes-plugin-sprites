@@ -183,7 +183,13 @@ caches copied into `~/.hermes` on the Sprite before each command) therefore:
   Each `fs/write` and exec counts against the per-Sprite request rate limit
   (300 per minute), and the skills tree alone is a few hundred files, so one
   request per file left every sync cut off by HTTP 429 and resent in full.
-  Archives hold up to 32 MiB of file data each;
+  No upload is larger than 4 MiB, tar headers included: the Sprites docs cap
+  one `fs/write` at 16 MiB (413 `file_too_large` above it), and in practice a
+  5 MiB write has come back 502 while 4.75 MiB and below succeed. More data
+  goes in more archives. A single file too large for that limit is left out
+  of the sync, and a copy synced earlier is removed from the Sprite; a
+  warning names its remote path and size once per process, and the file is
+  synced again once it is back under the limit;
 - deletes files that disappeared on the host with one exec per batch,
   `rm -f -- <paths>`, retried as `sudo -n rm -f -- <paths>` because `fs/write`
   creates root-owned files while the base image runs commands as `sprite`. A

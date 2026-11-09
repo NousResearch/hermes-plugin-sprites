@@ -416,8 +416,9 @@ _UNPACK_TIMEOUT = 120.0
 #: "Files are at most 16 MiB"; "Limits": "Files: 16 MiB per fs/write"), and
 #: a 17 MiB write gets 413 ``file_too_large``. Observed, not documented: a
 #: 5 MiB write came back 502 with an empty body after 8 s, while 4.75 MiB
-#: and below succeeded. 4 MiB stays under both. A file that does not fit is
-#: left out of the sync with a warning (see ``_within_write_limit``).
+#: and below succeeded. 4 MiB stays under both. A file too large for an
+#: archive of its own is sent in raw chunks of at most this size and joined
+#: on the Sprite (see ``_assemble_script``).
 _SYNC_WRITE_MAX_BYTES = 4 * 1024 * 1024
 
 #: Upper bound on one delete command, measured URL-encoded (the command
@@ -781,24 +782,6 @@ def _delete_batches(paths: list[str]) -> list[list[str]]:
     return batches
 
 
-#: Remote paths already reported as too large to sync.
-_oversize_warned: set = set()
-_oversize_warned_lock = threading.Lock()
-
-
-def _warn_oversized(remote_path: str, size: int) -> None:
-    """Log once per remote path per process that a file was left out of sync."""
-    with _oversize_warned_lock:
-        first = remote_path not in _oversize_warned
-        _oversize_warned.add(remote_path)
-    if first:
-        logger.warning(
-            "Sprites: file sync skipped %s: it is %d bytes, too large for one "
-            "upload to the Sprite (limit %d bytes)",
-            remote_path, size, _SYNC_WRITE_MAX_BYTES,
-        )
-
-
 def _tar_info(remote_path: str, size: int, mtime: float) -> tarfile.TarInfo:
     """The member header ``_build_archive`` writes for one file."""
     info = tarfile.TarInfo(remote_path.lstrip("/"))
@@ -830,46 +813,25 @@ def _fits_one_write(remote_path: str, size: int, mtime: float) -> bool:
     return _tar_archive_bytes(member) <= _SYNC_WRITE_MAX_BYTES
 
 
-def _within_write_limit(files):
-    """``files`` (``(host_path, remote_path)`` pairs) minus files too large to
-    upload, each warned about once (remote path and size, never contents).
+def _archive_batches(
+    files: list[tuple[str, str]],
+) -> tuple[list[list[tuple[str, str]]], list[tuple[str, str]]]:
+    """Split ``files`` into archive batches and files to send in chunks.
 
-    The Sprite refuses a write over its limit, so one such file would fail
-    every sync. It is dropped here, from the file list ``FileSyncManager``
-    plans from, rather than inside the upload: the manager then never
-    records it as synced, removes an older copy it did sync, and uploads
-    the file on the first sync after it shrinks back under the limit.
-    A file that cannot be stat'ed is kept; the manager handles it as before.
-    """
-    kept = []
-    for host_path, remote_path in files:
-        try:
-            st = os.stat(host_path)
-        except OSError:
-            kept.append((host_path, remote_path))
-            continue
-        if _fits_one_write(remote_path, st.st_size, st.st_mtime):
-            kept.append((host_path, remote_path))
-        else:
-            _warn_oversized(remote_path, st.st_size)
-    return kept
-
-
-def _archive_batches(files: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
-    """Split ``files`` so each archive ``_build_archive`` makes, measured in
-    real tar bytes, is at most ``_SYNC_WRITE_MAX_BYTES``.
-
-    A file too large even for an archive of its own (it grew after
-    ``_within_write_limit`` checked it) is left out with a warning, not sent.
+    Each archive ``_build_archive`` makes from a batch, measured in real tar
+    bytes, is at most ``_SYNC_WRITE_MAX_BYTES``. A file too large even for an
+    archive of its own is returned in the second list instead, to be sent
+    in chunks; no file is left out.
     """
     batches: list[list[tuple[str, str]]] = []
     current: list[tuple[str, str]] = []
+    chunked: list[tuple[str, str]] = []
     size = 0
     for host_path, remote_path in files:
         st = Path(host_path).stat()
         member = _tar_member_bytes(remote_path, st.st_size, st.st_mtime)
         if _tar_archive_bytes(member) > _SYNC_WRITE_MAX_BYTES:
-            _warn_oversized(remote_path, st.st_size)
+            chunked.append((host_path, remote_path))
             continue
         if current and _tar_archive_bytes(size + member) > _SYNC_WRITE_MAX_BYTES:
             batches.append(current)
@@ -878,7 +840,7 @@ def _archive_batches(files: list[tuple[str, str]]) -> list[list[tuple[str, str]]
         size += member
     if current:
         batches.append(current)
-    return batches
+    return batches, chunked
 
 
 def _build_archive(files: list[tuple[str, str]]) -> bytes:
@@ -908,6 +870,17 @@ _STALE_ARCHIVE_MINUTES = 30
 _ARCHIVE_LEFT_EXIT = 86
 
 
+def _sweep_script(staging_dir: str) -> str:
+    """Remove archives and chunk parts in ``staging_dir`` left behind by
+    earlier syncs that never finished (only names this plugin makes)."""
+    staging = shlex.quote(staging_dir)
+    return (
+        f"find {staging} -maxdepth 1 "
+        f"\\( -name '.sync-*.tar' -o -name '.sync-*.part' \\) "
+        f"-mmin +{_STALE_ARCHIVE_MINUTES} -exec rm -f -- {{}} +"
+    )
+
+
 def _unpack_script(archive_path: str) -> str:
     """Unpack the archive at ``/``, retrying with ``sudo -n``, then remove it.
 
@@ -919,16 +892,50 @@ def _unpack_script(archive_path: str) -> str:
     directory left behind by earlier syncs whose unpack never ran.
     """
     q = shlex.quote(archive_path)
-    staging = shlex.quote(posixpath.dirname(archive_path))
     tar = f"tar -xf {q} -C / --no-same-owner"
-    sweep = (
-        f"find {staging} -maxdepth 1 -name '.sync-*.tar' "
-        f"-mmin +{_STALE_ARCHIVE_MINUTES} -exec rm -f -- {{}} +"
-    )
+    sweep = _sweep_script(posixpath.dirname(archive_path))
     return (
         f"{{ {tar} || sudo -n {tar}; }}; rc=$?; "
         f"rm -f -- {q} 2>/dev/null || sudo -n rm -f -- {q} 2>/dev/null "
         f"|| rc={_ARCHIVE_LEFT_EXIT}; "
+        f"{{ {sweep} || sudo -n {sweep}; }} >/dev/null 2>&1; "
+        f"exit $rc"
+    )
+
+
+def _assemble_script(parts: list[str], remote_path: str, tmp_path: str) -> str:
+    """Join chunk ``parts`` into ``remote_path``, then remove the parts.
+
+    The Sprites 2 docs offer no append or partial write ("Files": one
+    ``PUT fs/write`` per file, at most 16 MiB), so a file larger than one
+    write arrives as several part files and is joined here. The parts are
+    concatenated into ``tmp_path`` (next to the destination, so the rename
+    stays on one filesystem), set to 0644 like a single ``fs/write``, and
+    renamed over the destination atomically: a reader sees the old file or
+    the new one, never a partial one. The parts are root-owned 0600
+    ``fs/write`` files, so a non-root exec user retries through ``sudo -n``
+    as ``_unpack_script`` does. On failure the temp file is removed and the
+    script exits non-zero; the parts are removed either way, and
+    ``_ARCHIVE_LEFT_EXIT`` reports a join that worked but left its parts.
+    Stale archives and parts from earlier syncs are swept as well.
+    """
+    q_parts = " ".join(shlex.quote(p) for p in parts)
+    q_tmp = shlex.quote(tmp_path)
+    q_dest = shlex.quote(remote_path)
+    q_dir = shlex.quote(posixpath.dirname(remote_path) or "/")
+    join = (
+        f"mkdir -p -- {q_dir} && cat -- {q_parts} > {q_tmp} && "
+        f"chmod 0644 -- {q_tmp} && mv -f -- {q_tmp} {q_dest}"
+    )
+    rm_tmp = f"rm -f -- {q_tmp}"
+    rm_parts = f"rm -f -- {q_parts}"
+    sweep = _sweep_script(posixpath.dirname(parts[0]))
+    return (
+        f"{{ {join}; }} || {{ {rm_tmp} 2>/dev/null; sudo -n sh -c {shlex.quote(join)}; }}; "
+        f"rc=$?; "
+        f"if [ $rc -ne 0 ]; then {{ {rm_tmp} || sudo -n {rm_tmp}; }} >/dev/null 2>&1; fi; "
+        f"{rm_parts} 2>/dev/null || sudo -n {rm_parts} 2>/dev/null "
+        f"|| {{ [ $rc -ne 0 ] || rc={_ARCHIVE_LEFT_EXIT}; }}; "
         f"{{ {sweep} || sudo -n {sweep}; }} >/dev/null 2>&1; "
         f"exit $rc"
     )
@@ -1088,9 +1095,9 @@ class SpritesEnvironment(BaseEnvironment):
             # Never ship the token file's directory into the Sprite. This is
             # the one place host paths are seen: FileSyncManager copies each
             # file to a staging dir before upload_fn / bulk_upload_fn run.
-            get_files_fn=lambda: _within_write_limit(_without_token_dir(
+            get_files_fn=lambda: _without_token_dir(
                 iter_sync_files(f"{self._remote_home}/.hermes"),
-                self._token_source.token_dir)),
+                self._token_source.token_dir),
             upload_fn=self._sprite_upload,
             bulk_upload_fn=self._sprite_bulk_upload,
             delete_fn=self._sprite_delete,
@@ -1290,21 +1297,85 @@ class SpritesEnvironment(BaseEnvironment):
     # ------------------------------------------------------------------
 
     def _sprite_upload(self, host_path: str, remote_path: str) -> None:
-        """Upload a single file with ``fs/write``.
+        """Upload a single file with ``fs/write``, or in chunks if it is
+        larger than one write (``_SYNC_WRITE_MAX_BYTES``).
 
         ``mkdir_parents=True`` makes the write create missing parent
         directories, so no separate mkdir (which needs ``fs/list``, absent on
         the Sprites 2.0 runtime) is made. Mode and parent creation are the
         sprites-py defaults the plugin has always sent.
         """
-        data = Path(host_path).read_bytes()
+        with open(host_path, "rb") as f:
+            data = f.read(_SYNC_WRITE_MAX_BYTES + 1)
         if len(data) > _SYNC_WRITE_MAX_BYTES:
-            # The Sprite refuses it (see ``_SYNC_WRITE_MAX_BYTES``).
-            _warn_oversized(remote_path, len(data))
+            del data
+            self._sprite_upload_chunked(host_path, remote_path)
             return
         self._with_auth_retry(
             lambda: (self._fs / remote_path).write_bytes(data, mode=0o644, mkdir_parents=True)
         )
+
+    def _sprite_upload_chunked(self, host_path: str, remote_path: str) -> None:
+        """Upload one file too large for a single write as chunks, then join
+        them on the Sprite with one exec (see ``_assemble_script``).
+
+        Each chunk of at most ``_SYNC_WRITE_MAX_BYTES`` is read from the
+        file as it is sent, so at most one chunk is held in memory, and goes
+        in one ``fs/write`` to its own part file (root-only, mode 0600, like
+        an archive) in ``~/.hermes/.sync-staging``. The file is read to its
+        end, so all of it is sent whatever its size. Any failure raises, so
+        ``FileSyncManager`` rolls back and retries; parts already written are
+        removed on a best-effort basis, and otherwise by a later sync's sweep.
+        """
+        token = uuid.uuid4().hex
+        staging = posixpath.join(self._remote_home, ".hermes", ".sync-staging")
+        parts: list[str] = []
+        try:
+            with open(host_path, "rb") as f:
+                while True:
+                    chunk = f.read(_SYNC_WRITE_MAX_BYTES)
+                    if not chunk and parts:
+                        break
+                    part = posixpath.join(staging, f".sync-{token}-{len(parts):05d}.part")
+                    parts.append(part)
+                    self._with_auth_retry(
+                        lambda: (self._fs / part).write_bytes(
+                            chunk, mode=0o600, mkdir_parents=True)
+                    )
+                    last = len(chunk) < _SYNC_WRITE_MAX_BYTES
+                    del chunk  # drop it before reading the next one
+                    if last:
+                        break
+            tmp = posixpath.join(
+                posixpath.dirname(remote_path) or "/", f".sync-{token}.tmp")
+            self._exec_or_raise(
+                _assemble_script(parts, remote_path, tmp), _UNPACK_TIMEOUT,
+                f"joining {len(parts)} uploaded part(s) into {remote_path}",
+            )
+        except _ExecFailed as e:
+            if e.exit_code != _ARCHIVE_LEFT_EXIT:
+                raise
+            # The file is in place; only its parts could not be removed.
+            # Empty them so they hold no file data (as for an archive).
+            logger.warning("%s; emptying the parts instead", e)
+            for part in parts:
+                self._with_auth_retry(
+                    lambda: (self._fs / part).write_bytes(b"", mode=0o600, mkdir_parents=True))
+        except BaseException:
+            self._remove_parts_quietly(parts)
+            raise
+
+    def _remove_parts_quietly(self, parts: list[str]) -> None:
+        """Best-effort removal of chunk parts after a failed upload."""
+        if not parts:
+            return
+        rm = "rm -f -- " + " ".join(shlex.quote(p) for p in parts)
+        try:
+            self._exec_or_raise(
+                f"{rm} 2>/dev/null || sudo -n {rm}", _DELETE_TIMEOUT,
+                f"removing {len(parts)} uploaded part(s)")
+        except Exception as e:  # the sweep in a later sync gets them
+            logger.debug("Sprites: could not remove upload parts: %s", e)
 
     def _sprite_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         """Upload changed files as archives: per archive, one ``fs/write`` of a
@@ -1327,10 +1398,13 @@ class SpritesEnvironment(BaseEnvironment):
         cannot delete a root-owned file), it is overwritten with nothing and
         this environment stops using archives, so they do not pile up.
 
-        No write is larger than ``_SYNC_WRITE_MAX_BYTES``; files too large
-        for it are already left out by ``_within_write_limit``.
+        No write is larger than ``_SYNC_WRITE_MAX_BYTES``. A file too large
+        for an archive of its own is sent in chunks and joined on the Sprite
+        (``_sprite_upload_chunked``), on this path and the one-by-one path
+        alike. Every file passed in is written, or this raises.
         """
-        for batch in _archive_batches(files):
+        batches, chunked = _archive_batches(files)
+        for batch in batches:
             if not self._use_archives:
                 for host_path, remote_path in batch:
                     self._sprite_upload(host_path, remote_path)
@@ -1342,8 +1416,10 @@ class SpritesEnvironment(BaseEnvironment):
                 f".sync-{uuid.uuid4().hex}.tar")
             payload = _build_archive(batch)
             if len(payload) > _SYNC_WRITE_MAX_BYTES:
-                # Not reachable from the staged copies FileSyncManager passes
-                # in; a guard so a write the Sprite refuses is never sent.
+                # A file grew between being measured and being read (the
+                # staged copies FileSyncManager passes in do not). Fail the
+                # sync rather than send a write the Sprite refuses or skip
+                # a file the manager would then record as synced.
                 raise RuntimeError(
                     f"Sprites: sync archive is {len(payload)} bytes, over the "
                     f"{_SYNC_WRITE_MAX_BYTES}-byte upload limit")
@@ -1366,6 +1442,8 @@ class SpritesEnvironment(BaseEnvironment):
                             b"", mode=0o600, mkdir_parents=True))
                 for host_path, remote_path in batch:
                     self._sprite_upload(host_path, remote_path)
+        for host_path, remote_path in chunked:
+            self._sprite_upload_chunked(host_path, remote_path)
 
     def _exec_or_raise(self, script: str, timeout: float, what: str) -> None:
         """Run ``script`` with ``sh -c``; a non-zero exit raises ``_ExecFailed``."""

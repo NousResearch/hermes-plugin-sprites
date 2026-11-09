@@ -178,18 +178,23 @@ caches copied into `~/.hermes` on the Sprite before each command) therefore:
   land with mode `0644`, as a single `fs/write` sets. If the unpack fails (no
   `tar`, a non-root user without working sudo), that batch is sent one
   `fs/write` per file; if the archive cannot be removed, it is emptied and the
-  session sends files one by one from then on. Archives left by a sync whose
-  unpack never ran are removed by a later sync after 30 minutes.
+  session sends files one by one from then on (large files still in
+  chunks). Archives left by a sync whose unpack never ran are removed by a
+  later sync after 30 minutes.
   Each `fs/write` and exec counts against the per-Sprite request rate limit
   (300 per minute), and the skills tree alone is a few hundred files, so one
   request per file left every sync cut off by HTTP 429 and resent in full.
   No upload is larger than 4 MiB, tar headers included: the Sprites docs cap
   one `fs/write` at 16 MiB (413 `file_too_large` above it), and in practice a
   5 MiB write has come back 502 while 4.75 MiB and below succeed. More data
-  goes in more archives. A single file too large for that limit is left out
-  of the sync, and a copy synced earlier is removed from the Sprite; a
-  warning names its remote path and size once per process, and the file is
-  synced again once it is back under the limit;
+  goes in more archives. A file too large for an archive of its own (an
+  image, an attachment, generated media) is sent in chunks of at most 4 MiB,
+  each one `fs/write` to a root-only part file in `~/.hermes/.sync-staging`,
+  then one exec joins them into a temp file beside the destination and
+  renames it into place (the API has no append), retried with `sudo -n`, and
+  removes the parts. A failed chunk or join fails the sync, which is retried
+  in full before the next command; parts left by a sync that never finished
+  are removed with stale archives;
 - deletes files that disappeared on the host with one exec per batch,
   `rm -f -- <paths>`, retried as `sudo -n rm -f -- <paths>` because `fs/write`
   creates root-owned files while the base image runs commands as `sprite`. A

@@ -1777,6 +1777,13 @@ class _UploadRefused(RuntimeError):
             self.retry_after_ms = retry_after_ms
 
 
+def _tag_failing(init, failing_ids):
+    def tagged(self, *args, **kwargs):
+        failing_ids.add(id(self))  # before the forced sync in __init__
+        init(self, *args, **kwargs)
+    return tagged
+
+
 class TestSyncRetryBackoff:
     """A failing upload is retried after a growing delay, not before every command."""
 
@@ -1950,6 +1957,57 @@ class TestSyncRetryBackoff:
         assert rig.attempts[name] == 2
         assert rig.remote == {rig.remote_path: b"v2", late_remote: b"late"}
         assert set(env._sync_manager._synced_files) == {rig.remote_path, late_remote}
+
+    def test_no_op_in_another_environment_keeps_the_backoff(self, rig, monkeypatch):
+        import sprites_environment as se
+
+        clean = rig.build(task="a")  # nothing pending after this
+        failing_ids = set()
+        plain_upload = se.SpritesEnvironment._sprite_bulk_upload
+
+        def _bulk_upload(self, files):
+            if id(self) in failing_ids:
+                name = self._sprite_name
+                rig.attempts[name] = rig.attempts.get(name, 0) + 1
+                raise _UploadRefused()
+            return plain_upload(self, files)
+
+        monkeypatch.setattr(se.SpritesEnvironment, "_sprite_bulk_upload", _bulk_upload)
+        # The second environment of the Sprite has its own synced state, so
+        # it still has everything to upload; its uploads keep failing.
+        monkeypatch.setattr(se.SpritesEnvironment, "__init__", _tag_failing(
+            se.SpritesEnvironment.__init__, failing_ids))
+        failing = rig.build(task="b")
+        name = failing._sprite_name
+        assert clean._sprite_name == name
+        attempts_at = [rig.clock.now]  # its forced sync at creation failed
+        seen = rig.attempts[name]
+        while rig.clock.now < 1000.0 + 1300.0:
+            rig.clock.now += 1.0
+            clean._before_execute()  # a no-op once core's interval passes
+            failing._before_execute()
+            if rig.attempts[name] != seen:
+                seen = rig.attempts[name]
+                attempts_at.append(rig.clock.now)
+        gaps = [b - a for a, b in zip(attempts_at, attempts_at[1:])]
+        assert gaps[:8] == [5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 300.0, 300.0]
+
+    def test_backoff_survives_a_thousand_failures(self, rig):
+        import sprites_environment as se
+
+        rig.fail = _UploadRefused()
+        env = rig.build()
+        backoff = env._sync_manager._backoff
+        for _ in range(1100):
+            rig.clock.now = backoff.deadline
+            env._before_execute()  # must not raise: the command still runs
+        name = env._sprite_name
+        assert rig.attempts[name] == 1101
+        assert backoff.failures == 1101
+        assert backoff.deadline - rig.clock.now == se._SYNC_BACKOFF_MAX
+        rig.clock.now += 1.0
+        env._before_execute()  # skipped, still no error
+        assert rig.attempts[name] == 1101
 
     def test_sync_skipped_by_core_interval_is_not_a_failure(self, rig):
         env = rig.build()  # succeeds at t=1000

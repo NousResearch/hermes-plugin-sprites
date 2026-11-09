@@ -40,7 +40,6 @@ restart. Unset, ``SPRITES_TOKEN`` / ``SPRITE_TOKEN`` are read as before (see
 import hashlib
 import io
 import logging
-import math
 import os
 import posixpath
 import re
@@ -586,9 +585,6 @@ _SYNC_BACKOFF_MAX = 300.0
 #: Upper bound on a server retry hint, so a malformed value cannot stop
 #: syncing for the rest of the process.
 _SYNC_RETRY_HINT_MAX = 3600.0
-#: Put in ``FileSyncManager._last_sync_time`` when a sync cycle starts; core
-#: replaces it with a real time only if the cycle succeeds.
-_SYNC_STARTED = float("nan")
 #: Hermes core's switch that forces every sync (``HERMES_FORCE_FILE_SYNC``).
 _FORCE_SYNC_ENV = getattr(_file_sync_module, "_FORCE_SYNC_ENV", "HERMES_FORCE_FILE_SYNC")
 
@@ -602,6 +598,7 @@ class _SyncBackoff:
     def __init__(self, sprite_name: str):
         self.sprite_name = sprite_name
         self.failures = 0
+        self.delay = 0.0  # current backoff step, before any server hint
         self.deadline = 0.0  # monotonic; no backoff while now >= deadline
 
     def active(self) -> bool:
@@ -609,7 +606,11 @@ class _SyncBackoff:
 
     def failed(self, exc: BaseException | None) -> None:
         self.failures += 1
-        delay = min(_SYNC_BACKOFF_BASE * 2 ** (self.failures - 1), _SYNC_BACKOFF_MAX)
+        # Double the stored step rather than computing BASE * 2 ** failures:
+        # that power overflows a float after about a thousand failures.
+        self.delay = (_SYNC_BACKOFF_BASE if self.delay <= 0
+                      else min(self.delay * 2, _SYNC_BACKOFF_MAX))
+        delay = self.delay
         hint = _retry_hint_seconds(exc)
         if hint is not None:
             delay = max(delay, hint)
@@ -621,6 +622,7 @@ class _SyncBackoff:
 
     def succeeded(self) -> None:
         self.failures = 0
+        self.delay = 0.0
         self.deadline = 0.0
 
 
@@ -677,39 +679,44 @@ class _SharedSpriteSyncManager(FileSyncManager):
     times a minute. Until the backoff deadline passes, non-forced syncs of
     every environment of the Sprite are skipped (the command still runs);
     nothing is committed, so the next attempt uploads everything pending.
-    Forced syncs always run, and any success clears the backoff.
+    Forced syncs always run.
+
+    Core swallows sync errors, so the outcome is read from the transport
+    callables handed to core, which are wrapped here: a cycle in which a
+    transport call raised is a failure; a cycle in which transport calls were
+    made and none raised (core then commits) is a success and clears the
+    backoff. A cycle that made no transport call leaves the backoff as it
+    is: that covers core's interval skip, a no-op with nothing pending (which
+    says nothing about this Sprite's uploads, since every environment keeps
+    its own synced state), and a local planning or staging failure (such as
+    a file removed between listing and copying). Those local failures never
+    reach the Sprite, are usually gone on the next listing, and fail before
+    the upload archive is built, so they are left to core's normal retry.
     """
 
     def __init__(self, *args, shared_lock: threading.Lock,
                  backoff: _SyncBackoff | None = None, **kwargs):
-        # Core swallows sync errors, so watch the callables it is given: the
-        # file listing marks that a sync cycle actually started, and the
-        # transport records the error that ended it.
+        # Record, per sync attempt, whether core reached the transport and
+        # whether a transport call raised (see the class docstring).
         self._attempt = threading.local()
-        for key in ("get_files_fn", "upload_fn", "bulk_upload_fn", "delete_fn"):
+        for key in ("upload_fn", "bulk_upload_fn", "delete_fn"):
             if kwargs.get(key) is not None:
-                kwargs[key] = self._watch(kwargs[key], started=key == "get_files_fn")
+                kwargs[key] = self._watch(kwargs[key])
         super().__init__(*args, **kwargs)
         self._shared_lock = shared_lock
         self._backoff = backoff or _SyncBackoff("?")
 
-    def _watch(self, fn, *, started: bool):
+    def _watch(self, fn):
         attempt = self._attempt
 
         def watched(*args, **kwargs):
-            active = getattr(attempt, "active", False)
-            if active and started:
-                # Core lists the files only once it has decided to run a
-                # cycle. Mark its sync clock here: core writes a real time
-                # there when the cycle succeeds (or finds nothing to do) and
-                # leaves it alone when the cycle fails and rolls back.
-                attempt.started = True
-                self._last_sync_time = _SYNC_STARTED
+            if not getattr(attempt, "active", False):
+                return fn(*args, **kwargs)
+            attempt.called = True
             try:
                 return fn(*args, **kwargs)
             except Exception as exc:
-                if active:
-                    attempt.error = exc
+                attempt.error = attempt.error or exc
                 raise
 
         return watched
@@ -722,21 +729,19 @@ class _SharedSpriteSyncManager(FileSyncManager):
                              self._backoff.sprite_name)
                 return
             attempt = self._attempt
-            attempt.active, attempt.started, attempt.error = True, False, None
-            synced_at = self._last_sync_time
+            attempt.active, attempt.called, attempt.error = True, False, None
             try:
                 super().sync(force=force)
             except Exception as exc:
-                attempt.error = attempt.error or exc
+                if attempt.called:
+                    attempt.error = attempt.error or exc
                 raise
             finally:
                 attempt.active = False
-                if attempt.started:
-                    if math.isnan(self._last_sync_time):
-                        self._last_sync_time = synced_at  # what core would have kept
-                        self._backoff.failed(attempt.error)
-                    else:
-                        self._backoff.succeeded()
+                if attempt.error is not None:
+                    self._backoff.failed(attempt.error)
+                elif attempt.called:
+                    self._backoff.succeeded()
 
 
 def _collapse_slug(value: str) -> str:

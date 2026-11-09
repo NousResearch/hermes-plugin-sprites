@@ -410,6 +410,21 @@ _DELETE_TIMEOUT = 60.0
 #: Client wait for the exec that unpacks a sync archive.
 _UNPACK_TIMEOUT = 120.0
 
+#: Client wait for the exec that joins a chunked upload: ``_UNPACK_TIMEOUT``
+#: (what one archive of up to 4 MiB gets) plus one second per MiB joined.
+#: The join reads and writes the file once (twice when it is retried
+#: through ``sudo -n``), so this allows for a disk far slower than 1 MiB/s.
+#: Capped at 600 s, the longest exec the Sprites 2 docs allow ("Exec":
+#: ``timeout_ms`` "at most 600000 (10 minutes)").
+_JOIN_TIMEOUT_PER_MIB = 1.0
+_JOIN_TIMEOUT_MAX = 600.0
+
+
+def _join_timeout(size: int) -> float:
+    """Client wait for joining a chunked upload of ``size`` bytes."""
+    mib = -(-size // (1024 * 1024))
+    return min(_JOIN_TIMEOUT_MAX, _UNPACK_TIMEOUT + _JOIN_TIMEOUT_PER_MIB * mib)
+
 #: Largest body one sync ``fs/write`` sends: a whole tar archive (headers,
 #: padding and end-of-archive blocks included), or one file in the
 #: one-by-one fallback. The Sprites 2 docs cap a write at 16 MiB ("Files":
@@ -859,25 +874,40 @@ def _build_archive(files: list[tuple[str, str]]) -> bytes:
     return buf.getvalue()
 
 
-#: Archives older than this are taken to be leftovers of a sync whose unpack
-#: never ran (transport failure, killed process). Best effort: well past
-#: ``_UNPACK_TIMEOUT``, but a sync stalled for longer between its upload and
-#: its unpack can lose its archive; its unpack then fails and the batch is
-#: sent file by file.
-_STALE_ARCHIVE_MINUTES = 30
+#: Archives and upload directories not modified for this long are taken to
+#: be leftovers of a sync that never finished (transport failure, killed
+#: process) and are removed by a later sync's sweep.
+#:
+#: A chunked upload modifies its directory with every part it writes (each
+#: part is a new entry) and touches it again when the join starts, so it is
+#: only ever idle for the longest of: one part write, or the join. The join
+#: is abandoned by the client after at most ``_JOIN_TIMEOUT_MAX`` (600 s).
+#: One part write is one ``fs/write`` of at most ``_SYNC_WRITE_MAX_BYTES``
+#: (4 MiB), retried at most once after a 401: observed writes of that size
+#: finish in seconds (a failing 5 MiB one took 8.2 s), and for two of them
+#: to take two hours the link would have to carry under 1.2 KB/s without
+#: ever stalling for the HTTP client's timeout. The whole upload may take
+#: longer than this, which is fine: what is compared is the directory's
+#: idle time, not its age. An archive is idle only between its write and its
+#: unpack (``_UNPACK_TIMEOUT``). A sync stalled for longer than this loses
+#: its staging; its join or unpack then fails and the sync is retried.
+_STALE_SYNC_MINUTES = 120
 
 #: Exit status of the unpack script when the archive could not be removed.
 _ARCHIVE_LEFT_EXIT = 86
 
 
 def _sweep_script(staging_dir: str) -> str:
-    """Remove archives and chunk parts in ``staging_dir`` left behind by
-    earlier syncs that never finished (only names this plugin makes)."""
+    """Remove archives and chunked-upload directories in ``staging_dir``
+    left behind by earlier syncs that never finished (only names this plugin
+    makes). An upload directory goes as a whole, parts and temp output
+    alike, and only once the directory itself has been idle for
+    ``_STALE_SYNC_MINUTES``, so an upload still in flight is never touched."""
     staging = shlex.quote(staging_dir)
     return (
-        f"find {staging} -maxdepth 1 "
-        f"\\( -name '.sync-*.tar' -o -name '.sync-*.part' \\) "
-        f"-mmin +{_STALE_ARCHIVE_MINUTES} -exec rm -f -- {{}} +"
+        f"find {staging} -mindepth 1 -maxdepth 1 "
+        f"\\( -type f -name '.sync-*.tar' -o -type d -name '.sync-*.d' \\) "
+        f"-mmin +{_STALE_SYNC_MINUTES} -exec rm -rf -- {{}} +"
     )
 
 
@@ -903,38 +933,56 @@ def _unpack_script(archive_path: str) -> str:
     )
 
 
-def _assemble_script(parts: list[str], remote_path: str, tmp_path: str) -> str:
-    """Join chunk ``parts`` into ``remote_path``, then remove the parts.
+#: Joins the parts of a chunked upload; run as ``sh -c J sh DIR DEST N``.
+#: Refuses an incomplete upload (fewer than N parts) and a destination that
+#: is a directory or a symlink to one (``[ -d ]`` follows symlinks; ``mv
+#: -T`` also refuses a real directory that appears in between). A symlink to
+#: a file is replaced by the file, as a single ``fs/write`` would.
+_JOIN_BODY = (
+    'c=0; for p in "$1"/[0-9]*; do [ -f "$p" ] && c=$((c+1)); done; '
+    '[ "$c" -eq "$3" ] || { echo "upload has $c of $3 parts" >&2; exit 65; }; '
+    '[ ! -d "$2" ] || { echo "$2 is a directory" >&2; exit 66; }; '
+    'p=${2%/*}; mkdir -p -- "${p:-/}" && '
+    'cat -- "$1"/[0-9]* > "$1/out" && '
+    'chmod 0644 -- "$1/out" && mv -fT -- "$1/out" "$2"'
+)
+
+
+def _assemble_script(upload_dir: str, remote_path: str, part_count: int) -> str:
+    """Join the ``part_count`` parts in ``upload_dir`` into ``remote_path``,
+    then remove ``upload_dir``.
 
     The Sprites 2 docs offer no append or partial write ("Files": one
     ``PUT fs/write`` per file, at most 16 MiB), so a file larger than one
-    write arrives as several part files and is joined here. The parts are
-    concatenated into ``tmp_path`` (next to the destination, so the rename
-    stays on one filesystem), set to 0644 like a single ``fs/write``, and
-    renamed over the destination atomically: a reader sees the old file or
-    the new one, never a partial one. The parts are root-owned 0600
-    ``fs/write`` files, so a non-root exec user retries through ``sudo -n``
-    as ``_unpack_script`` does. On failure the temp file is removed and the
-    script exits non-zero; the parts are removed either way, and
-    ``_ARCHIVE_LEFT_EXIT`` reports a join that worked but left its parts.
-    Stale archives and parts from earlier syncs are swept as well.
+    write arrives as numbered part files (``00000``, ``00001``, ...) in its
+    own directory and is joined here. The command has the same length
+    whatever the number of parts: the parts are found by a glob (the
+    zero-padded names sort in order in any locale) and counted against
+    ``part_count``, and the cleanup is one ``rm -rf``. The parts are
+    concatenated into ``out`` inside ``upload_dir``, set to 0644 like a
+    single ``fs/write``, and renamed over the destination with ``mv -fT``
+    (GNU coreutils, which the Sprites base image ships as ``mv``). Sync
+    destinations are under ``~/.hermes`` like the staging directory, so the
+    rename stays on one filesystem: a reader sees the old file or the new
+    one, never a partial one. Nothing
+    is written next to the destination, so a join cut short leaves nothing
+    there; ``out`` goes with the directory, by this script or a later
+    sweep. The directory is touched first so the sweep sees it as live.
+
+    The parts are root-owned 0600 ``fs/write`` files, so a non-root exec
+    user retries through ``sudo -n`` as ``_unpack_script`` does. Exits
+    non-zero if the join fails (the destination is left as it was), and
+    ``_ARCHIVE_LEFT_EXIT`` if the join worked but ``upload_dir`` could not
+    be removed. Stale archives and upload directories are swept as well.
     """
-    q_parts = " ".join(shlex.quote(p) for p in parts)
-    q_tmp = shlex.quote(tmp_path)
-    q_dest = shlex.quote(remote_path)
-    q_dir = shlex.quote(posixpath.dirname(remote_path) or "/")
-    join = (
-        f"mkdir -p -- {q_dir} && cat -- {q_parts} > {q_tmp} && "
-        f"chmod 0644 -- {q_tmp} && mv -f -- {q_tmp} {q_dest}"
-    )
-    rm_tmp = f"rm -f -- {q_tmp}"
-    rm_parts = f"rm -f -- {q_parts}"
-    sweep = _sweep_script(posixpath.dirname(parts[0]))
+    args = " ".join(shlex.quote(a) for a in (upload_dir, remote_path, str(part_count)))
+    sweep = _sweep_script(posixpath.dirname(upload_dir))
     return (
-        f"{{ {join}; }} || {{ {rm_tmp} 2>/dev/null; sudo -n sh -c {shlex.quote(join)}; }}; "
-        f"rc=$?; "
-        f"if [ $rc -ne 0 ]; then {{ {rm_tmp} || sudo -n {rm_tmp}; }} >/dev/null 2>&1; fi; "
-        f"{rm_parts} 2>/dev/null || sudo -n {rm_parts} 2>/dev/null "
+        f"set -- {args}; J={shlex.quote(_JOIN_BODY)}; "
+        f'{{ touch -- "$1" || sudo -n touch -- "$1"; }} >/dev/null 2>&1; '
+        f'sh -c "$J" sh "$@" || {{ rm -f -- "$1/out" 2>/dev/null; '
+        f'sudo -n sh -c "$J" sh "$@"; }}; rc=$?; '
+        f'rm -rf -- "$1" 2>/dev/null || sudo -n rm -rf -- "$1" 2>/dev/null '
         f"|| {{ [ $rc -ne 0 ] || rc={_ARCHIVE_LEFT_EXIT}; }}; "
         f"{{ {sweep} || sudo -n {sweep}; }} >/dev/null 2>&1; "
         f"exit $rc"
@@ -1321,40 +1369,43 @@ class SpritesEnvironment(BaseEnvironment):
 
         Each chunk of at most ``_SYNC_WRITE_MAX_BYTES`` is read from the
         file as it is sent, so at most one chunk is held in memory, and goes
-        in one ``fs/write`` to its own part file (root-only, mode 0600, like
-        an archive) in ``~/.hermes/.sync-staging``. The file is read to its
+        in one ``fs/write`` to its own numbered part file (root-only, mode
+        0600, like an archive) in a directory of its own,
+        ``~/.hermes/.sync-staging/.sync-<random>.d``. The file is read to its
         end, so all of it is sent whatever its size. Any failure raises, so
-        ``FileSyncManager`` rolls back and retries; parts already written are
-        removed on a best-effort basis, and otherwise by a later sync's sweep.
+        ``FileSyncManager`` rolls back and retries; the directory is removed
+        on a best-effort basis, and otherwise by a later sync's sweep.
         """
-        token = uuid.uuid4().hex
-        staging = posixpath.join(self._remote_home, ".hermes", ".sync-staging")
+        upload_dir = posixpath.join(
+            self._remote_home, ".hermes", ".sync-staging",
+            f".sync-{uuid.uuid4().hex}.d")
         parts: list[str] = []
+        size = 0
         try:
             with open(host_path, "rb") as f:
                 while True:
                     chunk = f.read(_SYNC_WRITE_MAX_BYTES)
                     if not chunk and parts:
                         break
-                    part = posixpath.join(staging, f".sync-{token}-{len(parts):05d}.part")
+                    part = posixpath.join(upload_dir, f"{len(parts):05d}")
                     parts.append(part)
                     self._with_auth_retry(
                         lambda: (self._fs / part).write_bytes(
                             chunk, mode=0o600, mkdir_parents=True)
                     )
+                    size += len(chunk)
                     last = len(chunk) < _SYNC_WRITE_MAX_BYTES
                     del chunk  # drop it before reading the next one
                     if last:
                         break
-            tmp = posixpath.join(
-                posixpath.dirname(remote_path) or "/", f".sync-{token}.tmp")
             self._exec_or_raise(
-                _assemble_script(parts, remote_path, tmp), _UNPACK_TIMEOUT,
+                _assemble_script(upload_dir, remote_path, len(parts)),
+                _join_timeout(size),
                 f"joining {len(parts)} uploaded part(s) into {remote_path}",
             )
         except _ExecFailed as e:
             if e.exit_code != _ARCHIVE_LEFT_EXIT:
-                raise
+                raise  # the join script removed the directory itself
             # The file is in place; only its parts could not be removed.
             # Empty them so they hold no file data (as for an archive).
             logger.warning("%s; emptying the parts instead", e)
@@ -1362,20 +1413,18 @@ class SpritesEnvironment(BaseEnvironment):
                 self._with_auth_retry(
                     lambda: (self._fs / part).write_bytes(b"", mode=0o600, mkdir_parents=True))
         except BaseException:
-            self._remove_parts_quietly(parts)
+            self._remove_upload_dir_quietly(upload_dir)
             raise
 
-    def _remove_parts_quietly(self, parts: list[str]) -> None:
-        """Best-effort removal of chunk parts after a failed upload."""
-        if not parts:
-            return
-        rm = "rm -f -- " + " ".join(shlex.quote(p) for p in parts)
+    def _remove_upload_dir_quietly(self, upload_dir: str) -> None:
+        """Best-effort removal of a chunked upload's directory after a failure."""
+        rm = f"rm -rf -- {shlex.quote(upload_dir)}"
         try:
             self._exec_or_raise(
                 f"{rm} 2>/dev/null || sudo -n {rm}", _DELETE_TIMEOUT,
-                f"removing {len(parts)} uploaded part(s)")
-        except Exception as e:  # the sweep in a later sync gets them
-            logger.debug("Sprites: could not remove upload parts: %s", e)
+                "removing an unfinished chunked upload")
+        except Exception as e:  # the sweep in a later sync gets it
+            logger.debug("Sprites: could not remove upload directory: %s", e)
 
     def _sprite_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         """Upload changed files as archives: per archive, one ``fs/write`` of a

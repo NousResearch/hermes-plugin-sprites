@@ -906,6 +906,12 @@ class TestFileSyncPush:
         ], "upload must not touch parent/mkdir/stat/exists"
 
 
+def _is_part(path: str) -> bool:
+    """A chunk part: ``.sync-staging/.sync-<hex>.d/NNNNN``."""
+    import re
+    return re.search(r"/\.sync-staging/\.sync-[0-9a-f]+\.d/\d{5}$", path) is not None
+
+
 class _RateLimitedSprite:
     """Sprite double that counts requests against a per-Sprite limit.
 
@@ -951,14 +957,14 @@ class _RateLimitedSprite:
                 sprite._count()
                 if sprite.fail_file_writes and ".sync-staging" not in self.path:
                     raise RuntimeError("fs/write failed")
-                if self.path.endswith(".part"):
+                if _is_part(self.path):
                     index = sprite.part_writes
                     sprite.part_writes += 1
                     if index == sprite.fail_part_write:
                         raise RuntimeError("HTTP 502")
                 sprite.writes[self.path] = data
                 sprite.modes[self.path] = mode
-                if self.path.endswith(".part"):
+                if _is_part(self.path):
                     sprite._parts[self.path] = data
 
         class _Fs:
@@ -981,24 +987,23 @@ class _RateLimitedSprite:
                 return b"/home/sprite\n"
             sprite._count()
             sprite.scripts.append(script)
-            if "cat -- " in script:
-                # cat -- PARTS > TMP && chmod 0644 -- TMP && mv -f -- TMP DEST
-                lex = shlex.shlex(script, posix=True, punctuation_chars=True)
-                lex.whitespace_split = True
-                toks = list(lex)
-                i = toks.index("cat") + 2
-                parts = toks[i:toks.index(">", i)]
-                m = toks.index("mv")
-                dest = toks[m + 4]
+            if script.startswith("set -- "):
+                # set -- DIR DEST N; ... joins DIR/[0-9]* into DEST, rm -rf DIR
+                upload_dir, dest, count = shlex.split(script.split(";", 1)[0])[2:]
+                parts = sorted(p for p in sprite._parts if p.startswith(upload_dir + "/"))
                 sprite.assembles += 1
+                data = b"".join(sprite._parts[p] for p in parts)
                 for part in parts:
                     sprite.writes.pop(part, None)
+                    del sprite._parts[part]
                 if sprite.assemble_exit:
                     raise _ExitError("exit", sprite.assemble_exit, b"cat: No such file\n")
-                sprite.files[dest] = b"".join(sprite._parts[p] for p in parts)
+                assert len(parts) == int(count)
+                sprite.files[dest] = data
                 return b""
-            if script.startswith("rm -f -- ") and ".part" in script:
-                for path in shlex.split(script.split(" 2>", 1)[0])[3:]:
+            if script.startswith("rm -rf -- ") and ".sync-staging/" in script:
+                upload_dir = shlex.split(script.split(" 2>", 1)[0])[3]
+                for path in [p for p in sprite.writes if p.startswith(upload_dir + "/")]:
                     sprite.writes.pop(path, None)
                 return b""
             if "tar -xf" in script:
@@ -1369,7 +1374,7 @@ class TestSyncUnderWriteLimit:
 
     @staticmethod
     def _parts(writes):
-        return [(p, n) for p, n in writes if p.endswith(".part")]
+        return [(p, n) for p, n in writes if _is_part(p)]
 
     @pytest.mark.parametrize("size", [int(4.25 * 1024 * 1024), 20 * 1024 * 1024])
     def test_large_file_reaches_the_sprite_in_chunks(
@@ -1399,6 +1404,7 @@ class TestSyncUnderWriteLimit:
             assert path.startswith("/home/sprite/.hermes/.sync-staging/.sync-")
             assert sprite.modes[path] == 0o600
         assert len({p for p, _ in parts}) == len(parts), "each part is its own file"
+        assert len({p.rsplit("/", 1)[0] for p, _ in parts}) == 1, "one directory per upload"
         assert sprite.writes == {}, "the parts are consumed"
         assert remote in env._sync_manager._synced_files
 
@@ -1445,7 +1451,7 @@ class TestSyncUnderWriteLimit:
 
         assert big_remote not in sprite.files
         assert env._sync_manager._synced_files == {}, "the whole sync rolled back"
-        assert not [p for p in sprite.writes if p.endswith(".part")], (
+        assert not [p for p in sprite.writes if _is_part(p)], (
             "parts already written are cleaned up")
 
         sprite.fail_part_write = None
@@ -1604,60 +1610,236 @@ class TestSyncUnderWriteLimit:
         assert sum(sent) == big.stat().st_size
         assert peak < 2.5 * se._SYNC_WRITE_MAX_BYTES, peak
 
+    def test_join_timeout_grows_with_size_up_to_the_exec_maximum(self):
+        import sprites_environment as se
+
+        small = se._join_timeout(5 * 1024 * 1024)
+        large = se._join_timeout(200 * 1024 * 1024)
+        assert se._UNPACK_TIMEOUT < small < large < se._JOIN_TIMEOUT_MAX
+        assert se._join_timeout(10 * 1024 ** 3) == 600.0, "the docs' exec maximum"
+
+    def test_join_exec_gets_the_size_aware_timeout(self, make_env, tmp_path):
+        import sprites_environment as se
+
+        env = make_env(task_id="join-timeout")
+        env._fs = MagicMock()
+        timeouts = []
+        env._exec_or_raise = lambda script, timeout, what: timeouts.append(timeout)
+        big = tmp_path / "big"
+        big.write_bytes(b"x" * (40 * 1024 * 1024))
+        env._sprite_upload(str(big), "/home/sprite/.hermes/big")
+        assert timeouts == [se._join_timeout(40 * 1024 * 1024)]
+
+    def test_assemble_script_length_does_not_grow_with_parts(self):
+        from sprites_environment import _assemble_script
+
+        d = "/home/sprite/.hermes/.sync-staging/.sync-" + "a" * 32 + ".d"
+        one = _assemble_script(d, "/home/sprite/.hermes/cache/x.bin", 1)
+        many = _assemble_script(d, "/home/sprite/.hermes/cache/x.bin", 512)
+        assert len(many) - len(one) == 2  # only the digits of the count
+        assert len(many) < 4096
+
+    @staticmethod
+    def _join_bin(tmp_path, sudo_ok=False):
+        """Real sh and coreutils; sudo either refuses or runs the command."""
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        for tool in ("sh", "cat", "chmod", "mv", "rm", "mkdir", "find", "touch"):
+            if shutil.which(tool) is None:
+                pytest.skip(f"{tool} not available")
+            (bindir / tool).symlink_to(shutil.which(tool))
+        body = 'shift; exec "$@"\n' if sudo_ok else "exit 1\n"
+        (bindir / "sudo").write_text("#!/bin/sh\n" + body)
+        (bindir / "sudo").chmod(0o755)
+        return bindir
+
+    @staticmethod
+    def _upload_dir(tmp_path, chunks, name="abc"):
+        staging = tmp_path / "it's staging"
+        staging.mkdir(exist_ok=True)
+        upload = staging / f".sync-{name}.d"
+        upload.mkdir()
+        for i, chunk in enumerate(chunks):
+            part = upload / f"{i:05d}"
+            part.write_bytes(chunk)
+            part.chmod(0o600)
+        return staging, upload
+
+    @staticmethod
+    def _run_join(bindir, upload, dest, count):
+        import subprocess
+
+        from sprites_environment import _assemble_script
+
+        return subprocess.run(
+            [shutil.which("sh"), "-c", _assemble_script(str(upload), str(dest), count)],
+            env={**os.environ, "PATH": str(bindir)}, check=False,
+            capture_output=True).returncode
+
     @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
     @pytest.mark.parametrize("ok", [True, False])
     def test_assemble_script(self, tmp_path, ok):
         """Real sh, cat, chmod, mv and find; sudo always refused."""
         import stat
-        import subprocess
 
-        from sprites_environment import _assemble_script
-
-        bindir = tmp_path / "bin"
-        bindir.mkdir()
-        for tool in ("cat", "chmod", "mv", "rm", "mkdir", "find"):
-            if shutil.which(tool) is None:
-                pytest.skip(f"{tool} not available")
-            (bindir / tool).symlink_to(shutil.which(tool))
-        (bindir / "sudo").write_text("#!/bin/sh\nexit 1\n")
-        (bindir / "sudo").chmod(0o755)
-
-        staging = tmp_path / "it's staging"
-        staging.mkdir()
-        parts = []
-        for i, chunk in enumerate([b"first ", b"second ", b"third"]):
-            part = staging / f".sync-abc-{i:05d}.part"
-            part.write_bytes(chunk)
-            part.chmod(0o600)
-            parts.append(str(part))
-        stale = staging / ".sync-old-00000.part"
-        stale.write_bytes(b"old secret")
-        os.utime(stale, (0, 0))
-        other = staging / "not-ours.part"
-        other.write_bytes(b"keep")
+        bindir = self._join_bin(tmp_path)
+        staging, upload = self._upload_dir(tmp_path, [b"first ", b"second ", b"third"])
+        stale_dir = staging / ".sync-old.d"
+        stale_dir.mkdir()
+        (stale_dir / "00000").write_bytes(b"old secret")
+        os.utime(stale_dir, (0, 0))
+        stale_tar = staging / ".sync-old.tar"
+        stale_tar.write_bytes(b"old secret")
+        os.utime(stale_tar, (0, 0))
+        other = staging / "not-ours.d"
+        other.mkdir()
         os.utime(other, (0, 0))
         dest_dir = tmp_path / "dest dir"
         dest_dir.mkdir()
         dest = dest_dir / "file.bin"
         dest.write_bytes(b"old")
         if not ok:
-            Path(parts[1]).unlink()
+            (upload / "00001").unlink()
 
-        rc = subprocess.run(
-            [shutil.which("sh"), "-c", _assemble_script(
-                parts, str(dest), str(dest_dir / ".sync-abc.tmp"))],
-            env={**os.environ, "PATH": str(bindir)}, check=False).returncode
+        rc = self._run_join(bindir, upload, dest, 3)
         if ok:
             assert rc == 0
             assert dest.read_bytes() == b"first second third"
             assert stat.S_IMODE(dest.stat().st_mode) == 0o644
         else:
-            assert rc != 0
+            assert rc != 0, "a missing part is caught by the count"
             assert dest.read_bytes() == b"old", "a failed join leaves the old file"
-        assert sorted(p.name for p in dest_dir.iterdir()) == ["file.bin"], "no temp left"
-        assert not any(Path(p).exists() for p in parts), "parts removed either way"
-        assert not stale.exists(), "a stale part from an earlier sync is swept"
+        assert sorted(p.name for p in dest_dir.iterdir()) == ["file.bin"], (
+            "nothing is written next to the destination")
+        assert not upload.exists(), "the upload directory is removed either way"
+        assert not stale_dir.exists(), "a stale upload from an earlier sync is swept"
+        assert not stale_tar.exists(), "a stale archive is swept"
         assert other.exists(), "the sweep only matches names this plugin makes"
+
+    @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+    def test_join_cut_short_after_writing_leaves_nothing_beside_the_destination(
+        self, tmp_path
+    ):
+        """The join fails after its temp output is written (chmod refused):
+        the destination is untouched, nothing is left next to it, and the
+        temp output goes with the upload directory."""
+        bindir = self._join_bin(tmp_path)
+        (bindir / "chmod").unlink()
+        (bindir / "chmod").write_text("#!/bin/sh\nexit 1\n")
+        (bindir / "chmod").chmod(0o755)
+        _, upload = self._upload_dir(tmp_path, [b"new ", b"data"])
+        dest_dir = tmp_path / "dest dir"
+        dest_dir.mkdir()
+        dest = dest_dir / "file.bin"
+        dest.write_bytes(b"old")
+
+        assert self._run_join(bindir, upload, dest, 2) != 0
+        assert dest.read_bytes() == b"old"
+        assert sorted(p.name for p in dest_dir.iterdir()) == ["file.bin"]
+        assert not upload.exists()
+
+    @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+    def test_assemble_script_joins_512_parts_in_order(self, tmp_path):
+        bindir = self._join_bin(tmp_path)
+        chunks = [f"<{i}>".encode() for i in range(512)]
+        _, upload = self._upload_dir(tmp_path, chunks)
+        dest = tmp_path / "out" / "big.bin"
+        assert self._run_join(bindir, upload, dest, 512) == 0
+        assert dest.read_bytes() == b"".join(chunks)
+        assert not upload.exists()
+
+    @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+    @pytest.mark.parametrize("sudo_ok", [False, True])
+    @pytest.mark.parametrize("kind", ["dir", "symlink_to_dir"])
+    def test_assemble_script_refuses_a_directory_destination(
+        self, tmp_path, kind, sudo_ok
+    ):
+        """``mv -f`` would move the file *into* the directory; the join must
+        fail and leave the destination as it was, with or without sudo."""
+        bindir = self._join_bin(tmp_path, sudo_ok=sudo_ok)
+        _, upload = self._upload_dir(tmp_path, [b"new ", b"data"])
+        target = tmp_path / "real dir"
+        target.mkdir()
+        (target / "keep").write_bytes(b"keep")
+        dest = tmp_path / "dest"
+        if kind == "dir":
+            dest = target
+        else:
+            dest.symlink_to(target)
+
+        assert self._run_join(bindir, upload, dest, 2) != 0
+        assert sorted(p.name for p in target.iterdir()) == ["keep"]
+        assert (target / "keep").read_bytes() == b"keep"
+        if kind == "symlink_to_dir":
+            assert dest.is_symlink() and os.readlink(dest) == str(target)
+        assert not upload.exists()
+
+    @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+    def test_assemble_script_replaces_a_symlink_to_a_file(self, tmp_path):
+        bindir = self._join_bin(tmp_path)
+        _, upload = self._upload_dir(tmp_path, [b"new ", b"data"])
+        target = tmp_path / "target"
+        target.write_bytes(b"old")
+        dest = tmp_path / "dest"
+        dest.symlink_to(target)
+
+        assert self._run_join(bindir, upload, dest, 2) == 0
+        assert not dest.is_symlink() and dest.read_bytes() == b"new data"
+        assert target.read_bytes() == b"old", "the link's target is not written through"
+
+    @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+    def test_sweep_spares_a_live_upload_and_reclaims_an_idle_one(self, tmp_path):
+        """Idle time is the directory's mtime, not its parts': a live upload
+        with an old first part survives; one idle past the threshold, with
+        its temp output, goes."""
+        import subprocess
+        import time
+
+        from sprites_environment import _STALE_SYNC_MINUTES, _sweep_script
+
+        bindir = self._join_bin(tmp_path)
+        staging, live = self._upload_dir(tmp_path, [b"a", b"b"], name="live")
+        old = time.time() - 10 * 60 * _STALE_SYNC_MINUTES
+        os.utime(live / "00000", (old, old))  # written long ago, dir still busy
+        _, idle = self._upload_dir(tmp_path, [b"a"], name="idle")
+        (idle / "out").write_bytes(b"half-joined temp output")
+        just_over = time.time() - 60 * _STALE_SYNC_MINUTES - 120
+        for p in (idle / "00000", idle / "out", idle):
+            os.utime(p, (just_over, just_over))
+        _, recent = self._upload_dir(tmp_path, [b"a"], name="recent")
+        under = time.time() - 60 * _STALE_SYNC_MINUTES + 120
+        os.utime(recent, (under, under))
+
+        subprocess.run([shutil.which("sh"), "-c", _sweep_script(str(staging))],
+                       env={**os.environ, "PATH": str(bindir)}, check=True)
+        assert (live / "00000").exists() and (live / "00001").exists()
+        assert recent.exists()
+        assert not idle.exists(), "the idle upload and its temp output are reclaimed"
+
+    def test_stale_threshold_exceeds_the_longest_idle_gap(self):
+        """The directory is idle at most for one join (capped at the exec
+        maximum) or one part write (two HTTP attempts): the threshold must
+        clear both with room to spare."""
+        import sprites_environment as se
+
+        assert se._STALE_SYNC_MINUTES * 60 >= 10 * se._JOIN_TIMEOUT_MAX
+
+    @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+    def test_assemble_script_touches_the_upload_dir_first(self, tmp_path):
+        """A join starting on a directory whose last part landed long ago
+        marks it live before anything else (here the join then stops at the
+        part count, before writing into the directory)."""
+        bindir = self._join_bin(tmp_path)
+        (bindir / "rm").unlink()
+        (bindir / "rm").write_text("#!/bin/sh\nexit 1\n")  # keep the directory
+        (bindir / "rm").chmod(0o755)
+        _, upload = self._upload_dir(tmp_path, [b"x"])
+        os.utime(upload, (0, 0))
+        import time
+        start = time.time()
+        assert self._run_join(bindir, upload, tmp_path / "dest", 2) != 0
+        assert sorted(p.name for p in upload.iterdir()) == ["00000"]
+        assert upload.stat().st_mtime >= start - 2
 
 
 def _umask() -> int:

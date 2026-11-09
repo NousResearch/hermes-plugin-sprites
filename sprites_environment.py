@@ -604,16 +604,20 @@ class _SyncBackoff:
     def active(self) -> bool:
         return self.failures > 0 and _monotonic() < self.deadline
 
-    def failed(self, exc: BaseException | None) -> None:
+    def failed(self, retry_hint: float | None = None) -> None:
+        """Record one failed upload; ``retry_hint`` is the server's wait, in seconds.
+
+        Takes the hint, not the exception: this object lives as long as the
+        process, and an exception's traceback holds the upload archive.
+        """
         self.failures += 1
         # Double the stored step rather than computing BASE * 2 ** failures:
         # that power overflows a float after about a thousand failures.
         self.delay = (_SYNC_BACKOFF_BASE if self.delay <= 0
                       else min(self.delay * 2, _SYNC_BACKOFF_MAX))
         delay = self.delay
-        hint = _retry_hint_seconds(exc)
-        if hint is not None:
-            delay = max(delay, hint)
+        if retry_hint is not None:
+            delay = max(delay, retry_hint)
         self.deadline = _monotonic() + delay
         logger.warning(
             "file_sync: Sprite %s upload failed; retrying in %ds",
@@ -726,33 +730,44 @@ class _SharedSpriteSyncManager(FileSyncManager):
 
     def sync(self, *, force: bool = False) -> None:
         forced = force or bool(os.environ.get(_FORCE_SYNC_ENV))
+        attempt = self._attempt
         with self._shared_lock:
-            if not forced and self._backoff.active():
-                logger.debug("file_sync: Sprite %s in upload backoff; skipping sync",
-                             self._backoff.sprite_name)
-                return
-            attempt = self._attempt
-            attempt.active, attempt.called, attempt.error = True, False, None
-            before = self._commit_marker()
             try:
-                super().sync(force=force)
-            except Exception as exc:
-                if attempt.called:
-                    attempt.error = attempt.error or exc
-                raise
+                if not forced and self._backoff.active():
+                    logger.debug("file_sync: Sprite %s in upload backoff; skipping sync",
+                                 self._backoff.sprite_name)
+                    return
+                attempt.active, attempt.called, attempt.error = True, False, None
+                before = self._commit_marker()
+                try:
+                    super().sync(force=force)
+                except Exception as exc:
+                    if attempt.called:
+                        attempt.error = attempt.error or exc
+                    raise
+                finally:
+                    attempt.active = False
+                    failed = attempt.error is not None
+                    # Read the hint now and drop the exception below: its
+                    # traceback holds the upload archive, and a worker thread
+                    # (with this thread-local slot) can stay idle for hours.
+                    hint = _retry_hint_seconds(attempt.error) if failed else None
+                    attempt.error = None
+                    if failed:
+                        self._backoff.failed(hint)
+                    elif attempt.called:
+                        after = self._commit_marker()
+                        if before is None or after is None:
+                            pass  # cannot tell; never clear the backoff on a guess
+                        elif after != before:
+                            self._backoff.succeeded()
+                        else:
+                            # Core rolled back after the transport returned.
+                            self._backoff.failed()
             finally:
-                attempt.active = False
-                if attempt.error is not None:
-                    self._backoff.failed(attempt.error)
-                elif attempt.called:
-                    after = self._commit_marker()
-                    if before is None or after is None:
-                        pass  # cannot tell; never clear the backoff on a guess
-                    elif after != before:
-                        self._backoff.succeeded()
-                    else:
-                        # Core rolled back after the transport returned.
-                        self._backoff.failed(None)
+                # Always runs, even if the bookkeeping above raised or this
+                # sync was skipped, so no exception stays on the thread.
+                attempt.active, attempt.error = False, None
 
     def _commit_marker(self):
         """Read-only snapshot of the core state that changes only on commit.

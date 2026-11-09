@@ -2167,6 +2167,103 @@ def test_polling_against_a_failing_sprite_builds_few_archives(
     assert len(builds) <= 10, [t - 1000.0 for t in builds]
 
 
+def _large_bytes_reachable(root, threshold):
+    """Total size of ``bytes`` objects over ``threshold`` reachable from ``root``."""
+    import gc
+
+    seen, stack, total = set(), [root], 0
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, (bytes, bytearray)):
+            total += len(obj) if len(obj) > threshold else 0
+            continue
+        if isinstance(obj, (type, types.ModuleType)):
+            continue  # stay within the thread's own state, not the whole program
+        stack.extend(gc.get_referents(obj))
+    return total
+
+
+def test_failed_upload_does_not_pin_its_archive_on_idle_workers(
+        hermes_runtime, tmp_path, monkeypatch):
+    """A failed upload's exception holds the archive in its traceback. Once
+    the sync is over, a worker thread that stays alive (a gateway thread
+    pool) must not keep it, in the thread-local attempt state or anywhere else
+    reachable from the thread, including after a later sync is skipped by the
+    backoff."""
+    import gc
+    import threading
+    import weakref
+    from concurrent.futures import ThreadPoolExecutor
+
+    import sprites_environment as se
+    import tools.environments.file_sync as fs
+
+    # Core logs the error as a ``%s`` argument; pytest's log capture keeps
+    # every record (and so the exception) until the test ends. Production
+    # handlers format and drop the record.
+    monkeypatch.setattr(fs.logger, "disabled", True)
+    clock = _Clock()
+    monkeypatch.setattr(se, "_monotonic", clock)
+    monkeypatch.setattr(fs, "_monotonic", clock)
+    monkeypatch.setattr(fs, "_credential_host_paths", lambda: set(), raising=False)
+    monkeypatch.delenv("HERMES_FORCE_FILE_SYNC", raising=False)
+    size = 4 * 1024 * 1024
+    host = tmp_path / "large-file"
+    host.write_bytes(b"x" * size)
+    files = [(str(host), "/root/.hermes/skills/large")]
+
+    env = object.__new__(se.SpritesEnvironment)
+    env._remote_home = "/root"
+    env._use_archives = True
+    env._with_auth_retry = lambda fn: fn()
+    archives = []
+
+    class Archive:  # weakly referenceable stand-in tied to each payload
+        def __init__(self, payload):
+            self.payload = payload
+
+    class FailingFS:
+        def __truediv__(self, _path):
+            return self
+
+        def write_bytes(self, payload, **kwargs):
+            archive = Archive(payload)
+            archives.append(weakref.ref(archive))
+            raise AttributeError("'dict' object has no attribute 'lower'")
+
+    env._fs = FailingFS()
+    manager = se._SharedSpriteSyncManager(
+        get_files_fn=lambda: files, upload_fn=lambda *_: None,
+        bulk_upload_fn=env._sprite_bulk_upload, delete_fn=lambda _: None,
+        shared_lock=threading.Lock(), backoff=se._SyncBackoff("idle-workers"))
+
+    def held_by_this_thread():
+        return _large_bytes_reachable(dict(vars(manager._attempt)), size // 2)
+
+    # One executor per worker: each thread stays alive, and they are distinct.
+    workers = [ThreadPoolExecutor(max_workers=1) for _ in range(3)]
+    try:
+        for worker in workers:
+            worker.submit(manager.sync).result()
+            worker.submit(manager.sync).result()  # skipped by the backoff
+            clock.now = manager._backoff.deadline
+        assert manager._backoff.failures == 3
+        assert len(archives) == 3
+        gc.collect()
+        held = [w.submit(held_by_this_thread).result() for w in workers]
+        alive = [a for a in (ref() for ref in archives) if a is not None]
+        assert held == [0, 0, 0]
+        assert sum(len(a.payload) for a in alive) == 0, (
+            f"{len(alive)} failed archives still alive after their syncs ended")
+        assert _large_bytes_reachable(manager._backoff, size // 2) == 0
+    finally:
+        for worker in workers:
+            worker.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # Create-time settings: image, max_cpus, max_ram_gb, max_disk_gb
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ restart. Unset, ``SPRITES_TOKEN`` / ``SPRITE_TOKEN`` are read as before (see
 import hashlib
 import io
 import logging
+import math
 import os
 import posixpath
 import re
@@ -47,6 +48,7 @@ import shlex
 import stat
 import tarfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import quote as _url_quote
@@ -61,6 +63,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "tools.environments.base_output":
         raise
     from tools.environments.base import _ThreadedProcessHandle
+from tools.environments import file_sync as _file_sync_module
 from tools.environments.file_sync import (
     FileSyncManager,
     iter_sync_files,
@@ -572,6 +575,87 @@ def _shared_sync_lock(sprite_name: str) -> threading.Lock:
         return _SYNC_LOCKS.setdefault(sprite_name, threading.Lock())
 
 
+#: Tests patch this alias rather than ``time.monotonic`` itself.
+_monotonic = time.monotonic
+
+#: First wait after a failed upload, doubled on each further failure up to
+#: ``_SYNC_BACKOFF_MAX``. Sprites 2 docs ("Responses and errors"): "Retry 429
+#: and 503 after a short delay".
+_SYNC_BACKOFF_BASE = 5.0
+_SYNC_BACKOFF_MAX = 300.0
+#: Upper bound on a server retry hint, so a malformed value cannot stop
+#: syncing for the rest of the process.
+_SYNC_RETRY_HINT_MAX = 3600.0
+#: Put in ``FileSyncManager._last_sync_time`` when a sync cycle starts; core
+#: replaces it with a real time only if the cycle succeeds.
+_SYNC_STARTED = float("nan")
+#: Hermes core's switch that forces every sync (``HERMES_FORCE_FILE_SYNC``).
+_FORCE_SYNC_ENV = getattr(_file_sync_module, "_FORCE_SYNC_ENV", "HERMES_FORCE_FILE_SYNC")
+
+
+class _SyncBackoff:
+    """Upload failure history of one Sprite, shared like its sync lock.
+
+    Read and written only while that Sprite's shared sync lock is held.
+    """
+
+    def __init__(self, sprite_name: str):
+        self.sprite_name = sprite_name
+        self.failures = 0
+        self.deadline = 0.0  # monotonic; no backoff while now >= deadline
+
+    def active(self) -> bool:
+        return self.failures > 0 and _monotonic() < self.deadline
+
+    def failed(self, exc: BaseException | None) -> None:
+        self.failures += 1
+        delay = min(_SYNC_BACKOFF_BASE * 2 ** (self.failures - 1), _SYNC_BACKOFF_MAX)
+        hint = _retry_hint_seconds(exc)
+        if hint is not None:
+            delay = max(delay, hint)
+        self.deadline = _monotonic() + delay
+        logger.warning(
+            "file_sync: Sprite %s upload failed; retrying in %ds",
+            self.sprite_name, round(delay),
+        )
+
+    def succeeded(self) -> None:
+        self.failures = 0
+        self.deadline = 0.0
+
+
+def _retry_hint_seconds(exc: BaseException | None) -> float | None:
+    """Seconds from a ``retry_after_ms`` attribute on the upload error, if any.
+
+    The Sprites API puts ``retry_ms`` in a 429 body (observed: 60000 on
+    fs/write); the upload path may expose it as ``retry_after_ms``.
+    """
+    raw = None
+    seen = set()
+    while exc is not None and raw is None and id(exc) not in seen:
+        seen.add(id(exc))  # the hint may sit on a wrapped (``from``) error
+        raw = getattr(exc, "retry_after_ms", None)
+        exc = exc.__cause__ or exc.__context__
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        seconds = float(raw) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    if not seconds > 0:  # also rejects NaN
+        return None
+    return min(seconds, _SYNC_RETRY_HINT_MAX)
+
+
+#: One upload failure history per Sprite name (see ``_SyncBackoff``).
+_SYNC_BACKOFFS: dict[str, _SyncBackoff] = {}
+
+
+def _shared_sync_backoff(sprite_name: str) -> _SyncBackoff:
+    with _SYNC_LOCKS_GUARD:
+        return _SYNC_BACKOFFS.setdefault(sprite_name, _SyncBackoff(sprite_name))
+
+
 class _SharedSpriteSyncManager(FileSyncManager):
     """File sync whose transactions are serialised per Sprite, not per environment.
 
@@ -585,15 +669,74 @@ class _SharedSpriteSyncManager(FileSyncManager):
     upload read the host file after the previous upload finished, so the
     last write is always the newest content. (Environments in other
     processes are not covered.)
+
+    A failed sync also starts a backoff for the whole Sprite. Hermes core
+    retries a failed sync on the very next command, and the background
+    process poller runs a command every few seconds per session, so a sync
+    that keeps failing would re-read and re-archive every pending file many
+    times a minute. Until the backoff deadline passes, non-forced syncs of
+    every environment of the Sprite are skipped (the command still runs);
+    nothing is committed, so the next attempt uploads everything pending.
+    Forced syncs always run, and any success clears the backoff.
     """
 
-    def __init__(self, *args, shared_lock: threading.Lock, **kwargs):
+    def __init__(self, *args, shared_lock: threading.Lock,
+                 backoff: _SyncBackoff | None = None, **kwargs):
+        # Core swallows sync errors, so watch the callables it is given: the
+        # file listing marks that a sync cycle actually started, and the
+        # transport records the error that ended it.
+        self._attempt = threading.local()
+        for key in ("get_files_fn", "upload_fn", "bulk_upload_fn", "delete_fn"):
+            if kwargs.get(key) is not None:
+                kwargs[key] = self._watch(kwargs[key], started=key == "get_files_fn")
         super().__init__(*args, **kwargs)
         self._shared_lock = shared_lock
+        self._backoff = backoff or _SyncBackoff("?")
+
+    def _watch(self, fn, *, started: bool):
+        attempt = self._attempt
+
+        def watched(*args, **kwargs):
+            active = getattr(attempt, "active", False)
+            if active and started:
+                # Core lists the files only once it has decided to run a
+                # cycle. Mark its sync clock here: core writes a real time
+                # there when the cycle succeeds (or finds nothing to do) and
+                # leaves it alone when the cycle fails and rolls back.
+                attempt.started = True
+                self._last_sync_time = _SYNC_STARTED
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                if active:
+                    attempt.error = exc
+                raise
+
+        return watched
 
     def sync(self, *, force: bool = False) -> None:
+        forced = force or bool(os.environ.get(_FORCE_SYNC_ENV))
         with self._shared_lock:
-            super().sync(force=force)
+            if not forced and self._backoff.active():
+                logger.debug("file_sync: Sprite %s in upload backoff; skipping sync",
+                             self._backoff.sprite_name)
+                return
+            attempt = self._attempt
+            attempt.active, attempt.started, attempt.error = True, False, None
+            synced_at = self._last_sync_time
+            try:
+                super().sync(force=force)
+            except Exception as exc:
+                attempt.error = attempt.error or exc
+                raise
+            finally:
+                attempt.active = False
+                if attempt.started:
+                    if math.isnan(self._last_sync_time):
+                        self._last_sync_time = synced_at  # what core would have kept
+                        self._backoff.failed(attempt.error)
+                    else:
+                        self._backoff.succeeded()
 
 
 def _collapse_slug(value: str) -> str:
@@ -1012,6 +1155,7 @@ class SpritesEnvironment(BaseEnvironment):
             bulk_upload_fn=self._sprite_bulk_upload,
             delete_fn=self._sprite_delete,
             shared_lock=_shared_sync_lock(sprite_name),
+            backoff=_shared_sync_backoff(sprite_name),
         )
         self._sync_manager.sync(force=True)
         self.init_session()

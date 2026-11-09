@@ -106,6 +106,10 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.delenv("SPRITES_TOKEN", raising=False)
     monkeypatch.delenv("SPRITE_TOKEN", raising=False)
     monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+    # Upload backoff is per Sprite name and process-wide; start each test clean.
+    se = sys.modules.get("sprites_environment")
+    if se is not None and hasattr(se, "_SYNC_BACKOFFS"):
+        monkeypatch.setattr(se, "_SYNC_BACKOFFS", {})
     return home
 
 @pytest.fixture()
@@ -1756,6 +1760,210 @@ class TestSharedSpriteFileSync:
         b.join(10)
         assert not errors, errors
         assert remote[remote_path] == b"new credential version"
+
+
+class _Clock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+class _UploadRefused(RuntimeError):
+    def __init__(self, message="fs/write failed", retry_after_ms=None):
+        super().__init__(message)
+        if retry_after_ms is not None:
+            self.retry_after_ms = retry_after_ms
+
+
+class TestSyncRetryBackoff:
+    """A failing upload is retried after a growing delay, not before every command."""
+
+    @pytest.fixture()
+    def rig(self, make_env, monkeypatch, tmp_path):
+        import sprites_environment as se
+
+        clock = _Clock()
+        monkeypatch.setattr(se, "_monotonic", clock)
+        monkeypatch.setattr("tools.environments.file_sync._monotonic", clock)
+        monkeypatch.setattr(
+            "tools.environments.file_sync._credential_host_paths", lambda: set(), raising=False)
+        monkeypatch.delenv("HERMES_FORCE_FILE_SYNC", raising=False)
+
+        host = tmp_path / "skill.md"
+        host.write_bytes(b"v1")
+        remote_path = "/home/sprite/.hermes/skills/skill.md"
+        monkeypatch.setattr(se, "iter_sync_files", lambda _root: [(str(host), remote_path)])
+
+        state = types.SimpleNamespace(
+            clock=clock, host=host, remote_path=remote_path,
+            attempts={}, remote={}, fail=None,
+        )
+
+        def _bulk_upload(self, files):
+            name = self._sprite_name
+            state.attempts[name] = state.attempts.get(name, 0) + 1
+            if state.fail is not None:
+                raise state.fail
+            for host_path, rp in files:
+                state.remote[rp] = Path(host_path).read_bytes()
+
+        monkeypatch.setattr(se.SpritesEnvironment, "_sprite_bulk_upload", _bulk_upload)
+
+        def build(task="a", sprite_name="hc-abc123-default", scope="instance"):
+            return make_env(task_id=task, name_prefix="hc-abc123", scope=scope,
+                            sprite=_make_sprite(sprite_name))
+
+        state.build = build
+        return state
+
+    def test_burst_of_commands_makes_one_upload_attempt(self, rig, caplog):
+        rig.fail = _UploadRefused()
+        with caplog.at_level(logging.WARNING, logger="sprites_environment"):
+            env = rig.build()  # forced sync at creation fails
+        name = env._sprite_name
+        assert rig.attempts[name] == 1
+        backoff_logs = [r for r in caplog.records if "retrying in" in r.getMessage()]
+        assert [r.getMessage() for r in backoff_logs] == [
+            f"file_sync: Sprite {name} upload failed; retrying in 5s"]
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="sprites_environment"):
+            for _ in range(20):
+                env._before_execute()
+                rig.clock.now += 0.2
+        assert rig.attempts[name] == 1, "no upload while backing off"
+        assert not [r for r in caplog.records if "retrying in" in r.getMessage()], (
+            "the backoff is logged once, not on every skipped sync")
+
+        rig.clock.now = 1000.0 + 5.0  # deadline reached
+        env._before_execute()
+        assert rig.attempts[name] == 2
+        for _ in range(20):
+            env._before_execute()
+            rig.clock.now += 0.4
+        assert rig.attempts[name] == 2, "second failure doubles the wait (10 s)"
+
+        rig.fail = None
+        rig.clock.now = 1005.0 + 10.0
+        env._before_execute()
+        assert rig.attempts[name] == 3
+        assert rig.remote[rig.remote_path] == b"v1"
+        assert env._sync_manager._backoff.failures == 0, "success resets the backoff"
+
+        # Back to the normal interval: a changed file goes up on the next
+        # command after core's 5 s sync interval, with no extra wait.
+        rig.host.write_bytes(b"v2")
+        rig.clock.now += 5.0
+        env._before_execute()
+        assert rig.attempts[name] == 4
+        assert rig.remote[rig.remote_path] == b"v2"
+
+    def test_backoff_is_capped(self, rig):
+        import sprites_environment as se
+
+        rig.fail = _UploadRefused()
+        env = rig.build()
+        backoff = env._sync_manager._backoff
+        for _ in range(12):
+            rig.clock.now = backoff.deadline
+            env._before_execute()
+        assert backoff.deadline - rig.clock.now == se._SYNC_BACKOFF_MAX
+
+    def test_environments_of_one_sprite_share_the_backoff(self, rig):
+        rig.fail = _UploadRefused()
+        a = rig.build(task="a")
+        b = rig.build(task="b")  # same Sprite (scope: instance); forced sync runs
+        name = a._sprite_name
+        assert b._sprite_name == name
+        assert rig.attempts[name] == 2
+        rig.clock.now += 1.0
+        for env in (a, b, a, b):
+            env._before_execute()
+        assert rig.attempts[name] == 2, "b's commands are held off by a's failure too"
+
+        rig.fail = None
+        other = rig.build(task="x", sprite_name="hc-abc123-x", scope="session")
+        other_name = other._sprite_name
+        assert other_name != name
+        assert rig.attempts[other_name] == 1
+        rig.host.write_bytes(b"v2")
+        rig.clock.now += 5.0  # 1006: the shared Sprite still backs off (until 1010)
+        other._before_execute()
+        assert rig.attempts[other_name] == 2, "a different Sprite is not held off"
+        a._before_execute()
+        assert rig.attempts[name] == 2
+
+    def test_retry_hint_lengthens_the_wait(self, rig):
+        rig.fail = RuntimeError("upload failed")
+        rig.fail.__cause__ = _UploadRefused("HTTP 429", retry_after_ms=60000)
+        env = rig.build()
+        name = env._sprite_name
+        rig.clock.now += 30.0  # past the 5 s default, inside the 60 s hint
+        env._before_execute()
+        assert rig.attempts[name] == 1
+        rig.clock.now = 1000.0 + 60.0
+        env._before_execute()
+        assert rig.attempts[name] == 2
+
+    def test_forced_sync_runs_during_backoff_and_clears_it(self, rig):
+        rig.fail = _UploadRefused()
+        env = rig.build()
+        name = env._sprite_name
+        rig.clock.now += 1.0
+        env._sync_manager.sync(force=True)
+        assert rig.attempts[name] == 2, "a forced sync is never skipped"
+
+        rig.fail = None
+        rig.clock.now += 1.0
+        env._sync_manager.sync(force=True)
+        assert rig.attempts[name] == 3
+        assert env._sync_manager._backoff.failures == 0
+        rig.host.write_bytes(b"v2")
+        rig.clock.now += 5.0
+        env._before_execute()
+        assert rig.attempts[name] == 4
+        assert rig.remote[rig.remote_path] == b"v2"
+
+    def test_files_changed_during_backoff_upload_after_it(self, rig, tmp_path, monkeypatch):
+        import sprites_environment as se
+
+        rig.fail = _UploadRefused()
+        env = rig.build()
+        name = env._sprite_name
+        late = tmp_path / "late.md"
+        late.write_bytes(b"late")
+        late_remote = "/home/sprite/.hermes/skills/late.md"
+        monkeypatch.setattr(se, "iter_sync_files", lambda _root: [
+            (str(rig.host), rig.remote_path), (str(late), late_remote)])
+        rig.host.write_bytes(b"v2")
+        rig.clock.now += 1.0
+        env._before_execute()
+        assert rig.attempts[name] == 1
+        assert env._sync_manager._synced_files == {}, "a skip commits nothing"
+        assert env._sync_manager._last_sync_time == 0.0, "sync clock left as core keeps it"
+
+        rig.fail = None
+        rig.clock.now = 1000.0 + 5.0
+        env._before_execute()
+        assert rig.attempts[name] == 2
+        assert rig.remote == {rig.remote_path: b"v2", late_remote: b"late"}
+        assert set(env._sync_manager._synced_files) == {rig.remote_path, late_remote}
+
+    def test_sync_skipped_by_core_interval_is_not_a_failure(self, rig):
+        env = rig.build()  # succeeds at t=1000
+        name = env._sprite_name
+        backoff = env._sync_manager._backoff
+        rig.fail = _UploadRefused()
+        rig.host.write_bytes(b"v2")
+        rig.clock.now += 1.0  # inside core's 5 s interval: core does nothing
+        env._before_execute()
+        assert rig.attempts[name] == 1 and backoff.failures == 0
+        assert env._sync_manager._last_sync_time == 1000.0
+        rig.clock.now += 4.0
+        env._before_execute()
+        assert rig.attempts[name] == 2 and backoff.failures == 1
 
 
 # ---------------------------------------------------------------------------

@@ -3837,21 +3837,75 @@ class TestFsWriteErrorDetailRefreshAndBodies:
         stream = TestFsWriteErrorDetailRefreshAndBodies._counting_stream(chunks)
         return httpx.Response(status, headers=headers or {}, stream=stream()), stream
 
-    def test_unread_body_of_known_small_length_is_read(self):
+    @pytest.mark.parametrize("headers", [
+        {}, {"Content-Length": str(1 << 20)}, "known-small"])
+    def test_unread_body_is_never_read(self, headers):
+        """A body not yet read gives the status alone, whatever its length says."""
         import json
         from sprites_environment import _parse_error_response
-        body = json.dumps({"error": {"code": "file_too_large", "request_id": "REQ-LEN"}})
-        response, stream = self._unread(
-            413, [body.encode()], {"Content-Length": str(len(body))})
-        error = _parse_error_response(response)
-        assert error == {"status_code": 413, "code": "file_too_large", "request_id": "REQ-LEN"}
-
-    @pytest.mark.parametrize("headers", [{}, {"Content-Length": str(1 << 20)}])
-    def test_unread_body_large_or_of_unknown_length_is_not_read(self, headers):
-        from sprites_environment import _parse_error_response
-        response, stream = self._unread(413, [b"x" * 4096] * 256, headers)
+        if headers == "known-small":
+            body = json.dumps({"error": {"code": "file_too_large", "request_id": "REQ-LEN"}})
+            chunks, headers = [body.encode()], {"Content-Length": str(len(body))}
+        else:
+            chunks = [b"x" * 4096] * 256
+        response, stream = self._unread(413, chunks, headers)
         assert _parse_error_response(response) == {"status_code": 413}
         assert stream.pulled == 0
+
+    def test_token_from_overlapping_refreshes_never_leaks(self, real_sprites_sdk, tmp_path,
+                                                         monkeypatch):
+        """A -> B -> C: this call starts with A; another thread switches to B, so
+        the retry goes out with B; a third switch to C lands while that retry is
+        in flight, and the response echoes B. B is withheld too."""
+        import threading
+        import httpx
+        from sprites_environment import SpritesHttpError, _mentions
+        A, B, C = self.OLD, "file-token-b-secret", "file-token-c-secret"
+        token_file = _secrets_dir(tmp_path) / "sprites-token"
+        sent = []
+
+        def switch_on_another_thread(token):
+            token_file.write_text(token)
+            done = []
+            thread = threading.Thread(
+                target=lambda: done.append(env._refresh_client_after_401(env._client)))
+            thread.start()
+            thread.join()
+            assert done == [True]
+
+        def handler(request):
+            if request.method != "PUT":
+                return httpx.Response(200, json={"name": "offline-probe"})
+            auth = request.headers["authorization"]
+            sent.append(auth)
+            if auth == f"Bearer {A}":
+                switch_on_another_thread(B)
+                return self._error(401, "unauthorized", "Bad token.", "REQ-A")
+            switch_on_another_thread(C)
+            return self._error(403, "forbidden", f"token {B} may not write",
+                               f"REQ-{B}")
+
+        env = self._env(real_sprites_sdk, handler, tmp_path, monkeypatch)
+        host = tmp_path / "f.txt"
+        host.write_bytes(b"file-body-bytes")
+        with pytest.raises(SpritesHttpError) as info:
+            env._sprite_upload(str(host), "/home/sprite/f.txt")
+        env._client.close()
+        assert sent == [f"Bearer {A}", f"Bearer {B}"]
+        assert env._token == C
+        assert info.value.status_code == 403
+        assert not _mentions(info.value, (A, B, C))
+        assert B not in (info.value.error_message or "") + (info.value.request_id or "")
+
+    def test_remembered_tokens_are_bounded(self, real_sprites_sdk, tmp_path, monkeypatch):
+        from sprites_environment import _KNOWN_TOKENS_MAX
+        env = self._env(real_sprites_sdk, lambda request: None, tmp_path, monkeypatch)
+        env._client.close()
+        with env._auth_lock:
+            for i in range(_KNOWN_TOKENS_MAX + 5):
+                env._remember_token(f"tok-{i}")
+        assert list(env._known_tokens) == [
+            f"tok-{i}" for i in range(5, _KNOWN_TOKENS_MAX + 5)]
 
     def test_streaming_request_outside_upload_is_not_drained(self, real_sprites_sdk, tmp_path,
                                                              monkeypatch):

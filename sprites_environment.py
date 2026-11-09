@@ -341,8 +341,6 @@ def _is_within(path: str, directory: str) -> bool:
 #: error response itself in ``error_response``, for ``_fs_write`` to parse
 #: after the SDK has raised. The hook never reads a body, so streaming
 #: requests are never drained.
-#: ``tried_tokens``, when ``_fs_write`` sets it, collects every token the
-#: 401 refresh read during that call, so none of them reaches an error.
 _http_auth = threading.local()
 
 
@@ -356,10 +354,15 @@ def _note_http_status(response) -> None:
             _http_auth.error_response = response
 
 
-#: At most this much of an error body is read or parsed (the API's are a
-#: few hundred bytes); a longer body, or one of unknown length not yet
-#: read, yields the status alone.
+#: At most this much of an error body is parsed (the API's are a few
+#: hundred bytes); a longer body yields the status alone.
 _ERROR_BODY_MAX_BYTES = 64 * 1024
+
+#: How many tokens an environment remembers to keep out of error text (see
+#: ``SpritesEnvironment._remember_token``). Tokens rotate about every 14
+#: days, so a long-lived environment sees a handful at most; past the cap
+#: the oldest is dropped.
+_KNOWN_TOKENS_MAX = 16
 
 
 def _error_body(response) -> "bytes | None":
@@ -368,18 +371,15 @@ def _error_body(response) -> "bytes | None":
     Called after the SDK raised. sprites-py's ``write_bytes`` (0.5.1 through
     0.7.2) makes a non-streaming ``put()``, so httpx has already read and
     decoded (gzip, deflate) the body by then: ``response.content`` is used.
-    A body not yet read is read only when its ``Content-Length`` is known
-    and within the budget; otherwise None (report the status alone).
+    A body not yet read is never read here (its decoded size is unknown
+    until it is): None, so the status is reported alone.
     """
     import httpx
 
     try:
         body = response.content
     except httpx.ResponseNotRead:
-        length = response.headers.get("content-length", "")
-        if not (length.isdigit() and int(length) <= _ERROR_BODY_MAX_BYTES):
-            return None
-        body = response.read()
+        return None
     return body if len(body) <= _ERROR_BODY_MAX_BYTES else None
 
 
@@ -1016,9 +1016,12 @@ class SpritesEnvironment(BaseEnvironment):
         self._SpritesClient = SpritesClient
         self._client_timeout = max(30.0, float(timeout))
         self._token_source = _token_source()
-        self._token = self._token_source.read()
-        self._client = self._new_client(self._token)
         self._auth_lock = threading.Lock()
+        self._known_tokens = {}
+        with self._auth_lock:
+            self._token = self._token_source.read()
+            self._remember_token(self._token)
+        self._client = self._new_client(self._token)
         self._persistent = persistent_filesystem
         self._task_id = task_id
         self._name_prefix = prefix
@@ -1138,6 +1141,33 @@ class SpritesEnvironment(BaseEnvironment):
             hooks["response"].append(_note_http_status)
         return client
 
+    def _remember_token(self, token) -> None:
+        """Record ``token`` as one to keep out of error text. Hold ``_auth_lock``.
+
+        Every token this environment has used or read is kept (up to
+        ``_KNOWN_TOKENS_MAX``, oldest dropped), not only those of the current
+        call: with concurrent refreshes, a call can send a token another
+        thread switched to and then away from while it was in flight.
+        """
+        if not token:
+            return
+        known = self.__dict__.setdefault("_known_tokens", {})
+        known.pop(token, None)
+        known[token] = None
+        while len(known) > _KNOWN_TOKENS_MAX:
+            del known[next(iter(known))]
+
+    def _token_secrets(self, *extra) -> tuple:
+        """Every token to keep out of error text: the remembered ones, the
+        current one and ``extra``."""
+        lock = getattr(self, "_auth_lock", None)
+        if lock is None:
+            known = tuple(getattr(self, "_known_tokens", ()))
+        else:
+            with lock:
+                known = tuple(getattr(self, "_known_tokens", ()))
+        return tuple(s for s in (*known, getattr(self, "_token", None), *extra) if s)
+
     def _with_auth_retry(self, fn):
         """Call ``fn()``; after an HTTP 401, retry it once if the token changed.
 
@@ -1159,7 +1189,7 @@ class SpritesEnvironment(BaseEnvironment):
                 return self._call_once(fn)
             except Exception as e:
                 error = e
-        if _mentions(error, (token, self._token)):
+        if _mentions(error, self._token_secrets(token)):
             # Raised outside the except blocks: no __context__ links back
             # to the original error.
             name = type(error).__name__
@@ -1192,11 +1222,9 @@ class SpritesEnvironment(BaseEnvironment):
             except SpritesTokenError as e:
                 logger.warning("Sprites: HTTP 401 and the token could not be re-read: %s", e)
                 return False
+            self._remember_token(token)  # keep it out of any error text
             if token == self._token:
                 return False
-            tried = getattr(_http_auth, "tried_tokens", None)
-            if tried is not None:
-                tried.add(token)  # keep it out of the caller's error text
             client = self._new_client(token)
             try:
                 sprite = client.get_sprite(self._sprite_name) if self._sprite is not None else None
@@ -1341,8 +1369,8 @@ class SpritesEnvironment(BaseEnvironment):
         unchanged. The error reported is that of the last upload attempt, not
         of the Sprite lookup a 401 refresh makes. The SDK's exception stays
         chained as ``__cause__`` unless its text holds a token. Every token
-        tried during the call (the one in use, and any the 401 refresh read)
-        is kept out of the message: a field or path holding one is withheld.
+        this environment has used or read (``_token_secrets``) is kept out
+        of the message: a field or path holding one is withheld.
         """
         token = self._token
         attempt = {}
@@ -1359,23 +1387,18 @@ class SpritesEnvironment(BaseEnvironment):
                 attempt["response"] = _http_auth.error_response
                 _http_auth.error_response = None
 
-        tried = set()
-        outer_tried = getattr(_http_auth, "tried_tokens", None)
-        _http_auth.tried_tokens = tried
         try:
             self._with_auth_retry(write)
             return
         except Exception as e:
             failure = e
-        finally:
-            _http_auth.tried_tokens = outer_tried
         seen = attempt.get("error")
         if seen and attempt.get("response") is not None:
             try:
                 seen = _parse_error_response(attempt["response"])
             except Exception:
                 pass
-        secrets = tuple(s for s in (token, self._token, *tried) if s)
+        secrets = self._token_secrets(token)
         if not seen:
             if _mentions(failure, secrets):
                 name = type(failure).__name__

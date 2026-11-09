@@ -2903,6 +2903,7 @@ def test_failed_upload_does_not_pin_its_archive_on_idle_workers(
     env._remote_home = "/root"
     env._use_archives = True
     env._with_auth_retry = lambda fn: fn()
+    env._token = "test-token"  # read by the upload path's error handling
     archives = []
 
     class Archive:  # weakly referenceable stand-in tied to each payload

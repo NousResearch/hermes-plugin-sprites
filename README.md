@@ -178,12 +178,28 @@ caches copied into `~/.hermes` on the Sprite before each command) therefore:
   land with mode `0644`, as a single `fs/write` sets. If the unpack fails (no
   `tar`, a non-root user without working sudo), that batch is sent one
   `fs/write` per file; if the archive cannot be removed, it is emptied and the
-  session sends files one by one from then on. Archives left by a sync whose
-  unpack never ran are removed by a later sync after 30 minutes.
+  session sends files one by one from then on (large files still in
+  chunks). Archives left by a sync whose unpack never ran are removed by a
+  later sync once idle for two hours.
   Each `fs/write` and exec counts against the per-Sprite request rate limit
   (300 per minute), and the skills tree alone is a few hundred files, so one
   request per file left every sync cut off by HTTP 429 and resent in full.
-  Archives hold up to 32 MiB of file data each;
+  No upload is larger than 4 MiB, tar headers included: the Sprites docs cap
+  one `fs/write` at 16 MiB (413 `file_too_large` above it), and in practice a
+  5 MiB write has come back 502 while 4.75 MiB and below succeed. More data
+  goes in more archives. A file too large for an archive of its own (an
+  image, an attachment, generated media) is sent in chunks of at most 4 MiB,
+  each one `fs/write` to a root-only numbered part file in a directory of its
+  own under `~/.hermes/.sync-staging`, then one exec (the same size whatever
+  the number of parts) checks that every part arrived, joins them into a temp
+  file in that directory and renames it into place with `mv -fT` (the API has
+  no append), retried with `sudo -n`, and removes the directory. A directory
+  at the destination is refused and left alone. A failed chunk or join fails
+  the sync, which is retried in full before the next command; an upload
+  directory left by a sync that never finished is removed, temp file and all,
+  once the directory has been idle for two hours (every part written
+  refreshes it). This is best-effort: an upload stalled for longer than that
+  can lose its directory, and its join then fails and the sync is retried;
 - deletes files that disappeared on the host with one exec per batch,
   `rm -f -- <paths>`, retried as `sudo -n rm -f -- <paths>` because `fs/write`
   creates root-owned files while the base image runs commands as `sprite`. A

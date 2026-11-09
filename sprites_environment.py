@@ -335,8 +335,12 @@ def _is_within(path: str, directory: str) -> bool:
 #: Set on the calling thread when an HTTP response with status 401 arrives
 #: (an httpx response hook on every client this plugin makes). sprites-py
 #: turns a filesystem 401 into a ``FilesystemError`` that keeps no status.
-#: ``last_error`` holds the status and Sprites error fields of the last
-#: HTTP error response (status >= 400) seen during the current call.
+#: ``last_error`` holds the status of the last HTTP error response (status
+#: >= 400) seen on this thread. Only while ``capture_fs_write`` is set (by
+#: ``_fs_write``, around the SDK's upload call) does the hook also read and
+#: parse the error body, so streaming requests elsewhere are never drained.
+#: ``tried_tokens``, when ``_fs_write`` sets it, collects every token the
+#: 401 refresh read during that call, so none of them reaches an error.
 _http_auth = threading.local()
 
 
@@ -345,14 +349,66 @@ def _note_http_status(response) -> None:
     if status == 401:
         _http_auth.saw_401 = True
     if isinstance(status, int) and status >= 400:
-        try:
-            _http_auth.last_error = _parse_error_response(response)
-        except Exception:
-            _http_auth.last_error = {"status_code": status}
+        error = {"status_code": status}
+        if getattr(_http_auth, "capture_fs_write", False):
+            try:
+                error = _parse_error_response(response)
+            except Exception:
+                pass
+        _http_auth.last_error = error
 
 
-#: Error bodies longer than this are not parsed (the API's are a few hundred bytes).
+#: At most this much of an error body is read by the hook (the API's are a
+#: few hundred bytes); a longer body is not parsed.
 _ERROR_BODY_MAX_BYTES = 64 * 1024
+
+
+def _error_body_head(response, limit: int) -> "bytes | None":
+    """The body of ``response`` if it is at most ``limit`` bytes, else None.
+
+    Stops reading once more than ``limit`` bytes have arrived, so at most
+    ``limit`` plus one network chunk is read, however long the body. A response hook runs
+    before httpx reads the body, so the bytes read here are put back: the
+    response's stream is replaced by one that yields them and then the rest
+    of the original stream (or re-raises the error that stopped the read).
+    httpx, and so the SDK, still sees the whole body, or fails as it would
+    have without the hook.
+    """
+    try:
+        return response.content  # already in memory (e.g. built from bytes)
+    except Exception:
+        pass
+    import httpx
+
+    original = response.stream
+    if not isinstance(original, httpx.SyncByteStream):
+        return None
+    chunks, size, failure = [], 0, None
+    it = iter(original)
+    try:
+        while size <= limit:
+            chunk = next(it, None)
+            if chunk is None:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except Exception as e:
+        failure = e
+    done = failure is None and size <= limit
+
+    class _Replay(httpx.SyncByteStream):
+        def __iter__(self):
+            yield from chunks
+            if failure is not None:
+                raise failure
+            if not done:
+                yield from it
+
+        def close(self):
+            original.close()
+
+    response.stream = _Replay()
+    return b"".join(chunks) if done else None
 
 
 def _parse_error_response(response) -> dict:
@@ -361,19 +417,20 @@ def _parse_error_response(response) -> dict:
     The docs ("Responses and errors") give two body shapes,
     ``{"error": {"code", "message", "request_id", "details"}}`` and
     ``{"error": "message"}``. Any other body (a 502 was observed with an
-    empty one) yields the status alone. A 429 carries ``details.retry_ms``.
-    Recorded here because sprites-py cannot parse the first shape and
-    raises an ``AttributeError`` that keeps none of it.
+    empty one), or one over ``_ERROR_BODY_MAX_BYTES``, yields the status
+    alone. A 429 carries ``details.retry_ms``. Recorded here because
+    sprites-py cannot parse the first shape and raises an ``AttributeError``
+    that keeps none of it.
     """
+    import json
+
     error = {"status_code": response.status_code}
     length = response.headers.get("content-length", "")
     if length.isdigit() and int(length) > _ERROR_BODY_MAX_BYTES:
         return error
     try:
-        # A response hook runs before httpx reads the body; read() caches
-        # it, so the SDK still sees the same body afterwards.
-        body = response.read()
-        data = response.json() if body and len(body) <= _ERROR_BODY_MAX_BYTES else None
+        body = _error_body_head(response, _ERROR_BODY_MAX_BYTES)
+        data = json.loads(body) if body and len(body) <= _ERROR_BODY_MAX_BYTES else None
     except Exception:
         data = None
     if not isinstance(data, dict):
@@ -1168,6 +1225,9 @@ class SpritesEnvironment(BaseEnvironment):
                 return False
             if token == self._token:
                 return False
+            tried = getattr(_http_auth, "tried_tokens", None)
+            if tried is not None:
+                tried.add(token)  # keep it out of the caller's error text
             client = self._new_client(token)
             try:
                 sprite = client.get_sprite(self._sprite_name) if self._sprite is not None else None
@@ -1307,30 +1367,65 @@ class SpritesEnvironment(BaseEnvironment):
         ``SpritesHttpError`` naming the status, code and request id.
 
         sprites-py's own exception for an HTTP error is replaced only when
-        the response hook saw an HTTP error during this call, so an
-        unrelated exception (a bug, a network error) is raised unchanged.
-        The SDK's exception stays chained as ``__cause__``.
+        the response hook saw an HTTP error during the upload request itself,
+        so an unrelated exception (a bug, a network error) is raised
+        unchanged. The error reported is that of the last upload attempt, not
+        of the Sprite lookup a 401 refresh makes. The SDK's exception stays
+        chained as ``__cause__`` unless its text holds a token. Every token
+        tried during the call (the one in use, and any the 401 refresh read)
+        is kept out of the message: a field or path holding one is withheld.
         """
         token = self._token
+        attempt = {}
+
+        def write():
+            _http_auth.last_error = None
+            _http_auth.capture_fs_write = True
+            try:
+                (self._fs / remote_path).write_bytes(data, mode=mode, mkdir_parents=True)
+            finally:
+                _http_auth.capture_fs_write = False
+                attempt["error"] = getattr(_http_auth, "last_error", None)
+
+        tried = set()
+        outer_tried = getattr(_http_auth, "tried_tokens", None)
+        _http_auth.tried_tokens = tried
         try:
-            self._with_auth_retry(
-                lambda: (self._fs / remote_path).write_bytes(data, mode=mode, mkdir_parents=True)
-            )
+            self._with_auth_retry(write)
+            return
         except Exception as e:
-            seen = getattr(_http_auth, "last_error", None)
-            if not seen:
-                raise
-            what = f"Sprites: fs/write {remote_path}"
-            error = SpritesHttpError(what, seen)
-            secrets = (token, self._token)
-            if _mentions(error, secrets):
-                # Keep the status, code and request id; drop the server's text.
-                error = SpritesHttpError(what, {**seen, "message": "(message withheld: "
-                                                "it contained the Sprites token)"})
-                if _mentions(error, secrets):
-                    error = SpritesHttpError(what, {"status_code": seen.get("status_code")})
-                raise error from None
-            raise error from e
+            failure = e
+        finally:
+            _http_auth.tried_tokens = outer_tried
+        seen = attempt.get("error")
+        secrets = tuple(s for s in (token, self._token, *tried) if s)
+        if not seen:
+            if _mentions(failure, secrets):
+                name = type(failure).__name__
+                failure = None
+                raise SpritesApiError(
+                    f"Sprites API call failed ({name}); its message was withheld "
+                    "because it contained the Sprites token.")
+            raise failure
+
+        def held(value):
+            return isinstance(value, str) and any(s in value for s in secrets)
+
+        fields = dict(seen)
+        if held(fields.get("message")):
+            fields["message"] = "(message withheld: it contained the Sprites token)"
+        for key in ("code", "request_id"):
+            if held(fields.get(key)):
+                fields[key] = "(withheld)"
+        path = "(path withheld)" if held(remote_path) else remote_path
+        error = SpritesHttpError(f"Sprites: fs/write {path}", fields)
+        if _mentions(error, secrets):
+            error = SpritesHttpError("Sprites: fs/write", {"status_code": seen.get("status_code")})
+        if _mentions(failure, secrets):
+            # Raised outside the except block: no __context__ links back.
+            failure = None
+            raise error
+        raise error from failure
 
     def _sprite_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         """Upload changed files as archives: per archive, one ``fs/write`` of a

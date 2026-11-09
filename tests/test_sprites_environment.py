@@ -3631,3 +3631,196 @@ class TestFsWriteErrorDetail:
             env._client.close()
         assert any("413" in r.getMessage() and "GN4cSYNC" in r.getMessage()
                    for r in caplog.records)
+
+
+class TestFsWriteErrorDetailRefreshAndBodies:
+    """fs/write error reporting around the 401 refresh and with streamed bodies.
+
+    Real sprites-py 0.5.1 transport over ``httpx.MockTransport``; the tokens
+    are made-up strings.
+    """
+
+    OLD = "file-token-old-secret"
+    NEW = "file-token-new-secret"
+
+    def _env(self, real_sprites_sdk, handler, tmp_path, monkeypatch):
+        import threading
+        import httpx
+        from sprites_environment import SpritesEnvironment, _token_source
+
+        token_file = _secrets_dir(tmp_path) / "sprites-token"
+        token_file.write_text(self.NEW)  # the candidate the 401 refresh reads
+        monkeypatch.setenv("SPRITES_TOKEN_FILE", str(token_file))
+
+        def make_client(token, timeout):
+            client = real_sprites_sdk.SpritesClient(token=token, timeout=timeout)
+            client._client.close()
+            client._client = httpx.Client(transport=httpx.MockTransport(handler))
+            return client
+
+        env = object.__new__(SpritesEnvironment)
+        env._SpritesClient = make_client
+        env._client_timeout = 30
+        env._token_source = _token_source()
+        env._token = self.OLD
+        env._client = env._new_client(self.OLD)
+        env._sprite_name = "offline-probe"
+        env._sprite = env._client.sprite("offline-probe")
+        env._fs = env._sprite.filesystem("/")
+        env._auth_lock = threading.Lock()
+        env._exec_env = None
+        env._remote_home = "/home/sprite"
+        env._use_archives = True
+        return env
+
+    @staticmethod
+    def _error(status, code, message, request_id):
+        import httpx
+        return httpx.Response(status, json={"error": {
+            "code": code, "message": message, "request_id": request_id}})
+
+    def _upload(self, env, tmp_path, remote="/home/sprite/f.txt"):
+        host = tmp_path / "f.txt"
+        host.write_bytes(b"file-body-bytes")
+        try:
+            env._sprite_upload(str(host), remote)
+        finally:
+            env._client.close()
+
+    def test_failed_refresh_reports_the_uploads_own_401(self, real_sprites_sdk, tmp_path,
+                                                        monkeypatch):
+        from sprites_environment import SpritesHttpError
+
+        def handler(request):
+            if request.method == "PUT":
+                return self._error(401, "unauthorized", "Bad token.", "REQ-UPLOAD")
+            return self._error(404, "not_found", "No such Sprite.", "REQ-LOOKUP")
+
+        env = self._env(real_sprites_sdk, handler, tmp_path, monkeypatch)
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        assert info.value.status_code == 401
+        assert info.value.request_id == "REQ-UPLOAD"
+        assert "HTTP 401" in str(info.value) and "REQ-LOOKUP" not in str(info.value)
+        assert env._token == self.OLD  # the refresh declined
+
+    def test_candidate_token_echoed_by_refresh_lookup_never_leaks(self, real_sprites_sdk,
+                                                                   tmp_path, monkeypatch):
+        from sprites_environment import SpritesHttpError, _mentions
+
+        def handler(request):
+            if request.method == "PUT":
+                return self._error(401, "unauthorized", "Bad token.", "REQ-UPLOAD")
+            return self._error(403, "forbidden", f"token {self.NEW} may not read",
+                               f"REQ-{self.NEW}")
+
+        env = self._env(real_sprites_sdk, handler, tmp_path, monkeypatch)
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        assert not _mentions(info.value, (self.NEW, self.OLD))
+        assert info.value.status_code == 401
+
+    def test_candidate_token_in_upload_error_fields_is_withheld(self, real_sprites_sdk,
+                                                                 tmp_path, monkeypatch):
+        """Every token tried during the call is withheld, not just the current one."""
+        from sprites_environment import SpritesHttpError, _mentions
+
+        def handler(request):
+            if request.method == "PUT":
+                return self._error(401, "unauthorized", f"rejected; try {self.NEW}",
+                                   f"REQ-{self.NEW}")
+            return self._error(404, "not_found", "No such Sprite.", "REQ-LOOKUP")
+
+        env = self._env(real_sprites_sdk, handler, tmp_path, monkeypatch)
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        assert not _mentions(info.value, (self.NEW,))
+        assert info.value.status_code == 401
+        for value in (info.value.code, info.value.error_message, info.value.request_id):
+            assert self.NEW not in (value or "")
+        # Only the fields holding a token are withheld; the rest is kept.
+        assert info.value.code == "unauthorized" and "unauthorized" in str(info.value)
+        assert "/home/sprite/f.txt" in str(info.value)
+
+    def test_token_in_remote_path_is_never_in_message(self, real_sprites_sdk, tmp_path,
+                                                      monkeypatch):
+        from sprites_environment import SpritesHttpError, _mentions
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk, lambda request: self._error(
+            413, "file_too_large", "File is too large.", "REQ-PATH"), tmp_path, monkeypatch)
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path, remote=f"/home/sprite/{self.OLD}/f.txt")
+        assert not _mentions(info.value, (self.OLD,))
+        assert info.value.status_code == 413 and "REQ-PATH" in str(info.value)
+
+    @staticmethod
+    def _counting_stream(chunks):
+        import httpx
+
+        class _Stream(httpx.SyncByteStream):
+            pulled = 0
+
+            def __iter__(self):
+                for chunk in chunks:
+                    _Stream.pulled += len(chunk)
+                    yield chunk
+
+        return _Stream
+
+    def test_upload_hook_reads_a_streamed_body_only_up_to_the_budget(self, real_sprites_sdk,
+                                                                      tmp_path, monkeypatch):
+        import httpx
+        from sprites_environment import _ERROR_BODY_MAX_BYTES, SpritesHttpError
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        chunk = b"x" * 4096
+        stream = self._counting_stream([chunk] * 256)  # 1 MiB, no Content-Length
+        pulled_after_hook = []
+
+        def handler(request):
+            return httpx.Response(413, stream=stream())
+
+        env = self._env(real_sprites_sdk, handler, tmp_path, monkeypatch)
+        env._client._client.event_hooks["response"].append(
+            lambda response: pulled_after_hook.append(stream.pulled))
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        assert pulled_after_hook and pulled_after_hook[0] <= _ERROR_BODY_MAX_BYTES + len(chunk)
+        assert info.value.status_code == 413 and info.value.code is None
+        # The SDK still got the whole body afterwards (it read it to parse).
+        assert stream.pulled == 256 * len(chunk)
+
+    def test_upload_hook_parses_a_small_streamed_body(self, real_sprites_sdk, tmp_path,
+                                                      monkeypatch):
+        import httpx
+        import json
+        from sprites_environment import SpritesHttpError
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        body = json.dumps({"error": {"code": "rate_limited", "message": "Slow down.",
+                                     "request_id": "REQ-STREAM",
+                                     "details": {"retry_ms": 60000}}}).encode()
+        stream = self._counting_stream([body[:10], body[10:]])
+        env = self._env(real_sprites_sdk, lambda request: httpx.Response(429, stream=stream()),
+                        tmp_path, monkeypatch)
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        assert info.value.code == "rate_limited" and info.value.request_id == "REQ-STREAM"
+        assert info.value.retry_after_ms == 60000
+
+    def test_streaming_request_outside_upload_is_not_drained(self, real_sprites_sdk, tmp_path,
+                                                             monkeypatch):
+        import httpx
+        from sprites_environment import _http_auth
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        stream = self._counting_stream([b"y" * 4096] * 16)
+        env = self._env(real_sprites_sdk, lambda request: httpx.Response(401, stream=stream()),
+                        tmp_path, monkeypatch)
+        _http_auth.saw_401 = False
+        try:
+            with env._client._client.stream("GET", "https://sprites.invalid/exec") as response:
+                assert stream.pulled == 0
+                assert response.status_code == 401
+            assert _http_auth.saw_401 is True
+            assert _http_auth.last_error == {"status_code": 401}
+        finally:
+            env._client.close()

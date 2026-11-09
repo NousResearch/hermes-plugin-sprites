@@ -47,6 +47,7 @@ import shlex
 import stat
 import tarfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import quote as _url_quote
@@ -61,6 +62,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "tools.environments.base_output":
         raise
     from tools.environments.base import _ThreadedProcessHandle
+from tools.environments import file_sync as _file_sync_module
 from tools.environments.file_sync import (
     FileSyncManager,
     iter_sync_files,
@@ -704,6 +706,94 @@ def _shared_sync_lock(sprite_name: str) -> threading.Lock:
         return _SYNC_LOCKS.setdefault(sprite_name, threading.Lock())
 
 
+#: Tests patch this alias rather than ``time.monotonic`` itself.
+_monotonic = time.monotonic
+
+#: First wait after a failed upload, doubled on each further failure up to
+#: ``_SYNC_BACKOFF_MAX``. Sprites 2 docs ("Responses and errors"): "Retry 429
+#: and 503 after a short delay".
+_SYNC_BACKOFF_BASE = 5.0
+_SYNC_BACKOFF_MAX = 300.0
+#: Upper bound on a server retry hint, so a malformed value cannot stop
+#: syncing for the rest of the process.
+_SYNC_RETRY_HINT_MAX = 3600.0
+#: Hermes core's switch that forces every sync (``HERMES_FORCE_FILE_SYNC``).
+_FORCE_SYNC_ENV = getattr(_file_sync_module, "_FORCE_SYNC_ENV", "HERMES_FORCE_FILE_SYNC")
+
+
+class _SyncBackoff:
+    """Upload failure history of one Sprite, shared like its sync lock.
+
+    Read and written only while that Sprite's shared sync lock is held.
+    """
+
+    def __init__(self, sprite_name: str):
+        self.sprite_name = sprite_name
+        self.failures = 0
+        self.delay = 0.0  # current backoff step, before any server hint
+        self.deadline = 0.0  # monotonic; no backoff while now >= deadline
+
+    def active(self) -> bool:
+        return self.failures > 0 and _monotonic() < self.deadline
+
+    def failed(self, retry_hint: float | None = None) -> None:
+        """Record one failed upload; ``retry_hint`` is the server's wait, in seconds.
+
+        Takes the hint, not the exception: this object lives as long as the
+        process, and an exception's traceback holds the upload archive.
+        """
+        self.failures += 1
+        # Double the stored step rather than computing BASE * 2 ** failures:
+        # that power overflows a float after about a thousand failures.
+        self.delay = (_SYNC_BACKOFF_BASE if self.delay <= 0
+                      else min(self.delay * 2, _SYNC_BACKOFF_MAX))
+        delay = self.delay
+        if retry_hint is not None:
+            delay = max(delay, retry_hint)
+        self.deadline = _monotonic() + delay
+        logger.warning(
+            "file_sync: Sprite %s upload failed; retrying in %ds",
+            self.sprite_name, round(delay),
+        )
+
+    def succeeded(self) -> None:
+        self.failures = 0
+        self.delay = 0.0
+        self.deadline = 0.0
+
+
+def _retry_hint_seconds(exc: BaseException | None) -> float | None:
+    """Seconds from a ``retry_after_ms`` attribute on the upload error, if any.
+
+    The Sprites API puts ``retry_ms`` in a 429 body (observed: 60000 on
+    fs/write); the upload path may expose it as ``retry_after_ms``.
+    """
+    raw = None
+    seen = set()
+    while exc is not None and raw is None and id(exc) not in seen:
+        seen.add(id(exc))  # the hint may sit on a wrapped (``from``) error
+        raw = getattr(exc, "retry_after_ms", None)
+        exc = exc.__cause__ or exc.__context__
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        seconds = float(raw) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    if not seconds > 0:  # also rejects NaN
+        return None
+    return min(seconds, _SYNC_RETRY_HINT_MAX)
+
+
+#: One upload failure history per Sprite name (see ``_SyncBackoff``).
+_SYNC_BACKOFFS: dict[str, _SyncBackoff] = {}
+
+
+def _shared_sync_backoff(sprite_name: str) -> _SyncBackoff:
+    with _SYNC_LOCKS_GUARD:
+        return _SYNC_BACKOFFS.setdefault(sprite_name, _SyncBackoff(sprite_name))
+
+
 class _SharedSpriteSyncManager(FileSyncManager):
     """File sync whose transactions are serialised per Sprite, not per environment.
 
@@ -717,15 +807,125 @@ class _SharedSpriteSyncManager(FileSyncManager):
     upload read the host file after the previous upload finished, so the
     last write is always the newest content. (Environments in other
     processes are not covered.)
+
+    A failed sync also starts a backoff for the whole Sprite. Hermes core
+    retries a failed sync on the very next command, and the background
+    process poller runs a command every few seconds per session, so a sync
+    that keeps failing would re-read and re-archive every pending file many
+    times a minute. Until the backoff deadline passes, non-forced syncs of
+    every environment of the Sprite are skipped (the command still runs);
+    nothing is committed, so the next attempt uploads everything pending.
+    Forced syncs always run.
+
+    Core swallows sync errors, so the outcome is read from the transport
+    callables handed to core, which are wrapped here, and from core's synced
+    state: a cycle in which a transport call raised is a failure. A cycle in
+    which transport calls were made and none raised is a success only if core
+    then committed (see ``_commit_marker``); core can still roll back after
+    the transport returns (staging cleanup or the commit itself failing),
+    and that counts as a failure too, or a persistent cleanup error would
+    rebuild every archive before every command. A cycle that made no
+    transport call leaves the backoff as it is: that covers core's interval skip, a no-op with nothing pending (which
+    says nothing about this Sprite's uploads, since every environment keeps
+    its own synced state), and a local planning or staging failure (such as
+    a file removed between listing and copying). Those local failures never
+    reach the Sprite, are usually gone on the next listing, and fail before
+    the upload archive is built, so they are left to core's normal retry.
     """
 
-    def __init__(self, *args, shared_lock: threading.Lock, **kwargs):
+    def __init__(self, *args, shared_lock: threading.Lock,
+                 backoff: _SyncBackoff | None = None, **kwargs):
+        # Record, per sync attempt, whether core reached the transport and
+        # whether a transport call raised (see the class docstring).
+        self._attempt = threading.local()
+        for key in ("upload_fn", "bulk_upload_fn", "delete_fn"):
+            if kwargs.get(key) is not None:
+                kwargs[key] = self._watch(kwargs[key])
         super().__init__(*args, **kwargs)
         self._shared_lock = shared_lock
+        self._backoff = backoff or _SyncBackoff("?")
+
+    def _watch(self, fn):
+        attempt = self._attempt
+
+        def watched(*args, **kwargs):
+            if not getattr(attempt, "active", False):
+                return fn(*args, **kwargs)
+            attempt.called = True
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                attempt.error = attempt.error or exc
+                raise
+
+        return watched
 
     def sync(self, *, force: bool = False) -> None:
+        forced = force or bool(os.environ.get(_FORCE_SYNC_ENV))
+        attempt = self._attempt
         with self._shared_lock:
-            super().sync(force=force)
+            try:
+                if not forced and self._backoff.active():
+                    logger.debug("file_sync: Sprite %s in upload backoff; skipping sync",
+                                 self._backoff.sprite_name)
+                    return
+                attempt.active, attempt.called, attempt.error = True, False, None
+                before = self._commit_marker()
+                try:
+                    super().sync(force=force)
+                except Exception as exc:
+                    if attempt.called:
+                        attempt.error = attempt.error or exc
+                    raise
+                finally:
+                    attempt.active = False
+                    failed = attempt.error is not None
+                    # Read the hint now and drop the exception below: its
+                    # traceback holds the upload archive, and a worker thread
+                    # (with this thread-local slot) can stay idle for hours.
+                    hint = _retry_hint_seconds(attempt.error) if failed else None
+                    attempt.error = None
+                    if failed:
+                        self._backoff.failed(hint)
+                    elif attempt.called:
+                        after = self._commit_marker()
+                        if before is None or after is None:
+                            pass  # cannot tell; never clear the backoff on a guess
+                        elif after != before:
+                            self._backoff.succeeded()
+                        else:
+                            # Core rolled back after the transport returned.
+                            self._backoff.failed()
+            finally:
+                # Always runs, even if the bookkeeping above raised or this
+                # sync was skipped, so no exception stays on the thread.
+                attempt.active, attempt.error = False, None
+
+    def _commit_marker(self):
+        """Read-only snapshot of the core state that changes only on commit.
+
+        In a cycle that reaches the transport, Hermes core assigns
+        ``_last_sync_time`` and the new ``_synced_files`` / ``_pushed_hashes``
+        only when it commits; on a failure it restores copies of the previous
+        state and leaves the clock alone. Comparing the clock and the content
+        before and after therefore tells a commit from a rollback. The content
+        also changes on a commit that uploaded (core only uploads a file whose
+        hash is new) or deleted (fewer keys), so equal clock readings are
+        covered; a commit that still looked unchanged would be counted as a
+        failure, which only delays the next retry. Returns ``None``
+        when core does not have these attributes, so the caller can leave
+        the backoff unchanged rather than clear it.
+        """
+        missing = object()
+        clock = getattr(self, "_last_sync_time", missing)
+        files = getattr(self, "_synced_files", missing)
+        hashes = getattr(self, "_pushed_hashes", missing)
+        if any(value is missing for value in (clock, files, hashes)):
+            return None
+        try:
+            return clock, dict(files), dict(hashes)
+        except (TypeError, ValueError):
+            return None
 
 
 def _collapse_slug(value: str) -> str:
@@ -1296,6 +1496,7 @@ class SpritesEnvironment(BaseEnvironment):
             bulk_upload_fn=self._sprite_bulk_upload,
             delete_fn=self._sprite_delete,
             shared_lock=_shared_sync_lock(sprite_name),
+            backoff=_shared_sync_backoff(sprite_name),
         )
         self._sync_manager.sync(force=True)
         self.init_session()

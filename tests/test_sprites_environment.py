@@ -3768,10 +3768,10 @@ class TestFsWriteErrorDetailRefreshAndBodies:
 
         return _Stream
 
-    def test_upload_hook_reads_a_streamed_body_only_up_to_the_budget(self, real_sprites_sdk,
-                                                                      tmp_path, monkeypatch):
+    def test_upload_hook_reads_no_body(self, real_sprites_sdk, tmp_path, monkeypatch):
+        """The hook only keeps the response; an over-budget body gives the status."""
         import httpx
-        from sprites_environment import _ERROR_BODY_MAX_BYTES, SpritesHttpError
+        from sprites_environment import SpritesHttpError
         monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
         chunk = b"x" * 4096
         stream = self._counting_stream([chunk] * 256)  # 1 MiB, no Content-Length
@@ -3785,13 +3785,13 @@ class TestFsWriteErrorDetailRefreshAndBodies:
             lambda response: pulled_after_hook.append(stream.pulled))
         with pytest.raises(SpritesHttpError) as info:
             self._upload(env, tmp_path)
-        assert pulled_after_hook and pulled_after_hook[0] <= _ERROR_BODY_MAX_BYTES + len(chunk)
+        assert pulled_after_hook == [0]
         assert info.value.status_code == 413 and info.value.code is None
-        # The SDK still got the whole body afterwards (it read it to parse).
+        # The SDK read the whole body itself (its put() is not streaming).
         assert stream.pulled == 256 * len(chunk)
 
-    def test_upload_hook_parses_a_small_streamed_body(self, real_sprites_sdk, tmp_path,
-                                                      monkeypatch):
+    def test_upload_parses_a_small_streamed_body(self, real_sprites_sdk, tmp_path,
+                                                 monkeypatch):
         import httpx
         import json
         from sprites_environment import SpritesHttpError
@@ -3806,6 +3806,52 @@ class TestFsWriteErrorDetailRefreshAndBodies:
             self._upload(env, tmp_path)
         assert info.value.code == "rate_limited" and info.value.request_id == "REQ-STREAM"
         assert info.value.retry_after_ms == 60000
+
+    @pytest.mark.parametrize("encoding", ["gzip", "deflate"])
+    def test_upload_parses_a_compressed_streamed_body(self, real_sprites_sdk, tmp_path,
+                                                      monkeypatch, encoding):
+        """A gzip- or deflate-encoded error body is decoded before it is parsed."""
+        import gzip
+        import httpx
+        import json
+        import zlib
+        from sprites_environment import SpritesHttpError
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        body = json.dumps({"error": {
+            "code": "rate_limited", "message": "Too many requests.", "request_id": "REQ-GZ",
+            "details": {"limit": 300, "operation": "exec_open", "retry_ms": 60000}}}).encode()
+        wire = gzip.compress(body) if encoding == "gzip" else zlib.compress(body)
+        stream = self._counting_stream([wire[:7], wire[7:]])
+        env = self._env(real_sprites_sdk, lambda request: httpx.Response(
+            429, headers={"Content-Encoding": encoding}, stream=stream()),
+            tmp_path, monkeypatch)
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        assert info.value.status_code == 429
+        assert info.value.code == "rate_limited" and info.value.request_id == "REQ-GZ"
+        assert info.value.retry_after_ms == 60000
+
+    @staticmethod
+    def _unread(status, chunks, headers=None):
+        import httpx
+        stream = TestFsWriteErrorDetailRefreshAndBodies._counting_stream(chunks)
+        return httpx.Response(status, headers=headers or {}, stream=stream()), stream
+
+    def test_unread_body_of_known_small_length_is_read(self):
+        import json
+        from sprites_environment import _parse_error_response
+        body = json.dumps({"error": {"code": "file_too_large", "request_id": "REQ-LEN"}})
+        response, stream = self._unread(
+            413, [body.encode()], {"Content-Length": str(len(body))})
+        error = _parse_error_response(response)
+        assert error == {"status_code": 413, "code": "file_too_large", "request_id": "REQ-LEN"}
+
+    @pytest.mark.parametrize("headers", [{}, {"Content-Length": str(1 << 20)}])
+    def test_unread_body_large_or_of_unknown_length_is_not_read(self, headers):
+        from sprites_environment import _parse_error_response
+        response, stream = self._unread(413, [b"x" * 4096] * 256, headers)
+        assert _parse_error_response(response) == {"status_code": 413}
+        assert stream.pulled == 0
 
     def test_streaming_request_outside_upload_is_not_drained(self, real_sprites_sdk, tmp_path,
                                                              monkeypatch):

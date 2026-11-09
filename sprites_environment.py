@@ -337,8 +337,10 @@ def _is_within(path: str, directory: str) -> bool:
 #: turns a filesystem 401 into a ``FilesystemError`` that keeps no status.
 #: ``last_error`` holds the status of the last HTTP error response (status
 #: >= 400) seen on this thread. Only while ``capture_fs_write`` is set (by
-#: ``_fs_write``, around the SDK's upload call) does the hook also read and
-#: parse the error body, so streaming requests elsewhere are never drained.
+#: ``_fs_write``, around the SDK's upload call) does the hook also keep the
+#: error response itself in ``error_response``, for ``_fs_write`` to parse
+#: after the SDK has raised. The hook never reads a body, so streaming
+#: requests are never drained.
 #: ``tried_tokens``, when ``_fs_write`` sets it, collects every token the
 #: 401 refresh read during that call, so none of them reaches an error.
 _http_auth = threading.local()
@@ -349,66 +351,36 @@ def _note_http_status(response) -> None:
     if status == 401:
         _http_auth.saw_401 = True
     if isinstance(status, int) and status >= 400:
-        error = {"status_code": status}
+        _http_auth.last_error = {"status_code": status}
         if getattr(_http_auth, "capture_fs_write", False):
-            try:
-                error = _parse_error_response(response)
-            except Exception:
-                pass
-        _http_auth.last_error = error
+            _http_auth.error_response = response
 
 
-#: At most this much of an error body is read by the hook (the API's are a
-#: few hundred bytes); a longer body is not parsed.
+#: At most this much of an error body is read or parsed (the API's are a
+#: few hundred bytes); a longer body, or one of unknown length not yet
+#: read, yields the status alone.
 _ERROR_BODY_MAX_BYTES = 64 * 1024
 
 
-def _error_body_head(response, limit: int) -> "bytes | None":
-    """The body of ``response`` if it is at most ``limit`` bytes, else None.
+def _error_body(response) -> "bytes | None":
+    """The decoded body of ``response`` if at most ``_ERROR_BODY_MAX_BYTES``.
 
-    Stops reading once more than ``limit`` bytes have arrived, so at most
-    ``limit`` plus one network chunk is read, however long the body. A response hook runs
-    before httpx reads the body, so the bytes read here are put back: the
-    response's stream is replaced by one that yields them and then the rest
-    of the original stream (or re-raises the error that stopped the read).
-    httpx, and so the SDK, still sees the whole body, or fails as it would
-    have without the hook.
+    Called after the SDK raised. sprites-py's ``write_bytes`` (0.5.1 through
+    0.7.2) makes a non-streaming ``put()``, so httpx has already read and
+    decoded (gzip, deflate) the body by then: ``response.content`` is used.
+    A body not yet read is read only when its ``Content-Length`` is known
+    and within the budget; otherwise None (report the status alone).
     """
-    try:
-        return response.content  # already in memory (e.g. built from bytes)
-    except Exception:
-        pass
     import httpx
 
-    original = response.stream
-    if not isinstance(original, httpx.SyncByteStream):
-        return None
-    chunks, size, failure = [], 0, None
-    it = iter(original)
     try:
-        while size <= limit:
-            chunk = next(it, None)
-            if chunk is None:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-    except Exception as e:
-        failure = e
-    done = failure is None and size <= limit
-
-    class _Replay(httpx.SyncByteStream):
-        def __iter__(self):
-            yield from chunks
-            if failure is not None:
-                raise failure
-            if not done:
-                yield from it
-
-        def close(self):
-            original.close()
-
-    response.stream = _Replay()
-    return b"".join(chunks) if done else None
+        body = response.content
+    except httpx.ResponseNotRead:
+        length = response.headers.get("content-length", "")
+        if not (length.isdigit() and int(length) <= _ERROR_BODY_MAX_BYTES):
+            return None
+        body = response.read()
+    return body if len(body) <= _ERROR_BODY_MAX_BYTES else None
 
 
 def _parse_error_response(response) -> dict:
@@ -425,12 +397,9 @@ def _parse_error_response(response) -> dict:
     import json
 
     error = {"status_code": response.status_code}
-    length = response.headers.get("content-length", "")
-    if length.isdigit() and int(length) > _ERROR_BODY_MAX_BYTES:
-        return error
     try:
-        body = _error_body_head(response, _ERROR_BODY_MAX_BYTES)
-        data = json.loads(body) if body and len(body) <= _ERROR_BODY_MAX_BYTES else None
+        body = _error_body(response)
+        data = json.loads(body) if body else None
     except Exception:
         data = None
     if not isinstance(data, dict):
@@ -1380,12 +1349,15 @@ class SpritesEnvironment(BaseEnvironment):
 
         def write():
             _http_auth.last_error = None
+            _http_auth.error_response = None
             _http_auth.capture_fs_write = True
             try:
                 (self._fs / remote_path).write_bytes(data, mode=mode, mkdir_parents=True)
             finally:
                 _http_auth.capture_fs_write = False
                 attempt["error"] = getattr(_http_auth, "last_error", None)
+                attempt["response"] = _http_auth.error_response
+                _http_auth.error_response = None
 
         tried = set()
         outer_tried = getattr(_http_auth, "tried_tokens", None)
@@ -1398,6 +1370,11 @@ class SpritesEnvironment(BaseEnvironment):
         finally:
             _http_auth.tried_tokens = outer_tried
         seen = attempt.get("error")
+        if seen and attempt.get("response") is not None:
+            try:
+                seen = _parse_error_response(attempt["response"])
+            except Exception:
+                pass
         secrets = tuple(s for s in (token, self._token, *tried) if s)
         if not seen:
             if _mentions(failure, secrets):

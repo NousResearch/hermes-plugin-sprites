@@ -907,9 +907,9 @@ class TestFileSyncPush:
 
 
 def _is_part(path: str) -> bool:
-    """A chunk part: ``.sync-staging/.sync-<hex>.d/NNNNN``."""
+    """A chunk part: ``.sync-staging/.sync-<hex>.d/NNNNNNNN``."""
     import re
-    return re.search(r"/\.sync-staging/\.sync-[0-9a-f]+\.d/\d{5}$", path) is not None
+    return re.search(r"/\.sync-staging/\.sync-[0-9a-f]+\.d/\d{8}$", path) is not None
 
 
 class _RateLimitedSprite:
@@ -1660,7 +1660,7 @@ class TestSyncUnderWriteLimit:
         upload = staging / f".sync-{name}.d"
         upload.mkdir()
         for i, chunk in enumerate(chunks):
-            part = upload / f"{i:05d}"
+            part = upload / f"{i:08d}"
             part.write_bytes(chunk)
             part.chmod(0o600)
         return staging, upload
@@ -1686,7 +1686,7 @@ class TestSyncUnderWriteLimit:
         staging, upload = self._upload_dir(tmp_path, [b"first ", b"second ", b"third"])
         stale_dir = staging / ".sync-old.d"
         stale_dir.mkdir()
-        (stale_dir / "00000").write_bytes(b"old secret")
+        (stale_dir / "00000000").write_bytes(b"old secret")
         os.utime(stale_dir, (0, 0))
         stale_tar = staging / ".sync-old.tar"
         stale_tar.write_bytes(b"old secret")
@@ -1699,7 +1699,7 @@ class TestSyncUnderWriteLimit:
         dest = dest_dir / "file.bin"
         dest.write_bytes(b"old")
         if not ok:
-            (upload / "00001").unlink()
+            (upload / "00000001").unlink()
 
         rc = self._run_join(bindir, upload, dest, 3)
         if ok:
@@ -1747,6 +1747,82 @@ class TestSyncUnderWriteLimit:
         assert self._run_join(bindir, upload, dest, 512) == 0
         assert dest.read_bytes() == b"".join(chunks)
         assert not upload.exists()
+
+    @staticmethod
+    def _dash_join(tmp_path, dirname, count):
+        """Write ``count`` tiny parts into ``dirname`` under ``tmp_path`` and
+        join them with the Sprite's /bin/sh (dash) and real coreutils."""
+        import subprocess
+
+        from sprites_environment import _assemble_script, _part_name
+
+        upload = tmp_path / dirname
+        upload.mkdir(parents=True)
+        for i in range(count):
+            (upload / _part_name(i)).write_bytes(b"%d," % i)
+        dest = tmp_path / "d"
+        proc = subprocess.run(
+            [shutil.which("dash"), "-c", _assemble_script(str(upload), str(dest), count)],
+            check=False, capture_output=True)
+        assert proc.returncode == 0, proc.stderr[-500:]
+        assert not upload.exists()
+        return dest.read_bytes()
+
+    @pytest.mark.skipif(shutil.which("dash") is None, reason="needs dash (the Sprite's /bin/sh)")
+    def test_assemble_script_joins_30000_parts_at_real_length_paths(self, tmp_path):
+        """Past ARG_MAX for one argv of every part path: the join must not
+        put all the parts on one command line."""
+        name = ("h" * 40 + "/.hermes/.sync-staging/.sync-" + "a" * 32 + ".d")
+        count = 30_000
+        assert count * len(str(tmp_path / name / "00000000")) > 2 * 1024 * 1024
+        assert self._dash_join(tmp_path, name, count) == b"".join(
+            b"%d," % i for i in range(count))
+
+    @pytest.mark.skipif(shutil.which("dash") is None, reason="needs dash (the Sprite's /bin/sh)")
+    def test_assemble_script_keeps_order_across_99999_to_100000(self, tmp_path):
+        """Short paths and one-number parts, named as the upload names them."""
+        count = 100_002
+        out = self._dash_join(tmp_path, "u", count)
+        assert out.endswith(b"99998,99999,100000,100001,")
+        assert out == b"".join(b"%d," % i for i in range(count))
+
+    def test_part_names_are_fixed_width(self, make_env, monkeypatch, tmp_path):
+        import sprites_environment as se
+
+        env = make_env(task_id="names")
+        names = []
+        env._fs = MagicMock()
+        env._fs.__truediv__.side_effect = lambda path: names.append(path) or MagicMock()
+        env._exec_or_raise = lambda *a: None
+        monkeypatch.setattr(se, "_SYNC_WRITE_MAX_BYTES", 1)
+        big = tmp_path / "big"
+        big.write_bytes(b"x" * 12)
+        env._sprite_upload_chunked(str(big), "/home/sprite/.hermes/big")
+        assert [n.rsplit("/", 1)[1] for n in names] == [f"{i:08d}" for i in range(12)]
+
+    def test_file_needing_more_parts_than_names_allow_is_refused_before_upload(
+        self, make_env, monkeypatch, tmp_path
+    ):
+        import sprites_environment as se
+
+        env = make_env(task_id="too-many")
+        env._fs = MagicMock()
+        scripts = []
+        env._exec_or_raise = lambda script, *a: scripts.append(script)
+        monkeypatch.setattr(se, "_SYNC_WRITE_MAX_BYTES", 2)
+        monkeypatch.setattr(se, "_MAX_PARTS", 3)
+        ok = tmp_path / "ok"
+        ok.write_bytes(b"x" * 6)
+        env._sprite_upload_chunked(str(ok), "/home/sprite/.hermes/ok")
+        assert env._fs.__truediv__.call_count == 3
+        env._fs.reset_mock()
+        scripts.clear()
+        big = tmp_path / "big"
+        big.write_bytes(b"x" * 7)
+        with pytest.raises(ValueError, match="too large"):
+            env._sprite_upload_chunked(str(big), "/home/sprite/.hermes/big")
+        assert env._fs.__truediv__.call_count == 0, "nothing is written"
+        assert not [s for s in scripts if "big" in s], "no join is run"
 
     @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
     @pytest.mark.parametrize("sudo_ok", [False, True])
@@ -1800,11 +1876,11 @@ class TestSyncUnderWriteLimit:
         bindir = self._join_bin(tmp_path)
         staging, live = self._upload_dir(tmp_path, [b"a", b"b"], name="live")
         old = time.time() - 10 * 60 * _STALE_SYNC_MINUTES
-        os.utime(live / "00000", (old, old))  # written long ago, dir still busy
+        os.utime(live / "00000000", (old, old))  # written long ago, dir still busy
         _, idle = self._upload_dir(tmp_path, [b"a"], name="idle")
         (idle / "out").write_bytes(b"half-joined temp output")
         just_over = time.time() - 60 * _STALE_SYNC_MINUTES - 120
-        for p in (idle / "00000", idle / "out", idle):
+        for p in (idle / "00000000", idle / "out", idle):
             os.utime(p, (just_over, just_over))
         _, recent = self._upload_dir(tmp_path, [b"a"], name="recent")
         under = time.time() - 60 * _STALE_SYNC_MINUTES + 120
@@ -1812,7 +1888,7 @@ class TestSyncUnderWriteLimit:
 
         subprocess.run([shutil.which("sh"), "-c", _sweep_script(str(staging))],
                        env={**os.environ, "PATH": str(bindir)}, check=True)
-        assert (live / "00000").exists() and (live / "00001").exists()
+        assert (live / "00000000").exists() and (live / "00000001").exists()
         assert recent.exists()
         assert not idle.exists(), "the idle upload and its temp output are reclaimed"
 
@@ -1838,7 +1914,7 @@ class TestSyncUnderWriteLimit:
         import time
         start = time.time()
         assert self._run_join(bindir, upload, tmp_path / "dest", 2) != 0
-        assert sorted(p.name for p in upload.iterdir()) == ["00000"]
+        assert sorted(p.name for p in upload.iterdir()) == ["00000000"]
         assert upload.stat().st_mtime >= start - 2
 
 

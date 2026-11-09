@@ -198,7 +198,8 @@ caches copied into `~/.hermes` on the Sprite before each command) therefore:
   the sync, which is retried in full before the next command; an upload
   directory left by a sync that never finished is removed, temp file and all,
   once the directory has been idle for two hours (every part written
-  refreshes it, so a slow upload in progress is never removed);
+  refreshes it). This is best-effort: an upload stalled for longer than that
+  can lose its directory, and its join then fails and the sync is retried;
 - deletes files that disappeared on the host with one exec per batch,
   `rm -f -- <paths>`, retried as `sudo -n rm -f -- <paths>` because `fs/write`
   creates root-owned files while the base image runs commands as `sprite`. A

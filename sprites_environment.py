@@ -891,6 +891,12 @@ def _build_archive(files: list[tuple[str, str]]) -> bytes:
 #: idle time, not its age. An archive is idle only between its write and its
 #: unpack (``_UNPACK_TIMEOUT``). A sync stalled for longer than this loses
 #: its staging; its join or unpack then fails and the sync is retried.
+#:
+#: This is best-effort, not a lock: ``find`` selects a directory and removes
+#: it a moment later, so a join that starts in between can still lose it.
+#: That needs an upload already stalled past the threshold, and the join
+#: then fails (its parts or its ``out`` are gone, so it never reaches the
+#: rename), the destination is left as it was, and the sync is retried.
 _STALE_SYNC_MINUTES = 120
 
 #: Exit status of the unpack script when the archive could not be removed.
@@ -902,7 +908,9 @@ def _sweep_script(staging_dir: str) -> str:
     left behind by earlier syncs that never finished (only names this plugin
     makes). An upload directory goes as a whole, parts and temp output
     alike, and only once the directory itself has been idle for
-    ``_STALE_SYNC_MINUTES``, so an upload still in flight is never touched."""
+    ``_STALE_SYNC_MINUTES``. This is best-effort: an upload that is only
+    resumed after that long can lose its directory, and its join then fails
+    and the sync is retried (see ``_STALE_SYNC_MINUTES``)."""
     staging = shlex.quote(staging_dir)
     return (
         f"find {staging} -mindepth 1 -maxdepth 1 "
@@ -933,18 +941,42 @@ def _unpack_script(archive_path: str) -> str:
     )
 
 
+#: Part files are named by their index as exactly this many digits
+#: (``00000000``, ``00000001``, ...), so a file may have at most
+#: ``_MAX_PARTS`` parts (``10**8`` parts of 4 MiB is 400 TiB, far beyond any
+#: disk). ``_sprite_upload_chunked`` refuses a larger file before sending
+#: anything.
+_PART_DIGITS = 8
+_MAX_PARTS = 10 ** _PART_DIGITS
+
+
+def _part_name(index: int) -> str:
+    """Name of part ``index`` of a chunked upload (see ``_JOIN_BODY``)."""
+    return f"{index:0{_PART_DIGITS}d}"
+
+
 #: Joins the parts of a chunked upload; run as ``sh -c J sh DIR DEST N``.
 #: Refuses an incomplete upload (fewer than N parts) and a destination that
 #: is a directory or a symlink to one (``[ -d ]`` follows symlinks; ``mv
 #: -T`` also refuses a real directory that appears in between). A symlink to
 #: a file is replaced by the file, as a single ``fs/write`` would.
+#:
+#: The parts are joined by index, ``_JOIN_BATCH`` at a time per ``cat``, so
+#: neither the argument list (one glob over all parts exceeds ARG_MAX at
+#: tens of thousands of parts) nor the sort order of the names matters. The
+#: name of part ``i`` is the last ``_PART_DIGITS`` digits of ``10**8 + i``,
+#: which needs no subshell per part. A missing part makes its ``cat`` fail.
+_JOIN_BATCH = 256
 _JOIN_BODY = (
     'c=0; for p in "$1"/[0-9]*; do [ -f "$p" ] && c=$((c+1)); done; '
     '[ "$c" -eq "$3" ] || { echo "upload has $c of $3 parts" >&2; exit 65; }; '
     '[ ! -d "$2" ] || { echo "$2 is a directory" >&2; exit 66; }; '
-    'p=${2%/*}; mkdir -p -- "${p:-/}" && '
-    'cat -- "$1"/[0-9]* > "$1/out" && '
-    'chmod 0644 -- "$1/out" && mv -fT -- "$1/out" "$2"'
+    'p=${2%/*}; mkdir -p -- "${p:-/}" || exit 1; '
+    'd=$1; t=$2; n=$3; i=0; while [ "$i" -lt "$n" ]; do set --; '
+    'while [ "$i" -lt "$n" ] && [ "$#" -lt ' + str(_JOIN_BATCH) + ' ]; do '
+    'k=$((' + str(_MAX_PARTS) + '+i)); set -- "$@" "$d/${k#1}"; i=$((i+1)); done; '
+    'cat -- "$@" || exit 1; done > "$d/out" || exit 1; '
+    'chmod 0644 -- "$d/out" && mv -fT -- "$d/out" "$t"'
 )
 
 
@@ -954,11 +986,11 @@ def _assemble_script(upload_dir: str, remote_path: str, part_count: int) -> str:
 
     The Sprites 2 docs offer no append or partial write ("Files": one
     ``PUT fs/write`` per file, at most 16 MiB), so a file larger than one
-    write arrives as numbered part files (``00000``, ``00001``, ...) in its
-    own directory and is joined here. The command has the same length
-    whatever the number of parts: the parts are found by a glob (the
-    zero-padded names sort in order in any locale) and counted against
-    ``part_count``, and the cleanup is one ``rm -rf``. The parts are
+    write arrives as numbered part files (``00000000``, ``00000001``, ...)
+    in its own directory and is joined here. The command has the same
+    length whatever the number of parts: the parts are counted against
+    ``part_count`` and joined in a loop by index (see ``_JOIN_BODY``), and
+    the cleanup is one ``rm -rf``. The parts are
     concatenated into ``out`` inside ``upload_dir``, set to 0644 like a
     single ``fs/write``, and renamed over the destination with ``mv -fT``
     (GNU coreutils, which the Sprites base image ships as ``mv``). Sync
@@ -967,7 +999,8 @@ def _assemble_script(upload_dir: str, remote_path: str, part_count: int) -> str:
     one, never a partial one. Nothing
     is written next to the destination, so a join cut short leaves nothing
     there; ``out`` goes with the directory, by this script or a later
-    sweep. The directory is touched first so the sweep sees it as live.
+    sweep. The directory is touched first so the sweep (best-effort, see
+    ``_STALE_SYNC_MINUTES``) sees it as live.
 
     The parts are root-owned 0600 ``fs/write`` files, so a non-root exec
     user retries through ``sudo -n`` as ``_unpack_script`` does. Exits
@@ -1374,8 +1407,14 @@ class SpritesEnvironment(BaseEnvironment):
         ``~/.hermes/.sync-staging/.sync-<random>.d``. The file is read to its
         end, so all of it is sent whatever its size. Any failure raises, so
         ``FileSyncManager`` rolls back and retries; the directory is removed
-        on a best-effort basis, and otherwise by a later sync's sweep.
+        on a best-effort basis, and otherwise by a later sync's sweep. A file
+        that would need more than ``_MAX_PARTS`` parts is refused before
+        anything is sent.
         """
+        if os.path.getsize(host_path) > _MAX_PARTS * _SYNC_WRITE_MAX_BYTES:
+            raise ValueError(
+                f"{host_path} is too large to sync: more than {_MAX_PARTS} "
+                f"parts of {_SYNC_WRITE_MAX_BYTES} bytes")
         upload_dir = posixpath.join(
             self._remote_home, ".hermes", ".sync-staging",
             f".sync-{uuid.uuid4().hex}.d")
@@ -1387,7 +1426,9 @@ class SpritesEnvironment(BaseEnvironment):
                     chunk = f.read(_SYNC_WRITE_MAX_BYTES)
                     if not chunk and parts:
                         break
-                    part = posixpath.join(upload_dir, f"{len(parts):05d}")
+                    if len(parts) >= _MAX_PARTS:  # the file grew as it was read
+                        raise ValueError(f"{host_path} grew past {_MAX_PARTS} parts")
+                    part = posixpath.join(upload_dir, _part_name(len(parts)))
                     parts.append(part)
                     self._with_auth_retry(
                         lambda: (self._fs / part).write_bytes(

@@ -2797,8 +2797,11 @@ class TestSdkShaped401:
         host = tmp_path / "f.txt"
         host.write_bytes(b"data")
         _write_token(token_file, "file-token-2")
-        with pytest.raises(_FilesystemError):
+        from sprites_environment import SpritesHttpError
+        with pytest.raises(SpritesHttpError) as info:
             env._sprite_upload(str(host), "/home/sprite/f.txt")
+        assert info.value.status_code == 500
+        assert isinstance(info.value.__cause__, _FilesystemError)
         env._SpritesClient.assert_not_called()
 
 
@@ -3423,3 +3426,208 @@ class TestRealSdk401:
             assert _is_auth_error(info.value)
         finally:
             client.close()
+
+
+class TestFsWriteErrorDetail:
+    """An fs/write HTTP error names the status, code and request id.
+
+    Driven through the real sprites-py ``write_bytes``: 0.5.1 cannot parse
+    a Sprites 2 error body and raises ``AttributeError: 'dict' object has
+    no attribute 'lower'`` instead.
+    """
+
+    TOKEN = "env-token-secret"
+
+    def _env(self, real_sprites_sdk, handler, hooked=True):
+        import threading
+        import httpx
+        from sprites_environment import SpritesEnvironment
+
+        def make_client(token, timeout):
+            client = real_sprites_sdk.SpritesClient(token=token, timeout=timeout)
+            client._client.close()
+            client._client = httpx.Client(transport=httpx.MockTransport(handler))
+            return client
+
+        env = object.__new__(SpritesEnvironment)
+        env._SpritesClient = make_client
+        env._client_timeout = 30
+        env._token_source = MagicMock(path=None)  # an env token: no 401 refresh
+        env._token = self.TOKEN
+        env._client = env._new_client(self.TOKEN) if hooked else make_client(self.TOKEN, 30)
+        env._sprite_name = "offline-probe"
+        env._sprite = env._client.sprite("offline-probe")
+        env._fs = env._sprite.filesystem("/")
+        env._auth_lock = threading.Lock()
+        env._exec_env = None
+        env._remote_home = "/home/sprite"
+        env._use_archives = True
+        return env
+
+    def _upload(self, env, tmp_path, content=b"file-body-bytes"):
+        host = tmp_path / "f.txt"
+        host.write_bytes(content)
+        try:
+            env._sprite_upload(str(host), "/home/sprite/f.txt")
+        finally:
+            env._client.close()
+
+    @staticmethod
+    def _envelope(status, code, message, request_id, details=None):
+        import httpx
+        error = {"code": code, "message": message, "request_id": request_id}
+        if details is not None:
+            error["details"] = details
+        return lambda request: httpx.Response(status, json={"error": error})
+
+    def test_413_names_status_code_and_request_id(self, real_sprites_sdk, tmp_path, monkeypatch):
+        from sprites_environment import SpritesHttpError
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk, self._envelope(
+            413, "file_too_large", "File is too large.", "GN4cREQ413",
+            {"max_bytes": 16777216}))
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        text = str(info.value)
+        assert "413" in text and "file_too_large" in text and "GN4cREQ413" in text
+        assert "File is too large." in text
+        assert info.value.status_code == 413
+        assert info.value.code == "file_too_large"
+        assert info.value.request_id == "GN4cREQ413"
+        assert info.value.retry_after_ms is None
+        # The SDK's own (broken-parser) error is kept as the cause.
+        assert isinstance(info.value.__cause__, AttributeError)
+        assert "file-body-bytes" not in text
+
+    def test_429_sets_retry_after_ms(self, real_sprites_sdk, tmp_path, monkeypatch):
+        from sprites_environment import SpritesHttpError
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk, self._envelope(
+            429, "rate_limited", "Rate limited.", "GN4cREQ429",
+            {"limit": 300, "operation": "exec_open", "retry_ms": 60000}))
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        assert info.value.status_code == 429
+        assert info.value.code == "rate_limited"
+        assert info.value.retry_after_ms == 60000
+        assert "60000" in str(info.value)
+
+    def test_502_with_empty_body(self, real_sprites_sdk, tmp_path, monkeypatch):
+        import httpx
+        from sprites_environment import SpritesHttpError
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk, lambda request: httpx.Response(502))
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        assert info.value.status_code == 502
+        assert info.value.code is None
+        assert "HTTP 502" in str(info.value)
+
+    def test_plain_string_error_shape(self, real_sprites_sdk, tmp_path, monkeypatch):
+        import httpx
+        from sprites_environment import SpritesHttpError
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk,
+                        lambda request: httpx.Response(400, json={"error": "bad path"}))
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        assert info.value.status_code == 400
+        assert "HTTP 400" in str(info.value) and "bad path" in str(info.value)
+
+    def test_bulk_upload_archive_write_reports_status(self, real_sprites_sdk, tmp_path,
+                                                      monkeypatch):
+        from sprites_environment import SpritesHttpError
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk, self._envelope(
+            413, "file_too_large", "File is too large.", "GN4cBULK"))
+        host = tmp_path / "a.txt"
+        host.write_bytes(b"archive member")
+        try:
+            with pytest.raises(SpritesHttpError) as info:
+                env._sprite_bulk_upload([(str(host), "/home/sprite/a.txt")])
+        finally:
+            env._client.close()
+        assert info.value.status_code == 413 and "GN4cBULK" in str(info.value)
+
+    def test_token_echoed_by_server_is_never_in_message(self, real_sprites_sdk, tmp_path,
+                                                        monkeypatch):
+        from sprites_environment import SpritesHttpError, _mentions
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk, self._envelope(
+            403, "forbidden", f"token {self.TOKEN} may not write", "GN4cTOK"))
+        with pytest.raises(SpritesHttpError) as info:
+            self._upload(env, tmp_path)
+        assert not _mentions(info.value, (self.TOKEN,))
+        assert info.value.status_code == 403 and "GN4cTOK" in str(info.value)
+        assert self.TOKEN not in (info.value.error_message or "")
+
+    def test_error_without_http_error_is_unchanged(self, real_sprites_sdk, tmp_path, monkeypatch):
+        """A genuine AttributeError (no HTTP error seen) surfaces as is."""
+        import httpx
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk, lambda request: httpx.Response(200, json={}))
+
+        class _Broken:
+            def write_bytes(self, *args, **kwargs):
+                env._client._client.put("https://sprites.invalid/fs/write", content=b"x")
+                raise AttributeError("a real bug")
+
+        env._fs = MagicMock()
+        env._fs.__truediv__.return_value = _Broken()
+        with pytest.raises(AttributeError, match="a real bug"):
+            self._upload(env, tmp_path)
+
+    def test_stale_error_from_an_earlier_call_is_not_reused(self, real_sprites_sdk, tmp_path,
+                                                            monkeypatch):
+        import httpx
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk, lambda request: httpx.Response(500))
+        env._client._client.get("https://sprites.invalid/other")  # earlier HTTP error
+
+        class _Broken:
+            def write_bytes(self, *args, **kwargs):
+                raise AttributeError("a real bug")
+
+        env._fs = MagicMock()
+        env._fs.__truediv__.return_value = _Broken()
+        with pytest.raises(AttributeError, match="a real bug"):
+            self._upload(env, tmp_path)
+
+    def test_client_without_event_hooks_raises_sdk_error(self, real_sprites_sdk, tmp_path,
+                                                         monkeypatch):
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk, self._envelope(
+            413, "file_too_large", "File is too large.", "GN4cNOHOOK"), hooked=False)
+        with pytest.raises(AttributeError):  # the SDK's own error, unchanged
+            self._upload(env, tmp_path)
+
+    def test_client_object_without_event_hooks_still_builds(self, tmp_path, monkeypatch):
+        from sprites_environment import SpritesEnvironment
+        env = object.__new__(SpritesEnvironment)
+        env._SpritesClient = lambda token, timeout: object()
+        env._client_timeout = 30
+        assert env._new_client("t") is not None
+
+    def test_sync_manager_warning_names_status(self, real_sprites_sdk, tmp_path, monkeypatch,
+                                               caplog):
+        """The line FileSyncManager logs on a failed sync names the status."""
+        import logging
+        from tools.environments.file_sync import FileSyncManager
+        monkeypatch.delenv("SPRITES_TOKEN_FILE", raising=False)
+        env = self._env(real_sprites_sdk, self._envelope(
+            413, "file_too_large", "File is too large.", "GN4cSYNC"))
+        host = tmp_path / "a.txt"
+        host.write_bytes(b"x")
+        manager = FileSyncManager(
+            get_files_fn=lambda: [(str(host), "/home/sprite/a.txt")],
+            upload_fn=env._sprite_upload,
+            delete_fn=lambda paths: None,
+            bulk_upload_fn=env._sprite_bulk_upload,
+        )
+        try:
+            with caplog.at_level(logging.WARNING):
+                manager.sync(force=True)
+        finally:
+            env._client.close()
+        assert any("413" in r.getMessage() and "GN4cSYNC" in r.getMessage()
+                   for r in caplog.records)

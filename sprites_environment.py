@@ -817,6 +817,12 @@ class _SharedSpriteSyncManager(FileSyncManager):
     nothing is committed, so the next attempt uploads everything pending.
     Forced syncs always run.
 
+    Once ``close()`` has been called (the environment was cleaned up and its
+    client closed), ``sync`` does nothing and a failure of a sync that was
+    already running is not recorded: an upload through a closed client says
+    nothing about the Sprite, and must not hold off the environments that
+    still use it.
+
     Core swallows sync errors, so the outcome is read from the transport
     callables handed to core, which are wrapped here, and from core's synced
     state: a cycle in which a transport call raised is a failure. A cycle in
@@ -844,6 +850,11 @@ class _SharedSpriteSyncManager(FileSyncManager):
         super().__init__(*args, **kwargs)
         self._shared_lock = shared_lock
         self._backoff = backoff or _SyncBackoff("?")
+        self.closed = False
+
+    def close(self) -> None:
+        """Stop syncing; see the class docstring."""
+        self.closed = True
 
     def _watch(self, fn):
         attempt = self._attempt
@@ -865,6 +876,8 @@ class _SharedSpriteSyncManager(FileSyncManager):
         attempt = self._attempt
         with self._shared_lock:
             try:
+                if self.closed:
+                    return
                 if not forced and self._backoff.active():
                     logger.debug("file_sync: Sprite %s in upload backoff; skipping sync",
                                  self._backoff.sprite_name)
@@ -885,7 +898,9 @@ class _SharedSpriteSyncManager(FileSyncManager):
                     # (with this thread-local slot) can stay idle for hours.
                     hint = _retry_hint_seconds(attempt.error) if failed else None
                     attempt.error = None
-                    if failed:
+                    if self.closed:
+                        pass  # cleaned up mid-sync; see the class docstring
+                    elif failed:
                         self._backoff.failed(hint)
                     elif attempt.called:
                         after = self._commit_marker()
@@ -1981,6 +1996,12 @@ class SpritesEnvironment(BaseEnvironment):
     # ------------------------------------------------------------------
 
     def _before_execute(self) -> None:
+        if self._sync_manager.closed:
+            # Raise rather than let the closed client fail each call: callers
+            # that keep this object (the background-process poller) then
+            # stop, instead of polling a dead environment indefinitely.
+            raise RuntimeError(
+                f"Sprites environment for {self._sprite_name} has been cleaned up")
         self._sync_manager.sync()
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
@@ -2036,6 +2057,11 @@ class SpritesEnvironment(BaseEnvironment):
         with self._lock:
             if self._sprite is None:
                 return
+            # Before the client is closed, so a sync running now does not
+            # record the closed client as an upload failure of the Sprite.
+            sync_manager = getattr(self, "_sync_manager", None)
+            if sync_manager is not None:
+                sync_manager.close()
 
             # No sync_back: the Sprite's persistent ext4 filesystem IS the
             # authoritative store. Files the agent touched stay in the Sprite

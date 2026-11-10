@@ -2789,6 +2789,57 @@ class TestSyncRetryBackoff:
         assert rig.remote[rig.remote_path] == b"v2"
         assert backoff.failures == 1, "an unreadable outcome never clears the backoff"
 
+    def test_cleaned_up_environment_neither_syncs_nor_backs_off_its_sprite(self, rig):
+        live = rig.build(task="live")
+        gone = rig.build(task="gone")  # same Sprite (scope: instance)
+        name = gone._sprite_name
+        assert live._sprite_name == name
+        attempts = rig.attempts[name]
+        commands = gone._mock_sprite.command.call_count
+        gone.cleanup()
+
+        # A file changes and core's sync interval passes, so a sync would upload.
+        rig.host.write_bytes(b"v2")
+        rig.clock.now += 5.0
+        rig.fail = RuntimeError("Cannot send a request, as the client has been closed.")
+        backoff = live._sync_manager._backoff
+        for _ in range(3):  # e.g. a background-process poller still holding it
+            with pytest.raises(RuntimeError, match="has been cleaned up"):
+                gone.execute("true")
+            gone._sync_manager.sync()
+        assert rig.attempts[name] == attempts, "no upload through the closed client"
+        assert gone._mock_sprite.command.call_count == commands, "no exec either"
+        assert (backoff.failures, backoff.deadline) == (0, 0.0)
+
+        rig.fail = None
+        live._before_execute()
+        assert rig.attempts[name] == attempts + 1, "the live environment is not held off"
+        assert rig.remote[rig.remote_path] == b"v2"
+
+    def test_cleanup_during_a_sync_does_not_back_off_the_sprite(self, rig, monkeypatch):
+        import sprites_environment as se
+
+        uploads = se.SpritesEnvironment._sprite_bulk_upload  # the rig's recorder
+        closing = []
+
+        def cleaned_up_mid_upload(self, files):
+            if self not in closing:
+                return uploads(self, files)
+            self.cleanup()
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        # Bound into each sync manager at construction, so patch before building.
+        monkeypatch.setattr(se.SpritesEnvironment, "_sprite_bulk_upload", cleaned_up_mid_upload)
+        live = rig.build(task="live")
+        gone = rig.build(task="gone")
+        backoff = live._sync_manager._backoff
+        closing.append(gone)
+        rig.host.write_bytes(b"v2")
+        rig.clock.now += 5.0
+        gone._before_execute()
+        assert (backoff.failures, backoff.deadline) == (0, 0.0)
+        assert gone._sprite is None, "the upload did clean the environment up"
+
 
 def test_polling_against_a_failing_sprite_builds_few_archives(
         hermes_runtime, tmp_path, monkeypatch):

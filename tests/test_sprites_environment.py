@@ -874,6 +874,52 @@ class TestRunBashExitCodes:
         assert "before" in out
         assert handle.returncode == 7
 
+    def test_connection_lost_mid_command_is_reported_not_silent(self, make_env):
+        # A checkpoint restore restarts the Sprite and drops every exec
+        # WebSocket (observed: close code 1012) before the EXIT frame, so
+        # sprites-py raises NetworkError. That must reach the agent as a
+        # lost connection with an unknown outcome, not as empty output.
+        env = make_env(task_id="rblost")
+        cmd = MagicMock()
+        cmd.combined_output.side_effect = _NetworkError(
+            "WebSocket closed before receiving command exit status "
+            "(code=1012, reason='internal_error')"
+        )
+        env._mock_sprite.command = MagicMock(return_value=cmd)
+
+        handle = env._run_bash("sleep 90", timeout=150)
+        handle.wait()
+        out = handle.stdout.read()
+        assert handle.returncode == 255
+        assert "connection to the Sprite was lost" in out
+        assert "code=1012" in out
+        assert "outcome is unknown" in out
+
+    def test_other_exec_errors_carry_their_message(self, make_env):
+        # An auth failure (a NetworkError wrapping a 401 handshake) is not a
+        # lost connection, and must still say what went wrong.
+        env = make_env(task_id="rbauth")
+        cmd = MagicMock()
+        try:
+            try:
+                raise _APIError401("handshake refused: 401")
+            except _APIError401 as inner:
+                # Carries the lost-connection phrase, so only the auth check
+                # keeps it out of the 255 path.
+                raise _NetworkError(
+                    "WebSocket command failed before receiving command exit status"
+                ) from inner
+        except _NetworkError as wrapped:
+            cmd.combined_output.side_effect = wrapped
+        env._mock_sprite.command = MagicMock(return_value=cmd)
+
+        handle = env._run_bash("true", timeout=10)
+        handle.wait()
+        out = handle.stdout.read()
+        assert handle.returncode == 1
+        assert "connection to the Sprite was lost" not in out
+        assert "WebSocket command failed" in out
+
     @pytest.mark.parametrize("timeout_type", [_SpritesTimeoutError, TimeoutError], ids=["sdk", "sync-future"])
     def test_timeout_reports_124_after_stopping_the_command(self, make_env, timeout_type):
         env = make_env(task_id="rbto")
@@ -967,7 +1013,8 @@ class TestKillStopsTheRemoteCommand:
         _, exc_mod = sprites_sdk
 
         def dropped():
-            raise exc_mod.NetworkError("connection closed before exit status")
+            raise exc_mod.NetworkError(
+                "WebSocket closed before receiving command exit status (code=1006)")
 
         calls = _route_commands(env, user=dropped)
         handle = env._run_bash("make deploy", timeout=60)
@@ -976,7 +1023,7 @@ class TestKillStopsTheRemoteCommand:
 
         assert len(calls["stop"]) == 1
         assert _marker_of(calls["user"][0]) in calls["stop"][0]
-        assert handle.returncode == 1
+        assert handle.returncode == 255
 
     def test_each_command_gets_its_own_marker(self, make_env):
         env = make_env(task_id="kill")

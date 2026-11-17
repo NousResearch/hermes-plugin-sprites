@@ -332,6 +332,36 @@ def _is_auth_error(exc: "BaseException | None") -> bool:
     return False
 
 
+#: Exit status for a command whose connection dropped before its exit status
+#: arrived (ssh uses 255 for the same case). The command may have finished,
+#: may have been killed, or may never have started.
+_CONNECTION_LOST_EXIT = 255
+
+#: What sprites-py (0.5.1 through 0.5.x) puts in the NetworkError it raises
+#: when an exec's connection closes or fails after the command started and
+#: before its exit status arrived. A refused start (a rejected handshake,
+#: such as HTTP 400 for an oversized argument) is a NetworkError too, but
+#: reads "WebSocket command failed: ..." and stays a plain failure.
+_NO_EXIT_STATUS = "before receiving command exit status"
+
+
+def _connection_lost_text(exc: BaseException) -> tuple[str, int]:
+    """Output and exit status for an exec whose connection dropped.
+
+    The exec WebSocket closed after the command started and before its exit
+    status arrived (see ``_NO_EXIT_STATUS``). A Sprite restart drops every
+    running exec this way (a checkpoint restore restarts it; observed close
+    code 1012), so the outcome is unknown and the message says so rather
+    than claiming the command never ran.
+    """
+    return (
+        "Sprites: the connection to the Sprite was lost before the command "
+        "finished, so its outcome is unknown. The Sprite may have restarted "
+        f"(for example, a checkpoint restore). Detail: {exc}\n",
+        _CONNECTION_LOST_EXIT,
+    )
+
+
 def _mentions(exc: BaseException, secrets) -> bool:
     """True when ``exc``'s text (or its chain's) contains any of ``secrets``."""
     seen = set()
@@ -2109,7 +2139,8 @@ class SpritesEnvironment(BaseEnvironment):
         """
         sprite = self._sprite
         from sprites.exceptions import (
-            ExitError, SpriteError, TimeoutError as SpritesTimeout)
+            ExitError, NetworkError as SpritesNetworkError, SpriteError,
+            TimeoutError as SpritesTimeout)
 
         exec_id = uuid.uuid4().hex
         shell_cmd = _launch_argv(exec_id, cmd_string, login)
@@ -2166,10 +2197,14 @@ class SpritesEnvironment(BaseEnvironment):
                 # _with_auth_retry already replaced an error naming the token.
                 # The SDK raises the same NetworkError for a refused start and
                 # for a connection lost mid-command, so stop whatever started.
-                text = _exec_failure_text(e, shell_cmd)
+                lost = (isinstance(e, SpritesNetworkError)
+                        and _NO_EXIT_STATUS in str(e)
+                        and not self._was_auth_error(e))
+                text, code = (_connection_lost_text(e) if lost
+                              else (_exec_failure_text(e, shell_cmd), 1))
                 if not stop():
                     text += "Stopping it on the Sprite failed: it may still be running.\n"
-                return (text, 1)
+                return (text, code)
             finally:
                 state["returned"] = True
 

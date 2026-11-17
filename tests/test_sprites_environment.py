@@ -893,6 +893,7 @@ class TestRunBashExitCodes:
         assert handle.returncode == 255
         assert "connection to the Sprite was lost" in out
         assert "code=1012" in out
+        assert "outcome is unknown" in out
 
     def test_other_exec_errors_carry_their_message(self, make_env):
         # An auth failure (a NetworkError wrapping a 401 handshake) is not a
@@ -903,7 +904,11 @@ class TestRunBashExitCodes:
             try:
                 raise _APIError401("handshake refused: 401")
             except _APIError401 as inner:
-                raise _NetworkError("WebSocket command failed") from inner
+                # Carries the lost-connection phrase, so only the auth check
+                # keeps it out of the 255 path.
+                raise _NetworkError(
+                    "WebSocket command failed before receiving command exit status"
+                ) from inner
         except _NetworkError as wrapped:
             cmd.combined_output.side_effect = wrapped
         env._mock_sprite.command = MagicMock(return_value=cmd)

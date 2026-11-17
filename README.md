@@ -205,13 +205,49 @@ caches copied into `~/.hermes` on the Sprite before each command) therefore:
   creates root-owned files while the base image runs commands as `sprite`. A
   missing file is fine; any other failure is retried on the next sync.
 
+## Bot Desktop, computer_use and the browser inside the Sprite
+
+The backend declares `supports_streams`, so Hermes runs the Bot Screen
+(Xvnc + Xfce), cua-driver (`computer_use`) and the bot's headed Chromium
+inside the Sprite instead of refusing them (`bot_desktop.placement: auto`).
+The Screen pane shows the Sprite's screen.
+
+- **Image.** The Sprite needs the desktop stack. Use
+  `nousresearch/hermes-sandbox:<version>-desktop`, pinned by digest, as the
+  `image` setting. Without it, Hermes names the missing binaries.
+- **Transport.** `SpritesEnvironment.exec_prefix()` gives Hermes a local
+  command: `sprite_stream.py`, running under Hermes's Python. It opens one
+  Sprites exec WebSocket (no TTY) per stream and passes bytes through
+  unchanged. It reads the token from `SPRITES_TOKEN_FILE`, or from the
+  `SPRITES_TOKEN` / `SPRITE_TOKEN` variable it inherits. The command line
+  carries the file's path or the variable's name, never the token. A token
+  that exists only in Hermes's secret scope cannot reach a subprocess, so the
+  screen is not available then.
+- **Desktop user.** Commands for the desktop user (`pn` in the sandbox image)
+  run through `sudo -n -H -u <user>`, so `$HOME` is that user's home.
+- **No orphaned sessions.** A Sprites exec session keeps running after its
+  socket closes, and a running session keeps the Sprite awake. Hermes ends
+  streams with SIGKILL. A reaper process, started for each stream in its own
+  session, kills the exec session through the API unless the stream reported
+  that its command finished.
+- **Idle.** An open stream (a viewer watching the screen, a cua-driver
+  session, a DevTools connection) keeps the Sprite running. When nothing is
+  open, the Sprite stops after its idle timeout. A warm stop ends every
+  process, the screen included; the next screen, browser or `computer_use`
+  call starts it again (open tabs are lost; the browser profile on disk
+  stays). A Sprite set to suspend when idle (`auto_idle: "suspend"`, at most
+  16 GB of memory) keeps the screen and its windows through the pause.
+- **Limits.** Each probe and each stream is one exec start. Sprites allows
+  300 exec starts a minute and 32 running execs per Sprite.
+
 ## Tests
 
 ```bash
 # Unit (no token needed): use a Hermes checkout with its test dependencies installed.
 # Run from that checkout, substituting the absolute path to this plugin:
 cd /path/to/hermes-agent
-scripts/run_tests.sh /path/to/hermes-plugin-sprites/tests/test_sprites_environment.py
+scripts/run_tests.sh /path/to/hermes-plugin-sprites/tests/test_sprites_environment.py \
+  /path/to/hermes-plugin-sprites/tests/test_sprite_stream.py
 ```
 
 Through `scripts/run_tests.sh`, the tests import Hermes from the checkout you

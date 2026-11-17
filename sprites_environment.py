@@ -45,6 +45,7 @@ import posixpath
 import re
 import shlex
 import stat
+import sys
 import tarfile
 import threading
 import time
@@ -1730,6 +1731,47 @@ class SpritesEnvironment(BaseEnvironment):
     def _command_kwargs(self) -> dict:
         """Extra ``sprite.command`` kwargs; empty unless the HOME fallback is active."""
         return {"env": dict(self._exec_env)} if self._exec_env else {}
+
+    # ------------------------------------------------------------------
+    # Long-lived streams (Bot Desktop, computer_use, the sandbox browser)
+    # ------------------------------------------------------------------
+
+    def exec_prefix(self, *, user: str | None = None, interactive: bool = True) -> list | None:
+        """Local argv that runs its remainder inside this Sprite with stdin/stdout open.
+
+        Hermes core appends ``bash -c <script>`` and spawns it for the Bot
+        Screen's RFB relay, cua-driver's MCP server, forwarded TCP ports and
+        short probes (``TerminalEnvironmentProvider.supports_streams``). The
+        helper, ``sprite_stream.py``, speaks the Sprites exec WebSocket and
+        reads the token itself from the same source this environment uses:
+        the token file's path, or the name of the variable that holds it, is
+        passed, never the token. None when the token is only in this
+        process's secret scope (not in ``os.environ``), which a subprocess
+        cannot read.
+        """
+        if self._sprite is None:
+            return None
+        prefix = [sys.executable, str(Path(__file__).with_name("sprite_stream.py")),
+                  "--api", str(self._client.base_url), "--sprite", self._sprite.name]
+        if self._token_source.path is not None:
+            prefix += ["--token-file", self._token_source.path]
+        else:
+            var = next((v for v in ("SPRITES_TOKEN", "SPRITE_TOKEN")
+                        if os.environ.get(v) == self._token), None)
+            if var is None:
+                logger.warning(
+                    "Sprites: the token is not in the process environment, so "
+                    "Bot Desktop and computer_use cannot open a stream in %s; set "
+                    "SPRITES_TOKEN_FILE or SPRITES_TOKEN in the environment", self._sprite.name)
+                return None
+            prefix += ["--token-env", var]
+        if user:
+            prefix += ["--user", user]
+        for key, value in (self._exec_env or {}).items():
+            prefix += ["--env", f"{key}={value}"]
+        if not interactive:
+            prefix.append("--no-stdin")
+        return prefix + ["--"]
 
     # ------------------------------------------------------------------
     # File sync callbacks

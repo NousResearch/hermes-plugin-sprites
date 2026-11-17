@@ -174,6 +174,10 @@ class SpritesProvider(TerminalEnvironmentProvider):
     display_name = "Sprites"
     is_remote = True
     is_container = True
+    # Bot Desktop, computer_use and the browser follow the terminal into the
+    # Sprite: SpritesEnvironment.exec_prefix() hands core a local argv
+    # (sprite_stream.py) that streams stdin/stdout over the exec WebSocket.
+    supports_streams = True
     # A durable Sprite is resumed BY NAME; under container_persistent: false
     # a shared deterministic name would let two independent ephemeral runs
     # attach one live VM and delete it out from under each other (#82731).

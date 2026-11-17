@@ -206,13 +206,69 @@ caches copied into `~/.hermes` on the Sprite before each command) therefore:
   creates root-owned files while the base image runs commands as `sprite`. A
   missing file is fine; any other failure is retried on the next sync.
 
+## Bot Desktop, computer_use and the browser inside the Sprite
+
+The backend declares `supports_streams`, so Hermes runs the Bot Screen
+(Xvnc + Xfce), cua-driver (`computer_use`) and the bot's headed Chromium
+inside the Sprite instead of refusing them (`bot_desktop.placement: auto`).
+The Screen pane shows the Sprite's screen.
+
+- **Image.** The Sprite needs the desktop stack. Use
+  `nousresearch/hermes-sandbox:<version>-desktop`, pinned by digest, as the
+  `image` setting. Without it, Hermes names the missing binaries.
+- **Transport.** `SpritesEnvironment.exec_prefix()` gives Hermes a local
+  command: `sprite_stream.py`, running under Hermes's Python. It opens one
+  Sprites exec WebSocket (no TTY) per stream and passes bytes through
+  unchanged. It reads the token from a file whose path is on its command
+  line, never the token: `SPRITES_TOKEN_FILE` when set, else a private copy
+  of the token (a `0600` file in a `0700` directory under `$XDG_RUNTIME_DIR`,
+  `/dev/shm` or `/tmp`, never under `HERMES_HOME`, removed when Hermes
+  exits; a Hermes that is killed or crashes leaves it behind, in
+  `hermes-sprites-stream-*`). A file because Hermes starts cua-driver's stream with only `PATH`
+  in its environment.
+- **Desktop user.** Commands for the desktop user (`pn` in the sandbox image)
+  run through `sudo -n -H -u <user>`, so `$HOME` is that user's home. The
+  image needs `sudo` (the desktop sandbox image has it).
+- **Long commands.** A command whose encoded query would pass 6 KiB (Bot
+  Desktop's setup script carries its launcher and wallpaper) does not go in
+  the URL: a short `python3` bootstrap receives it as the first bytes on
+  stdin (with the `--env` pairs), restores the default SIGPIPE/SIGXFSZ
+  handling and execs it (exit 127
+  when the command does not exist).
+- **Exit status.** The remote command's status, or 255 when the stream itself
+  failed (no token, connection or handshake refused, an error frame, the
+  socket closed before an exit status), with the reason on stderr in one
+  line, as `ssh` does.
+- **No orphaned sessions.** A Sprites exec session keeps running after its
+  socket closes, and a running session keeps the Sprite awake. Hermes ends
+  streams with SIGKILL. A reaper process, started for each stream in its own
+  session before it connects, learns the session id as soon as Sprites sends
+  it and kills the session through the API (TERM, then KILL after 5 s) unless
+  the stream reported that its command finished. A stream killed in the
+  moment between the socket opening and the session id arriving cannot be
+  identified, so that session runs until its command ends. A dropped
+  connection ends the stream (no reconnect).
+- **Idle.** An open stream (a viewer watching the screen, a cua-driver
+  session, a DevTools connection) keeps the Sprite running. Hermes keeps a
+  session's cua-driver stream open until that session ends (cache eviction
+  does not close it), so after one `computer_use` call the Sprite stays
+  running, and billed, until the session is reset or Hermes stops. When nothing is
+  open, the Sprite stops after its idle timeout. A warm stop ends every
+  process, the screen included; the next screen, browser or `computer_use`
+  call starts it again (open tabs are lost; the browser profile on disk
+  stays). A Sprite set to suspend when idle (`auto_idle: "suspend"`, at most
+  16 GB of memory) keeps the screen and its windows through the pause.
+- **Limits.** Each probe and each stream is one exec start. Sprites allows
+  300 exec starts a minute and 32 running execs per Sprite.
+
 ## Tests
 
 ```bash
 # Unit (no token needed): use a Hermes checkout with its test dependencies installed.
 # Run from that checkout, substituting the absolute path to this plugin:
 cd /path/to/hermes-agent
-scripts/run_tests.sh /path/to/hermes-plugin-sprites/tests/test_sprites_environment.py
+scripts/run_tests.sh /path/to/hermes-plugin-sprites/tests/test_sprites_environment.py \
+  /path/to/hermes-plugin-sprites/tests/test_sprite_stream.py
 ```
 
 Through `scripts/run_tests.sh`, the tests import Hermes from the checkout you

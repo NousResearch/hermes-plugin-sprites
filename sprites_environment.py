@@ -45,6 +45,7 @@ import posixpath
 import re
 import shlex
 import stat
+import sys
 import tarfile
 import threading
 import time
@@ -70,20 +71,14 @@ from tools.environments.file_sync import (
 
 logger = logging.getLogger(__name__)
 
-#: Names a file holding the Sprites token (Hermes Cloud writes a short-lived,
-#: per-instance token there and rewrites it on renewal). Not a secret itself.
-SPRITES_TOKEN_FILE_ENV = "SPRITES_TOKEN_FILE"
-
-#: Largest token file read. A token is a few hundred bytes; anything bigger
-#: is not a token file, and the bound keeps a stray large file out of memory.
-_TOKEN_FILE_MAX_BYTES = 8192
-
-_TOKEN_NOT_FROM_ENV = (
-    f"SPRITES_TOKEN is not used while {SPRITES_TOKEN_FILE_ENV} is set."
-)
-
-class SpritesTokenError(ValueError):
-    """No usable Sprites token. The message never contains the token."""
+if __package__:
+    from .sprites_token import (  # noqa: F401  (re-exported: callers and tests use these names here)
+        _TOKEN_FILE_MAX_BYTES, _TOKEN_NOT_FROM_ENV, SPRITES_TOKEN_FILE_ENV, SpritesTokenError,
+        _check_token_path, _read_token_file, _TokenSource)
+else:
+    from sprites_token import (  # noqa: F401
+        _TOKEN_FILE_MAX_BYTES, _TOKEN_NOT_FROM_ENV, SPRITES_TOKEN_FILE_ENV, SpritesTokenError,
+        _check_token_path, _read_token_file, _TokenSource)
 
 
 class SpritesApiError(RuntimeError):
@@ -127,118 +122,6 @@ def _default_lookup(name: str):
     from agent.secret_scope import get_secret
 
     return get_secret(name)
-
-
-def _read_token_file(path: str) -> str:
-    """Read the token from ``path``; raise ``SpritesTokenError`` if unusable.
-
-    The file holds the token alone, optionally followed by one newline. Only
-    a regular file is read (opened non-blocking, so a FIFO cannot stall the
-    caller), at most ``_TOKEN_FILE_MAX_BYTES``. A token must be printable
-    ASCII with no whitespace, so it can never break the HTTP header it is
-    sent in. Error messages name the path, never the contents.
-    """
-    def fail(problem: str) -> SpritesTokenError:
-        return SpritesTokenError(
-            f"{SPRITES_TOKEN_FILE_ENV} is set to {path!r} but {problem}. "
-            + _TOKEN_NOT_FROM_ENV
-        )
-
-    flags = (os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-             | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0))
-    try:
-        fd = os.open(path, flags)
-    except (OSError, ValueError) as e:
-        raise fail(f"the file could not be opened ({type(e).__name__})") from None
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise fail("it is not a regular file")
-        chunks, size = [], 0
-        while size <= _TOKEN_FILE_MAX_BYTES:
-            chunk = os.read(fd, _TOKEN_FILE_MAX_BYTES + 1 - size)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-    except OSError as e:
-        raise fail(f"the file could not be read ({type(e).__name__})") from None
-    finally:
-        os.close(fd)
-    data = b"".join(chunks)
-    if len(data) > _TOKEN_FILE_MAX_BYTES:
-        raise fail(f"the file is larger than {_TOKEN_FILE_MAX_BYTES} bytes")
-    if data.endswith(b"\r\n"):
-        data = data[:-2]
-    elif data.endswith(b"\n"):
-        data = data[:-1]
-    if not data:
-        raise fail("the file is empty")
-    if any(b < 0x21 or b > 0x7E for b in data):
-        raise fail(
-            "the file holds whitespace, control or non-ASCII characters "
-            "(it must hold the token alone, optionally followed by one newline)"
-        )
-    return data.decode("ascii")
-
-
-class _TokenSource:
-    """Where an environment gets its token: a token file, or a fixed env value.
-
-    Decided once, in the caller's secret scope, when the environment is
-    created. Later reads (after a 401, possibly on a worker thread that has
-    no secret scope) re-read the same file and never look up variables again,
-    so they cannot switch to a different credential. ``token_dir`` is the
-    token file's directory, which file sync never uploads from (``None`` for
-    an env token). ``repr`` shows the path only.
-    """
-
-    __slots__ = ("_env_token", "path", "token_dir")
-
-    def __init__(self, path: "str | None" = None, env_token: "str | None" = None):
-        self.path = path
-        self._env_token = env_token
-        self.token_dir = os.path.dirname(path) if path is not None else None
-
-    def read(self) -> str:
-        if self.path is None:
-            return self._env_token
-        _check_token_path(self.path)
-        return _read_token_file(self.path)
-
-    def __repr__(self) -> str:
-        return f"_TokenSource(path={self.path!r})"
-
-
-def _check_token_path(path: str) -> None:
-    """Refuse a ``SPRITES_TOKEN_FILE`` that is not absolute or crosses a symlink.
-
-    Every component is checked with ``lstat``, the file included, so the
-    configured path is the path the OS opens and its directory is the one
-    file sync leaves out. ``.``/``..`` components and repeated separators are
-    refused for the same reason. Checked when the environment is created and
-    again before every read.
-    """
-    def refuse(problem: str) -> SpritesTokenError:
-        return SpritesTokenError(
-            f"{SPRITES_TOKEN_FILE_ENV} is set to {path!r}, which {problem}. It "
-            "must be an absolute path with no symlinks in it, naming a file in "
-            "a directory that holds only the token. " + _TOKEN_NOT_FROM_ENV
-        )
-
-    if not os.path.isabs(path):
-        raise refuse("is not an absolute path")
-    if os.path.normpath(path) != path or path.startswith(os.sep * 2):
-        raise refuse("contains '.', '..', a trailing separator or repeated separators")
-    current = os.sep
-    for name in path.split(os.sep)[1:]:
-        current = os.path.join(current, name)
-        try:
-            mode = os.lstat(current).st_mode
-        except (OSError, ValueError) as e:
-            raise refuse(f"could not be checked at {current!r} ({type(e).__name__})") from None
-        if stat.S_ISLNK(mode):
-            raise refuse(f"has a symlink at {current!r}")
 
 
 def _token_source(lookup=None) -> _TokenSource:
@@ -1444,6 +1327,78 @@ class _ExecFailed(RuntimeError):
         super().__init__(message)
         self.exit_code = exit_code
 
+_stream_token_lock = threading.Lock()
+_stream_token_dirs: dict = {}
+
+
+def _stream_token_base() -> str:
+    """Where private token copies go: a per-user tmpfs, never under HERMES_HOME (file sync
+    uploads ``~/.hermes/cache``, and Hermes points TMPDIR there)."""
+    from hermes_constants import get_hermes_home
+    home = os.path.realpath(str(get_hermes_home()))
+    for base in (os.environ.get("XDG_RUNTIME_DIR"), "/dev/shm", "/tmp"):  # no-tmp: ok — must avoid TMPDIR
+        if not base or not os.path.isdir(base):
+            continue
+        real = os.path.realpath(base)
+        if real == home or real.startswith(home + os.sep):
+            continue
+        return real
+    raise FileNotFoundError("no private runtime directory outside HERMES_HOME")
+
+
+def _private_dir(path: "str | None") -> bool:
+    """``path`` is a real directory (not a symlink) owned by this user and closed to everyone else."""
+    if not path:
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and st.st_mode & 0o077 == 0
+
+
+def _remove_stream_token_dir(directory: str, owner_pid: int) -> None:
+    if os.getpid() == owner_pid:  # a forked child that exits normally must not delete its parent's copies
+        import shutil
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _stream_token_file(token: str) -> str:
+    """Path of a 0600 file holding ``token`` alone, in a 0700 directory of this process's own, for the
+    stream helper. One file per distinct token (several profiles may stream at once, each with its own
+    token, and a helper or reaper may open its file at any time), kept until this process exits."""
+    if not token or any(not 0x21 <= ord(c) <= 0x7E for c in token):
+        raise ValueError("the Sprites token holds whitespace, control or non-ASCII characters")
+    name = hashlib.sha256(token.encode()).hexdigest()[:24]
+    with _stream_token_lock:
+        directory = _stream_token_dirs.get(os.getpid())
+        if not _private_dir(directory):
+            # Never reuse a directory that vanished and may have been recreated by someone else.
+            import atexit
+            import tempfile
+            directory = tempfile.mkdtemp(prefix="hermes-sprites-stream-", dir=_stream_token_base())
+            _stream_token_dirs[os.getpid()] = directory
+            atexit.register(_remove_stream_token_dir, directory, os.getpid())
+        assert directory is not None
+        path = os.path.join(directory, name)
+        if not os.path.exists(path):
+            tmp = os.path.join(directory, f".{name}.{uuid.uuid4().hex}")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                try:
+                    os.write(fd, token.encode("ascii"))
+                finally:
+                    os.close(fd)
+                os.replace(tmp, path)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        return path
+
+
 class SpritesEnvironment(BaseEnvironment):
     """Sprites backend: stateful cloud sandboxes on Fly.io.
 
@@ -1825,6 +1780,47 @@ class SpritesEnvironment(BaseEnvironment):
     def _command_kwargs(self) -> dict:
         """Extra ``sprite.command`` kwargs; empty unless the HOME fallback is active."""
         return {"env": dict(self._exec_env)} if self._exec_env else {}
+
+    # ------------------------------------------------------------------
+    # Long-lived streams (Bot Desktop, computer_use, the sandbox browser)
+    # ------------------------------------------------------------------
+
+    def exec_prefix(self, *, user: str | None = None, interactive: bool = True) -> list | None:
+        """Local argv that runs its remainder inside this Sprite with stdin/stdout open.
+
+        Hermes core appends ``bash -c <script>`` and spawns it for the Bot
+        Screen's RFB relay, cua-driver's MCP server, forwarded TCP ports and
+        short probes (``TerminalEnvironmentProvider.supports_streams``). The
+        helper, ``sprite_stream.py``, speaks the Sprites exec WebSocket and
+        reads the token from a file whose path is passed, never the token:
+        ``SPRITES_TOKEN_FILE`` itself, or for an env / secret-scope token a
+        private copy (``_stream_token_file``). A file, because core spawns
+        some streams (cua-driver's MCP server) with a stripped environment.
+        None when no private copy can be made.
+        """
+        sprite = self._sprite  # one read: cleanup() may clear it concurrently
+        if sprite is None:
+            return None
+        token_file = self._token_source.path
+        if token_file is None:
+            try:
+                token_file = _stream_token_file(self._token)
+            except (OSError, ValueError) as e:
+                logger.warning(
+                    "Sprites: could not write the private token copy Bot Desktop and "
+                    "computer_use need for %s (%s); set SPRITES_TOKEN_FILE instead",
+                    sprite.name, type(e).__name__)
+                return None
+        prefix = [sys.executable, str(Path(__file__).with_name("sprite_stream.py")),
+                  "--api", str(self._client.base_url), "--sprite", sprite.name,
+                  "--token-file", token_file]
+        if user:
+            prefix += ["--user", user]
+        for key, value in (self._exec_env or {}).items():
+            prefix += ["--env", f"{key}={value}"]
+        if not interactive:
+            prefix.append("--no-stdin")
+        return prefix + ["--"]
 
     # ------------------------------------------------------------------
     # File sync callbacks

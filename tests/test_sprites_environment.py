@@ -3360,6 +3360,20 @@ class TestCreateSettingsValidation:
         with pytest.raises(ValueError, match=key):
             resolve_create_settings(**{key: value})
 
+    def test_a_bare_off_is_off(self):
+        """config.yaml `auto_idle: off` and `hermes config set ... auto_idle off` both arrive as False."""
+        import yaml
+        from sprites_environment import resolve_create_settings
+        value = yaml.safe_load("auto_idle: off")["auto_idle"]
+        assert value is False
+        assert resolve_create_settings(auto_idle=value) == {"auto_idle": False}
+
+    @pytest.mark.parametrize("value", ["Suspend", "sleep", True, 0])
+    def test_invalid_auto_idle(self, value):
+        from sprites_environment import resolve_create_settings
+        with pytest.raises(ValueError, match="auto_idle"):
+            resolve_create_settings(auto_idle=value)
+
     def test_only_set_keys_are_returned(self):
         from sprites_environment import resolve_create_settings
         assert resolve_create_settings(max_ram_gb=4, max_cpus=2) == {
@@ -3450,6 +3464,14 @@ class TestCreateWithSettings:
         assert body["name"].startswith("hermes-eph-mine-")
         assert body["config"] == {"max_ram_gb": 8}
         client.create_sprite.assert_not_called()
+
+    @pytest.mark.parametrize("setting, sent", [("warm", "warm"), ("suspend", "suspend"), ("off", False)])
+    def test_auto_idle_reaches_the_create_request(self, sprites_sdk, hermes_runtime, monkeypatch,
+                                                  setting, sent):
+        env, client = self._build(sprites_sdk, monkeypatch, _create_response(),
+                                  max_ram_gb=16, auto_idle=setting)
+        assert client.http_client.post.call_args.kwargs["json"]["config"] == {
+            "max_ram_gb": 16, "auto_idle": sent}
 
     def test_existing_sprite_is_used_as_is(self, sprites_sdk, hermes_runtime, monkeypatch, caplog):
         """Settings never change an existing Sprite (no create, no PUT config)."""
@@ -3641,6 +3663,9 @@ class TestProviderCreateSettings:
         })
         plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
         assert captured["image"] == "ubuntu:24.04"
+        TestProviderSettings._write_settings(isolated_home, {"auto_idle": "suspend"})
+        plugin_pkg.SpritesProvider().create_environment(cwd="/root", timeout=60, task_id="t")
+        assert captured["auto_idle"] == "suspend"
         assert (captured["max_cpus"], captured["max_ram_gb"], captured["max_disk_gb"]) == (2, 4, 20)
 
     def test_unset_create_settings_are_not_passed(self, monkeypatch, isolated_home):
@@ -3683,6 +3708,8 @@ class TestProviderCreateSettings:
         assert fields["image"]["type"] == "string"
         for key in ("max_cpus", "max_ram_gb", "max_disk_gb"):
             assert fields[key]["type"] == "number"
+        assert fields["auto_idle"]["choices"] == ["warm", "suspend", "off"]
+        assert fields["auto_idle"]["value"] is None  # unset: the Sprites default, not a pinned choice
 
 
 # ---------------------------------------------------------------------------

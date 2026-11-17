@@ -18,8 +18,9 @@ one deployment's Sprites are confined to ``<prefix>-*``, and ``scope:
 instance`` makes every task id share one persistent Sprite per profile (see
 ``resolve_naming_settings``).
 
-Four more optional settings (``image``, ``max_cpus``, ``max_ram_gb``,
-``max_disk_gb``) choose the image and sizing of Sprites this plugin creates
+Five more optional settings (``image``, ``max_cpus``, ``max_ram_gb``,
+``max_disk_gb``, ``auto_idle``) choose the image, sizing and idle policy of
+Sprites this plugin creates
 (see ``resolve_create_settings``). With none set, creation sends exactly the
 request it always has.
 
@@ -559,8 +560,12 @@ def _validate_int_setting(key: str, value, bounds: tuple[int, int]) -> int:
     return value
 
 
+#: ``auto_idle`` setting -> the Sprites ``config.auto_idle`` value.
+_AUTO_IDLE = {"warm": "warm", "suspend": "suspend", "off": False}
+
+
 def resolve_create_settings(image=None, max_cpus=None, max_ram_gb=None,
-                            max_disk_gb=None) -> dict:
+                            max_disk_gb=None, auto_idle=None) -> dict:
     """Validate the create-time plugin settings.
 
     Returns the Sprites ``config`` object to send on create, holding only the
@@ -578,6 +583,15 @@ def resolve_create_settings(image=None, max_cpus=None, max_ram_gb=None,
     ):
         if value not in (None, ""):
             config[key] = _validate_int_setting(key, value, bounds)
+    if auto_idle is False:  # YAML and `hermes config set` both read a bare `off` as false
+        auto_idle = "off"
+    if auto_idle not in (None, ""):
+        if not isinstance(auto_idle, str) or auto_idle not in _AUTO_IDLE:
+            raise ValueError(
+                f"Sprites plugin setting auto_idle {auto_idle!r} is invalid: expected one of "
+                + ", ".join(_AUTO_IDLE)
+            )
+        config["auto_idle"] = _AUTO_IDLE[auto_idle]
     return config
 
 
@@ -1456,6 +1470,7 @@ class SpritesEnvironment(BaseEnvironment):
         max_cpus: int | None = None,
         max_ram_gb: int | None = None,
         max_disk_gb: int | None = None,
+        auto_idle: str | None = None,
     ):
         requested_cwd = cwd
         # Validate settings before anything else (including the SDK import
@@ -1463,7 +1478,7 @@ class SpritesEnvironment(BaseEnvironment):
         # message and no Sprites API call is ever made.
         prefix, scope = resolve_naming_settings(name_prefix, scope)
         create_config = resolve_create_settings(
-            image, max_cpus, max_ram_gb, max_disk_gb
+            image, max_cpus, max_ram_gb, max_disk_gb, auto_idle
         )
         super().__init__(cwd=cwd, timeout=timeout)
 

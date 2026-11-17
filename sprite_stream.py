@@ -54,7 +54,7 @@ _BOOTSTRAP = (
     "  c=os.read(0,n-len(b))\n"
     "  if not c: sys.exit(255)\n"
     "  b+=c\n"
-    "a=json.loads(b)\n"
+    "p=json.loads(b);a=p['argv'];os.environ.update(p['env'])\n"
     "try: os.execvp(a[0],a)\n"
     "except OSError as e:\n"
     "  sys.stderr.write(f'{a[0]}: {e.strerror}\\n'); sys.exit(127)\n"
@@ -91,20 +91,22 @@ def remote_argv(args) -> list[str]:
 
 
 def plan(args) -> tuple[str, bytes]:
-    """``(exec URL, bytes to send first on stdin)``: the argv itself, or a bootstrap fed the argv."""
-    def query(argv: list[str]) -> str:
+    """``(exec URL, bytes to send first on stdin)``: argv and env in the URL, or a bootstrap in the URL
+    fed both as JSON on stdin (the bootstrap's URL then has a fixed, short query)."""
+    def query(argv: list[str], env: list[str]) -> str:
         params = [("cmd", a) for a in argv] + [("path", argv[0]), ("stdin", "true")]
-        return urlencode(params + [("env", kv) for kv in args.env])
+        return urlencode(params + [("env", kv) for kv in env])
 
     argv = remote_argv(args)
     first = b""
     try:
-        q = query(argv)
+        q = query(argv, args.env)
     except UnicodeEncodeError:  # an undecodable name (surrogate escapes): JSON carries it, a URL cannot
         q = ""
     if not q or len(q) > MAX_QUERY_BYTES:
-        first = json.dumps(argv).encode()
-        q = query(["python3", "-c", _BOOTSTRAP, str(len(first))])
+        env = dict(kv.split("=", 1) for kv in args.env)
+        first = json.dumps({"argv": argv, "env": env}).encode()
+        q = query(["python3", "-c", _BOOTSTRAP, str(len(first))], [])
     base = _sprite_url(args.api, args.sprite)
     scheme, rest = base.split("://", 1)
     return f"{'wss' if scheme == 'https' else 'ws'}://{rest}/exec?{q}", first
@@ -256,6 +258,12 @@ def stream(args, reaper: subprocess.Popen) -> int:
             pass
 
 
+def _env_pair(value: str) -> str:
+    if "=" not in value or value.startswith("="):
+        raise argparse.ArgumentTypeError(f"--env needs NAME=VALUE, got {value!r}")
+    return value
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="sprite_stream.py")
     p.add_argument("--api", required=True)
@@ -264,7 +272,7 @@ def main(argv=None) -> int:
     tok.add_argument("--token-file")
     tok.add_argument("--token-env")
     p.add_argument("--user")
-    p.add_argument("--env", action="append", default=[])
+    p.add_argument("--env", action="append", default=[], type=_env_pair)
     p.add_argument("--no-stdin", action="store_true")
     p.add_argument("--reap", action="store_true")
     p.add_argument("argv", nargs="*")

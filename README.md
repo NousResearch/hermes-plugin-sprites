@@ -229,7 +229,8 @@ The Screen pane shows the Sprite's screen.
 - **Long commands.** A command whose encoded query would pass 6 KiB (Bot
   Desktop's setup script carries its launcher and wallpaper) does not go in
   the URL: a short `python3` bootstrap receives it as the first bytes on
-  stdin, restores the default SIGPIPE/SIGXFSZ handling and execs it (exit 127
+  stdin (with the `--env` pairs), restores the default SIGPIPE/SIGXFSZ
+  handling and execs it (exit 127
   when the command does not exist).
 - **Exit status.** The remote command's status, or 255 when the stream itself
   failed (no token, connection or handshake refused, an error frame, the

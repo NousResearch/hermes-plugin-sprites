@@ -309,6 +309,17 @@ def test_an_undecodable_argument_still_runs(fake):
     assert proc.stdout == b"caf\xe9"
 
 
+def test_env_too_large_for_a_url_goes_through_the_bootstrap(fake):
+    """Env pairs travel with the argv on stdin, so the URL stays short however large they are."""
+    cmd, env = _helper(fake, "sh", "-c", 'printf %s "$BIG" | wc -c',
+                       extra=("--env", "BIG=" + "y" * 9000, "--env", "ODD=" + os.fsdecode(b"\xe9")))
+    proc = subprocess.run(cmd, capture_output=True, env=env, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == b"9000"
+    assert fake.sessions[0]["argv"][0] == "python3" and fake.sessions[0]["env"] == []
+    assert fake.url_lengths[0] < 2048
+
+
 def test_no_stdin_ends_remote_stdin_at_once(fake):
     cmd, env = _helper(fake, "cat", extra=("--no-stdin",))
     proc = subprocess.run(cmd, stdin=subprocess.PIPE, capture_output=True, env=env, timeout=30)

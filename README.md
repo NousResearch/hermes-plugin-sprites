@@ -248,7 +248,10 @@ The Screen pane shows the Sprite's screen.
   identified, so that session runs until its command ends. A dropped
   connection ends the stream (no reconnect).
 - **Idle.** An open stream (a viewer watching the screen, a cua-driver
-  session, a DevTools connection) keeps the Sprite running. When nothing is
+  session, a DevTools connection) keeps the Sprite running. Hermes keeps a
+  session's cua-driver stream open until that session ends (cache eviction
+  does not close it), so after one `computer_use` call the Sprite stays
+  running, and billed, until the session is reset or Hermes stops. When nothing is
   open, the Sprite stops after its idle timeout. A warm stop ends every
   process, the screen included; the next screen, browser or `computer_use`
   call starts it again (open tabs are lost; the browser profile on disk

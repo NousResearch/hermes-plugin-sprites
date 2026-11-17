@@ -50,3 +50,14 @@ config_schema:
     description: >-
       Root filesystem in GB for newly created Sprites, 1 to 1024 and no smaller
       than the image. Unset uses the Sprites default.
+  auto_idle:
+    type: str
+    label: When idle
+    description: >-
+      What newly created Sprites do once nothing keeps them awake. "warm" (the
+      Sprites default) stops them and the next use boots them again, so
+      processes, the Bot Desktop and its browser tabs are lost; "suspend"
+      freezes them with every process kept, which Sprites can do only with
+      max_ram_gb at most 16 (larger Sprites stop as with "warm"); "off" keeps
+      them running until stopped.
+    choices: [warm, suspend, "off"]

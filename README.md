@@ -101,6 +101,7 @@ above.
 | `max_cpus` | 1 to 128 | vCPUs for newly created Sprites. Unset: Sprites default. |
 | `max_ram_gb` | 1 to 1024 | Memory (GB) for newly created Sprites. Unset: Sprites default. |
 | `max_disk_gb` | 1 to 1024, no smaller than the image | Root filesystem (GB) for newly created Sprites. Unset: Sprites default. |
+| `auto_idle` | `warm` \| `suspend` \| `off` | What newly created Sprites do once nothing keeps them awake. `warm` (the Sprites default) stops them; the next use boots a fresh VM, so background processes, the Bot Desktop and its browser tabs are gone. `suspend` freezes them with every process kept. `off` keeps them running (and billed) until stopped. Unset: Sprites default. |
 | `scope` | `session` (default) \| `instance` | `instance` makes every task id on a profile (gateway sessions, cron jobs, `delegate_task` children, CLI) resume the same persistent Sprite: `<prefix>-default` (or `hermes-default` without a prefix) on the default profile, the usual digest-scoped `-default` name on a named profile. Each session still gets its own shell; they share the VM and filesystem (file sync into the Sprite is serialised across sessions in one process). |
 
 An invalid value for either key is an error, not a fallback: the backend
@@ -111,7 +112,13 @@ you just wrote. Ignoring a bad prefix would create Sprites outside the namespace
 to confine this install to; ignoring a misspelt scope would quietly start
 creating one Sprite per session.
 
-`image`, `max_cpus`, `max_ram_gb` and `max_disk_gb` apply only when the plugin
+`suspend` works only up to `max_ram_gb` 16, counting the configured size, not the
+memory in use. Measured on Sprites 2.0: at 17 GB and above an idle Sprite set to
+`suspend` is warm-stopped instead, with no reason given, and its API still
+reports the next wake as `resumed`. A 16 GB Sprite holding 12 GB took about 33 s
+to suspend and 6 s to wake.
+
+`image`, `max_cpus`, `max_ram_gb`, `max_disk_gb` and `auto_idle` apply only when the plugin
 creates a Sprite. An existing Sprite is resumed as it is; the plugin never
 updates its config (on Sprites 2.0 the image and disk size are fixed at
 creation). To move to a new image or size, delete the Sprite (or change
@@ -129,6 +136,7 @@ hermes config set plugins.entries.sprites.settings.image 'nousresearch/hermes-sa
 hermes config set plugins.entries.sprites.settings.max_cpus 2
 hermes config set plugins.entries.sprites.settings.max_ram_gb 4
 hermes config set plugins.entries.sprites.settings.max_disk_gb 20
+hermes config set plugins.entries.sprites.settings.auto_idle suspend
 ```
 
 `scope` only affects persistent Sprites. Ephemeral mode

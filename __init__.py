@@ -14,8 +14,9 @@ Install into ``~/.hermes/plugins/sprites/`` and enable via
 Optional settings (``plugins.entries.sprites.settings.*`` in config.yaml):
 ``name_prefix`` confines every Sprite name to ``<prefix>-*`` and ``scope``
 (``session`` | ``instance``) chooses one Sprite per task id or one per
-profile; ``image``, ``max_cpus``, ``max_ram_gb`` and ``max_disk_gb`` set the
-image and sizing of newly created Sprites. See README.md.
+profile; ``image``, ``max_cpus``, ``max_ram_gb``, ``max_disk_gb`` and
+``auto_idle`` set the image, sizing and idle policy of newly created Sprites.
+See README.md.
 
 Attribution: the Sprites environment was authored by Kyle McLaren
 (@kylemclaren, Fly.io) as hermes-agent PR #30112 and hardened through the
@@ -38,10 +39,10 @@ _SPRITES_SPEC = "sprites-py>=0.5.0,<0.6"
 _PLUGIN_ID = "sprites"
 
 #: Plugin settings this backend reads (``plugins.entries.<id>.settings.<key>``).
-_SETTING_KEYS = ("name_prefix", "scope", "image", "max_cpus", "max_ram_gb", "max_disk_gb")
+_SETTING_KEYS = ("name_prefix", "scope", "image", "max_cpus", "max_ram_gb", "max_disk_gb", "auto_idle")
 
 #: Settings that only shape the create request (see ``resolve_create_settings``).
-_CREATE_SETTING_KEYS = ("image", "max_cpus", "max_ram_gb", "max_disk_gb")
+_CREATE_SETTING_KEYS = ("image", "max_cpus", "max_ram_gb", "max_disk_gb", "auto_idle")
 
 
 def _failed_read_marker() -> Optional[type]:

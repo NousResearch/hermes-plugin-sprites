@@ -222,7 +222,8 @@ The Screen pane shows the Sprite's screen.
   line, never the token: `SPRITES_TOKEN_FILE` when set, else a private copy
   of the token (a `0600` file in a `0700` directory under `$XDG_RUNTIME_DIR`,
   `/dev/shm` or `/tmp`, never under `HERMES_HOME`, removed when Hermes
-  exits). A file because Hermes starts cua-driver's stream with only `PATH`
+  exits; a Hermes that is killed or crashes leaves it behind, in
+  `hermes-sprites-stream-*`). A file because Hermes starts cua-driver's stream with only `PATH`
   in its environment.
 - **Desktop user.** Commands for the desktop user (`pn` in the sandbox image)
   run through `sudo -n -H -u <user>`, so `$HOME` is that user's home. The

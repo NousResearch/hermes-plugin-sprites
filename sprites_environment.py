@@ -1256,34 +1256,56 @@ def _stream_token_base() -> str:
     raise FileNotFoundError("no private runtime directory outside HERMES_HOME")
 
 
+def _private_dir(path: "str | None") -> bool:
+    """``path`` is a real directory (not a symlink) owned by this user and closed to everyone else."""
+    if not path:
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and st.st_mode & 0o077 == 0
+
+
+def _remove_stream_token_dir(directory: str, owner_pid: int) -> None:
+    if os.getpid() == owner_pid:  # a forked child that exits normally must not delete its parent's copies
+        import shutil
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 def _stream_token_file(token: str) -> str:
-    """Path of a 0600 file holding ``token`` alone, in a 0700 directory of its own, for the stream
-    helper. Same token, same file; an older token's file in that directory is removed."""
+    """Path of a 0600 file holding ``token`` alone, in a 0700 directory of this process's own, for the
+    stream helper. One file per distinct token (several profiles may stream at once, each with its own
+    token, and a helper or reaper may open its file at any time), kept until this process exits."""
+    if not token or any(not 0x21 <= ord(c) <= 0x7E for c in token):
+        raise ValueError("the Sprites token holds whitespace, control or non-ASCII characters")
     name = hashlib.sha256(token.encode()).hexdigest()[:24]
     with _stream_token_lock:
         directory = _stream_token_dirs.get(os.getpid())
-        if directory is None or not os.path.isdir(directory):
+        if not _private_dir(directory):
+            # Never reuse a directory that vanished and may have been recreated by someone else.
             import atexit
-            import shutil
             import tempfile
             directory = tempfile.mkdtemp(prefix="hermes-sprites-stream-", dir=_stream_token_base())
             _stream_token_dirs[os.getpid()] = directory
-            atexit.register(shutil.rmtree, directory, True)
+            atexit.register(_remove_stream_token_dir, directory, os.getpid())
+        assert directory is not None
         path = os.path.join(directory, name)
         if not os.path.exists(path):
             tmp = os.path.join(directory, f".{name}.{uuid.uuid4().hex}")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
-                os.write(fd, token.encode("ascii"))
-            finally:
-                os.close(fd)
-            os.replace(tmp, path)
-            for other in os.listdir(directory):
-                if other != name:
-                    try:
-                        os.unlink(os.path.join(directory, other))
-                    except OSError:
-                        pass
+                try:
+                    os.write(fd, token.encode("ascii"))
+                finally:
+                    os.close(fd)
+                os.replace(tmp, path)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         return path
 
 
@@ -1688,7 +1710,7 @@ class SpritesEnvironment(BaseEnvironment):
         if token_file is None:
             try:
                 token_file = _stream_token_file(self._token)
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 logger.warning(
                     "Sprites: could not write the private token copy Bot Desktop and "
                     "computer_use need for %s (%s); set SPRITES_TOKEN_FILE instead",

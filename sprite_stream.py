@@ -131,17 +131,25 @@ def _tell(reaper: subprocess.Popen, line: bytes) -> None:
         pass  # a dead reaper cannot be helped here; the stream itself goes on
 
 
-def _kill(args, session: str, signal_name: str) -> bool:
+def _kill(args, session: str, signal_name: str, held: "str | None") -> bool:
     """POST the kill; True when it was accepted, False when the session was already gone or every try
-    failed (backing off 1, 2, 4, 8 s)."""
+    failed (backing off 1, 2, 4, 8 s). The token is read again each try (a renewed token file wins), and
+    ``held``, the token read when the reaper started, is used when it can no longer be read: Hermes
+    removes its private token copy when it exits, and the reaper outlives Hermes."""
     import httpx
     url = f"{_sprite_url(args.api, args.sprite)}/exec/{quote(session, safe='')}/kill"
     for delay in (0, 1, 2, 4, 8):
         time.sleep(delay)
         try:
+            token = _token(args)
+        except StreamError:
+            token = held
+        if not token:
+            continue
+        try:
             resp = httpx.post(url, json={"signal": signal_name}, timeout=30,
-                              headers={"Authorization": f"Bearer {_token(args)}"})
-        except (httpx.HTTPError, StreamError):
+                              headers={"Authorization": f"Bearer {token}"})
+        except httpx.HTTPError:
             continue
         if resp.status_code in (200, 404):  # 404: the session is already gone
             return resp.status_code == 200
@@ -150,6 +158,10 @@ def _kill(args, session: str, signal_name: str) -> bool:
 
 def reap(args) -> int:
     """Wait for the stream process; kill its session unless it reported the command finished."""
+    try:
+        held = _token(args)
+    except StreamError:
+        held = None
     session, finished = None, False
     for line in sys.stdin.buffer:
         if line.startswith(b"sid:"):
@@ -158,9 +170,9 @@ def reap(args) -> int:
             finished = True
     if session is None or finished:
         return 0
-    if _kill(args, session, "TERM"):
+    if _kill(args, session, "TERM", held):
         time.sleep(5)
-        _kill(args, session, "KILL")  # 404 when TERM already ended it
+        _kill(args, session, "KILL", held)  # 404 when TERM already ended it
     return 0
 
 

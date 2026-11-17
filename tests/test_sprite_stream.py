@@ -81,6 +81,41 @@ class TestExecPrefix:
         assert Path(prefix[prefix.index("--token-file") + 1]).read_text() == "test-token"
 
 
+class TestPrivateTokenCopy:
+    def test_each_token_keeps_its_own_file(self):
+        """Profiles with different tokens stream from one process: no copy may evict another."""
+        from sprites_environment import _stream_token_file
+        a, b = _stream_token_file("tok-a"), _stream_token_file("tok-b")
+        assert a != b and Path(a).read_text() == "tok-a" and Path(b).read_text() == "tok-b"
+        assert _stream_token_file("tok-a") == a
+
+    def test_a_directory_not_ours_is_never_reused(self):
+        from sprites_environment import _stream_token_file
+        first = Path(_stream_token_file("tok-c"))
+        first.parent.chmod(0o755)  # as if recreated by someone else / opened up
+        try:
+            second = Path(_stream_token_file("tok-c"))
+            assert second.parent != first.parent
+            assert (second.parent.stat().st_mode & 0o077) == 0
+        finally:
+            first.parent.chmod(0o700)
+
+    def test_a_forked_child_exiting_leaves_the_copies(self):
+        from sprites_environment import _remove_stream_token_dir, _stream_token_file
+        path = Path(_stream_token_file("tok-d"))
+        pid = os.fork()
+        if pid == 0:
+            _remove_stream_token_dir(str(path.parent), os.getppid())  # what its inherited atexit runs
+            os._exit(0)
+        os.waitpid(pid, 0)
+        assert path.exists()
+
+    def test_a_token_the_helper_cannot_send_is_refused(self, make_env, monkeypatch):
+        env = make_env()
+        env._token = "has space"
+        assert env.exec_prefix() is None
+
+
 def test_exec_prefix_streams_under_a_stripped_environment(make_env, fake):
     """The live failure: cua-driver's stream is spawned with env={"PATH": ...} only."""
     env = make_env()
@@ -476,3 +511,19 @@ def test_reaper_contract(fake):
     assert fake.kills == []
     reaper(b"sid:sess-9\n")                  # died mid-command (session unknown to the fake: 404)
     assert fake.kills == [("/v1/sprites/s1/exec/sess-9/kill", {"signal": "TERM"}, "Bearer tok-2")]
+
+
+def test_reaper_still_kills_after_its_token_file_is_removed(fake, tmp_path):
+    """Hermes removes its private token copy when it exits; the reapers it leaves behind must still kill."""
+    path = tmp_path / "tok"
+    path.write_text("tok-3")
+    path.chmod(0o600)
+    cmd = [sys.executable, str(HELPER), "--reap", "--api", fake.api, "--sprite", "s1",
+           "--token-file", str(path), "--"]
+    r = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    time.sleep(1.0)  # the reaper has read its token
+    path.unlink()
+    r.stdin.write(b"sid:sess-7\n")
+    r.stdin.close()
+    assert r.wait(timeout=60) == 0
+    assert fake.kills == [("/v1/sprites/s1/exec/sess-7/kill", {"signal": "TERM"}, "Bearer tok-3")]

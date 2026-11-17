@@ -3313,7 +3313,15 @@ class TestCreateSettingsValidation:
         with pytest.raises(ValueError, match=key):
             resolve_create_settings(**{key: value})
 
-    @pytest.mark.parametrize("value", ["Suspend", "sleep", True, False, 0])
+    def test_a_bare_off_is_off(self):
+        """config.yaml `auto_idle: off` and `hermes config set ... auto_idle off` both arrive as False."""
+        import yaml
+        from sprites_environment import resolve_create_settings
+        value = yaml.safe_load("auto_idle: off")["auto_idle"]
+        assert value is False
+        assert resolve_create_settings(auto_idle=value) == {"auto_idle": False}
+
+    @pytest.mark.parametrize("value", ["Suspend", "sleep", True, 0])
     def test_invalid_auto_idle(self, value):
         from sprites_environment import resolve_create_settings
         with pytest.raises(ValueError, match="auto_idle"):

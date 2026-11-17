@@ -553,6 +553,8 @@ def resolve_create_settings(image=None, max_cpus=None, max_ram_gb=None,
     ):
         if value not in (None, ""):
             config[key] = _validate_int_setting(key, value, bounds)
+    if auto_idle is False:  # YAML and `hermes config set` both read a bare `off` as false
+        auto_idle = "off"
     if auto_idle not in (None, ""):
         if not isinstance(auto_idle, str) or auto_idle not in _AUTO_IDLE:
             raise ValueError(

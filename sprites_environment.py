@@ -1134,16 +1134,24 @@ def _stop_flag_path(exec_id: str) -> str:
     return f"/tmp/.hermes-sprites-stopped-{exec_id}"
 
 
-def _refuse_if_stopped(exec_id: str, command: str) -> str:
-    """``command`` preceded by an exit when exec ``exec_id`` was already stopped.
+def _launch_argv(exec_id: str, command: str, login: bool) -> list[str]:
+    """Exec arguments running ``command`` in bash, unless exec ``exec_id`` was
+    already stopped.
 
     A stop can run before the exec it targets has started (an immediate
     /stop, a slow connection); its scan then finds nothing. The check runs in
     a process that already carries the marker, so either the stop's scan
-    sees that process or this check sees the stop's flag.
+    sees that process or this check sees the stop's flag. It runs in a plain
+    ``sh`` that then ``exec``s bash, before bash reads any startup file
+    (``BASH_ENV``, login profiles) that could start a child the stop missed.
+    The command stays a separate argument, so the launcher adds nothing to
+    the longest one (see ``_EXEC_ARG_MAX_BYTES``).
     """
     flag = shlex.quote(_stop_flag_path(exec_id))
-    return f"if [ -e {flag} ]; then rm -f {flag}; exit 130; fi\n{command}"
+    bash = "bash -l" if login else "bash"
+    launcher = (f'if [ -e {flag} ]; then rm -f {flag}; exit 130; fi\n'
+                f'exec {bash} -c "$1"')
+    return ["sh", "-c", launcher, "hermes", command]
 
 
 def _stop_exec_script(exec_id: str) -> str:
@@ -2108,11 +2116,7 @@ class SpritesEnvironment(BaseEnvironment):
             ExitError, SpriteError, TimeoutError as SpritesTimeout)
 
         exec_id = uuid.uuid4().hex
-        script = _refuse_if_stopped(exec_id, cmd_string)
-        if login:
-            shell_cmd = ["bash", "-l", "-c", script]
-        else:
-            shell_cmd = ["bash", "-c", script]
+        shell_cmd = _launch_argv(exec_id, cmd_string, login)
 
         # Absent/nonpositive timeouts get a fallback deadline.
         deadline = float(timeout) if timeout and timeout > 0 else 3600.0

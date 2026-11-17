@@ -910,7 +910,7 @@ def _route_commands(env, *, user, stop=lambda: b""):
 
     def command(*args, **kwargs):
         cmd = MagicMock()
-        if args[0] == "sh":
+        if args[:2] == ("sh", "-c") and len(args) == 3:  # _exec_or_raise
             calls["stop"].append(args[-1])
             cmd.combined_output.side_effect = stop
         else:
@@ -1026,23 +1026,45 @@ def test_a_stop_before_the_command_starts_keeps_it_from_running(tmp_path):
     import subprocess
     import uuid as _uuid
     from sprites_environment import (
-        _EXEC_MARKER_VAR, _refuse_if_stopped, _stop_exec_script, _stop_flag_path)
+        _EXEC_MARKER_VAR, _launch_argv, _stop_exec_script, _stop_flag_path)
 
     exec_id = _uuid.uuid4().hex
+    # A startup file that starts a background child must not run either: it
+    # would outlive a stop that has already scanned.
+    bash_env = tmp_path / "bash_env"
+    started = tmp_path / "startup-ran"
+    bash_env.write_text(f"touch {started}; sleep 60 &\n")
     try:
         stopped = subprocess.run(["sh", "-c", _stop_exec_script(exec_id)], timeout=30)
         assert stopped.returncode == 0
         ran = tmp_path / "ran"
         late = subprocess.run(
-            ["bash", "-c", _refuse_if_stopped(exec_id, f"touch {ran}")],
-            env={**os.environ, _EXEC_MARKER_VAR: exec_id}, timeout=10)
+            _launch_argv(exec_id, f"touch {ran}", login=False),
+            env={**os.environ, _EXEC_MARKER_VAR: exec_id, "BASH_ENV": str(bash_env)},
+            timeout=10)
 
         assert late.returncode == 130
         assert not ran.exists()
+        assert not started.exists()
         assert not os.path.exists(_stop_flag_path(exec_id))
     finally:
         if os.path.exists(_stop_flag_path(exec_id)):
             os.unlink(_stop_flag_path(exec_id))
+
+
+def test_the_launcher_runs_the_command_unchanged(tmp_path):
+    """Without a stop, the launcher hands the exact command to bash (quotes,
+    $vars, newlines and a login shell included)."""
+    import subprocess
+    import uuid as _uuid
+    from sprites_environment import _launch_argv
+
+    command = "x='a \"b\" $c'; printf '%s|%s\\n' \"$x\" \"$0\"\necho second"
+    for login in (False, True):
+        out = subprocess.run(_launch_argv(_uuid.uuid4().hex, command, login),
+                             capture_output=True, text=True, timeout=20)
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.splitlines()[-2:] == ['a "b" $c|bash', "second"]
 
 
 def test_children_carry_their_own_commands_marker_through_the_snapshot(make_env, tmp_path):

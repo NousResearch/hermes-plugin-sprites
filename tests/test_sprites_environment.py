@@ -11,6 +11,8 @@ import logging
 import os
 import shutil
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, call
@@ -873,15 +875,128 @@ class TestRunBashExitCodes:
         assert handle.returncode == 7
 
     @pytest.mark.parametrize("timeout_type", [_SpritesTimeoutError, TimeoutError], ids=["sdk", "sync-future"])
-    def test_timeout_surfaces_124(self, make_env, sprites_sdk, timeout_type):
+    def test_timeout_reports_124_after_stopping_the_command(self, make_env, timeout_type):
         env = make_env(task_id="rbto")
-        cmd = MagicMock()
-        cmd.combined_output.side_effect = timeout_type("deadline")
-        env._mock_sprite.command = MagicMock(return_value=cmd)
+        calls = _route_commands(env, user=lambda: (_ for _ in ()).throw(timeout_type("deadline")))
 
         handle = env._run_bash("sleep 999", timeout=1)
         handle.wait()
+
         assert handle.returncode == 124
+        assert len(calls["stop"]) == 1
+        assert _marker_of(calls["user"][0]) in calls["stop"][0]
+
+    def test_timeout_without_a_confirmed_stop_is_not_124(self, make_env, sprites_sdk):
+        """124 claims the command was stopped, so an unconfirmed stop must not report it."""
+        env = make_env(task_id="rbto")
+        _, exc_mod = sprites_sdk
+
+        def stop_fails():
+            raise exc_mod.ExitError("exit status 1", 1, b"still running: 41\n", b"")
+
+        _route_commands(env, user=lambda: (_ for _ in ()).throw(TimeoutError("deadline")),
+                        stop=stop_fails)
+        handle = env._run_bash("sleep 999", timeout=1)
+        handle.wait()
+
+        assert handle.returncode != 124
+        assert "may still be running" in handle.stdout.read()
+
+
+def _route_commands(env, *, user, stop=lambda: b""):
+    """Answer the command exec with ``user()`` and every ``sh -c`` exec (the
+    stop) with ``stop()``; return the scripts and kwargs each one received."""
+    calls = {"user": [], "stop": []}
+
+    def command(*args, **kwargs):
+        cmd = MagicMock()
+        if args[0] == "sh":
+            calls["stop"].append(args[-1])
+            cmd.combined_output.side_effect = stop
+        else:
+            calls["user"].append(kwargs)
+            cmd.combined_output.side_effect = user
+        return cmd
+
+    env._mock_sprite.command = MagicMock(side_effect=command)
+    return calls
+
+
+def _marker_of(kwargs) -> str:
+    from sprites_environment import _EXEC_MARKER_VAR
+    return f"{_EXEC_MARKER_VAR}={kwargs['env'][_EXEC_MARKER_VAR]}"
+
+
+class TestKillStopsTheRemoteCommand:
+    """Closing the exec WebSocket leaves the command running on the Sprite, so
+    the handle's kill() (Hermes's deadline, /stop, process kill) must stop it."""
+
+    def test_kill_stops_a_running_command(self, make_env, sprites_sdk):
+        env = make_env(task_id="kill")
+        _, exc_mod = sprites_sdk
+        stopped = threading.Event()
+
+        def user():
+            assert stopped.wait(10), "kill() never stopped the command"
+            raise exc_mod.ExitError("exit status 143", 143, b"partial\n", b"")
+
+        calls = _route_commands(env, user=user, stop=lambda: (stopped.set(), b"")[1])
+        handle = env._run_bash("sleep 999", timeout=60)
+        handle.kill()
+        handle.wait(10)
+
+        assert len(calls["stop"]) == 1
+        assert _marker_of(calls["user"][0]) in calls["stop"][0]
+        assert handle.returncode == 143
+        assert "partial" in handle.stdout.read()
+
+    def test_kill_after_the_command_returned_sends_nothing(self, make_env):
+        """A background job the command started carries its marker too."""
+        env = make_env(task_id="kill")
+        calls = _route_commands(env, user=lambda: b"4242\n")
+        handle = env._run_bash("( nohup sleep 99 ) & echo $!", timeout=10)
+        handle.wait()
+        handle.kill()
+
+        assert calls["stop"] == []
+
+    def test_each_command_gets_its_own_marker(self, make_env):
+        env = make_env(task_id="kill")
+        calls = _route_commands(env, user=lambda: b"")
+        env._run_bash("true", timeout=5).wait()
+        env._run_bash("true", timeout=5).wait()
+
+        assert _marker_of(calls["user"][0]) != _marker_of(calls["user"][1])
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self"), reason="needs /proc")
+def test_stop_script_stops_the_whole_tree():
+    """The real script against real processes: a TERM-ignoring shell, a
+    background child and a setsid'd grandchild all carry the marker and must
+    all be gone when it exits 0; a process without the marker is untouched."""
+    import subprocess
+    import uuid as _uuid
+    from sprites_environment import _EXEC_MARKER_VAR, _stop_exec_script
+
+    exec_id = _uuid.uuid4().hex
+    tree = subprocess.Popen(
+        ["bash", "-c", "trap '' TERM; (sleep 60) & setsid sleep 60 & sleep 60"],
+        env={**os.environ, _EXEC_MARKER_VAR: exec_id}, start_new_session=True)
+    bystander = subprocess.Popen(["sleep", "60"])
+    try:
+        time.sleep(0.5)
+        result = subprocess.run(["sh", "-c", _stop_exec_script(exec_id)],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        tree.wait(5)
+        leftover = subprocess.run(
+            ["sh", "-c", f"grep -lzx -- '{_EXEC_MARKER_VAR}={exec_id}' /proc/[0-9]*/environ 2>/dev/null"],
+            capture_output=True, text=True)
+        assert leftover.stdout == ""
+        assert bystander.poll() is None
+    finally:
+        bystander.kill()
+        tree.kill()
 
 
 # ---------------------------------------------------------------------------
@@ -2043,28 +2158,76 @@ class TestFileSyncDelete:
 # _stdin_mode wiring
 # ---------------------------------------------------------------------------
 
-class TestStdinMode:
-    def test_stdin_mode_is_heredoc(self):
-        """Ensures the base class will embed stdin via heredoc, not pipe.
+class TestStdin:
+    """stdin (write_file/patch content) must not travel in the exec URL:
+    Sprites refuses an exec argument over 8192 bytes, so any file larger than
+    that minus the command wrapper could not be written."""
 
-        SDK calls don't accept a real stdin stream, so the backend declares
-        ``_stdin_mode = "heredoc"`` and the base ``execute()`` wraps stdin
-        into the command string before calling ``_run_bash``.
-        """
-        # Inspect the class without constructing — no SDK needed for this check
-        import importlib
+    def test_execute_sends_stdin_as_the_exec_stdin_stream(self, make_env):
+        env = make_env(task_id="stdin")
+        sent = []
 
-        # Stub the SDK so the module imports cleanly outside the make_env fixture
-        sys.modules.setdefault("sprites", types.ModuleType("sprites"))
-        sys.modules.setdefault("sprites.exceptions", types.ModuleType("sprites.exceptions"))
+        def command(*args, **kwargs):
+            stream = kwargs.get("stdin")
+            sent.append((args, stream.read() if stream is not None else None))
+            cmd = MagicMock()
+            cmd.combined_output.return_value = b""
+            return cmd
 
-        # Force a clean import (in case earlier tests left it in sys.modules with
-        # a different SDK mocked in)
-        if "sprites_environment" in sys.modules:
-            importlib.reload(sys.modules["sprites_environment"])
-        from sprites_environment import SpritesEnvironment
+        env._mock_sprite.command = MagicMock(side_effect=command)
+        content = "x = 1  # caf\u00e9 'quoted' $HOME `tick`\n" * 1000  # ~38 KB
 
-        assert SpritesEnvironment._stdin_mode == "heredoc"
+        result = env.execute("cat > /tmp/f.py", stdin_data=content, timeout=10)
+
+        assert result["returncode"] == 0
+        args, stdin = sent[-1]
+        assert stdin == content.encode("utf-8")
+        assert all(len(a.encode()) <= 8192 for a in args)
+        assert "caf\u00e9" not in " ".join(args)
+
+    def test_no_stdin_sends_no_stream(self, make_env):
+        env = make_env(task_id="stdin")
+        calls = _route_commands(env, user=lambda: b"")
+        env._run_bash("true", timeout=5).wait()
+        assert "stdin" not in calls["user"][0]
+
+
+class TestExecFailureReason:
+    """An exec the SDK could not start used to come back as exit 1 with no
+    output, so write_file/patch said only "Failed to write file: "."""
+
+    def test_reason_and_size_limit_are_reported(self, make_env, sprites_sdk):
+        env = make_env(task_id="fail")
+        _, exc_mod = sprites_sdk
+
+        def refused():
+            raise exc_mod.NetworkError(
+                "WebSocket command failed: InvalidStatus: server rejected "
+                "WebSocket connection: HTTP 400")
+
+        _route_commands(env, user=refused)
+        handle = env._run_bash("echo " + "a" * 9000, timeout=5)
+        handle.wait()
+        out = handle.stdout.read()
+
+        assert handle.returncode == 1
+        assert "HTTP 400" in out
+        assert "8192" in out
+
+    def test_a_reason_holding_the_token_is_withheld(self, make_env, sprites_sdk):
+        env = make_env(task_id="fail")
+        _, exc_mod = sprites_sdk
+
+        def leaky():
+            raise exc_mod.NetworkError("handshake with Bearer test-token failed")
+
+        _route_commands(env, user=leaky)
+        handle = env._run_bash("true", timeout=5)
+        handle.wait()
+        out = handle.stdout.read()
+
+        assert "test-token" not in out
+        assert "NetworkError" in out
 
 
 # ---------------------------------------------------------------------------
@@ -3289,12 +3452,12 @@ class TestHomeFallback:
         assert env._remote_home == "/home/sprite"
         assert env._exec_env is None
         for c in env._mock_sprite.command.call_args_list:
-            assert "env" not in c.kwargs
+            assert "HOME" not in c.kwargs.get("env", {})
         cmd = MagicMock()
         cmd.combined_output.return_value = b"ok"
         env._mock_sprite.command = MagicMock(return_value=cmd)
         env._run_bash("true", timeout=5).wait()
-        assert "env" not in env._mock_sprite.command.call_args.kwargs
+        assert "HOME" not in env._mock_sprite.command.call_args.kwargs.get("env", {})
 
     def test_empty_home_as_root_sets_home_env(self, make_env):
         sprite = _sprite_with_home(b"\n", b"0\n")
@@ -3303,12 +3466,12 @@ class TestHomeFallback:
         assert env.cwd == "/root"
         assert env._exec_env == {"HOME": "/root"}
         # init_session's bootstrap (after detection) already carries HOME.
-        assert sprite.command.call_args_list[-1].kwargs.get("env") == {"HOME": "/root"}
+        assert sprite.command.call_args_list[-1].kwargs["env"]["HOME"] == "/root"
         cmd = MagicMock()
         cmd.combined_output.return_value = b"ok"
         sprite.command = MagicMock(return_value=cmd)
         env._run_bash("true", timeout=5).wait()
-        assert sprite.command.call_args.kwargs["env"] == {"HOME": "/root"}
+        assert sprite.command.call_args.kwargs["env"]["HOME"] == "/root"
         env._sprite_delete(["/root/.hermes/x"])
         assert sprite.command.call_args.kwargs["env"] == {"HOME": "/root"}
 

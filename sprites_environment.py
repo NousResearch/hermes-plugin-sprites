@@ -552,6 +552,31 @@ _SYNC_WRITE_MAX_BYTES = 4 * 1024 * 1024
 #: travels in the exec URL), so a very large batch is split into several execs.
 _DELETE_COMMAND_MAX = 6000
 
+#: Longest exec argument Sprites accepts, in bytes. Every argument travels as
+#: a query parameter of the exec WebSocket URL. Measured, not documented: an
+#: 8192-byte argument runs, an 8193-byte one is refused with HTTP 400, and
+#: two 5000-byte arguments run (the limit is per argument). Percent-encoding
+#: does not count: 4040 bytes of punctuation (12 KB encoded) runs.
+_EXEC_ARG_MAX_BYTES = 8192
+
+#: Environment variable every command exec carries, set to that exec's id.
+#: Children inherit it (including ones that ``setsid`` or background
+#: themselves), so the processes one command started can be found and
+#: stopped from a second exec: closing the exec WebSocket does not stop them.
+_EXEC_MARKER_VAR = "HERMES_SPRITES_EXEC"
+
+#: Seconds a stop gives the command's processes to exit after SIGTERM before
+#: it sends SIGKILL.
+_STOP_TERM_GRACE = 2.0
+
+#: Deadline for the exec that stops a command (SIGTERM, grace, SIGKILL, check).
+_STOP_EXEC_TIMEOUT = 20.0
+
+#: How long the client waits past a command's deadline. Hermes's own
+#: deadline (``execute()``) fires first and stops the command through
+#: ``kill()``; this wait only ends a call nothing else ended.
+_CLIENT_WAIT_SLACK = 10.0
+
 #: OCI reference pieces (distribution/reference grammar, simplified): a
 #: repository path component, a tag, and an ``algorithm:hex`` digest.
 _REPO_COMPONENT_RE = re.compile(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*")
@@ -1104,6 +1129,39 @@ def _delete_script(paths: list[str]) -> str:
     return f"rm -f -- {quoted} || sudo -n rm -f -- {quoted}"
 
 
+def _stop_exec_script(exec_id: str) -> str:
+    """Stop every process carrying exec ``exec_id``'s marker: SIGTERM, then
+    SIGKILL after ``_STOP_TERM_GRACE``. Exits 0 only once none is left.
+
+    Processes are found by the marker in ``/proc/<pid>/environ``, which also
+    finds children that left the command's process group or session. A
+    process that dropped its environment (``env -i``, ``sudo``) or runs as
+    another user is not found.
+    """
+    marker = shlex.quote(f"{_EXEC_MARKER_VAR}={exec_id}")
+    polls = max(1, int(_STOP_TERM_GRACE / 0.25))
+    return (
+        f"M={marker}\n"
+        'pids() { grep -lzx -- "$M" /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3; }\n'
+        'P=$(pids); [ -n "$P" ] || exit 0\n'
+        "kill -TERM $P 2>/dev/null\n"
+        f"i=0; while [ $i -lt {polls} ]; do sleep 0.25; "
+        'P=$(pids); [ -n "$P" ] || exit 0; i=$((i+1)); done\n'
+        "kill -KILL $P 2>/dev/null; sleep 0.2\n"
+        'P=$(pids); [ -z "$P" ] || { echo "still running: $P"; exit 1; }\n'
+    )
+
+
+def _exec_failure_text(exc: BaseException, args: list[str]) -> str:
+    """Why an exec failed before the command ran, for the tool output."""
+    text = f"Sprites exec failed: {type(exc).__name__}: {exc}"
+    longest = max(len(a.encode("utf-8", "surrogateescape")) for a in args)
+    if longest > _EXEC_ARG_MAX_BYTES:
+        text += (f". The command is {longest} bytes; Sprites refuses an "
+                 f"exec argument over {_EXEC_ARG_MAX_BYTES} bytes")
+    return text + "\n"
+
+
 def _delete_batches(paths: list[str]) -> list[list[str]]:
     """Split ``paths`` so each URL-encoded delete command fits ``_DELETE_COMMAND_MAX``.
 
@@ -1358,11 +1416,16 @@ class SpritesEnvironment(BaseEnvironment):
     """Sprites backend: stateful cloud sandboxes on Fly.io.
 
     Spawn-per-call via ``_ThreadedProcessHandle`` wrapping blocking
-    ``sprite.command(...).combined_output()`` calls. The SDK timeout is
-    used to bound the client wait, not as a remote process-kill guarantee.
+    ``sprite.command(...).combined_output()`` calls. Closing an exec's
+    WebSocket does not stop the command on the Sprite, so the handle's
+    ``kill()`` stops it with a second exec (see ``_stop_exec``).
     """
 
-    _stdin_mode = "heredoc"
+    # stdin travels as the exec's own stdin stream. Embedding it in the
+    # command (heredoc) put it in the exec URL, whose arguments Sprites caps
+    # at _EXEC_ARG_MAX_BYTES, so writing any larger file failed. Hermes
+    # versions without "payload" pass stdin_data to _run_bash all the same.
+    _stdin_mode = "payload"
 
     def __init__(
         self,
@@ -2007,27 +2070,54 @@ class SpritesEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None):
-        """Return a _ThreadedProcessHandle wrapping a blocking SDK call."""
+        """Return a _ThreadedProcessHandle wrapping a blocking SDK call.
+
+        The exec carries a unique ``_EXEC_MARKER_VAR``. The handle's
+        ``kill()`` (Hermes's deadline, an interrupt, a process kill) stops
+        every process carrying it, and so does the client wait's own expiry
+        before it reports 124. ``kill()`` after the command returned does
+        nothing: a background job it started (``nohup ... &``) carries the
+        marker too and must keep running.
+        """
         sprite = self._sprite
-        from sprites.exceptions import ExitError, TimeoutError as SpritesTimeout
+        from sprites.exceptions import (
+            ExitError, SpriteError, TimeoutError as SpritesTimeout)
 
         if login:
             shell_cmd = ["bash", "-l", "-c", cmd_string]
         else:
             shell_cmd = ["bash", "-c", cmd_string]
 
-        # Bound the client wait, including when no deadline was supplied.
-        # SDK cancellation closes the WebSocket, but does not guarantee the
-        # remote process is killed (cancel_fn=None below). Absent/nonpositive
-        # timeouts get a fallback deadline; explicit positive values pass through.
-        cmd_timeout = float(timeout) if timeout and timeout > 0 else 3600.0
-
+        # Absent/nonpositive timeouts get a fallback deadline.
+        deadline = float(timeout) if timeout and timeout > 0 else 3600.0
+        exec_id = uuid.uuid4().hex
         cmd_kwargs = self._command_kwargs()
+        cmd_kwargs["env"] = {**cmd_kwargs.get("env", {}), _EXEC_MARKER_VAR: exec_id}
+        payload = (stdin_data.encode("utf-8", "surrogateescape")
+                   if stdin_data else None)
+        stop_lock = threading.Lock()
+        state = {"returned": False, "stopped": None}
 
         def run():
             # After a token switch, self._sprite is bound to the new client.
             current = self._sprite or sprite
-            return current.command(*shell_cmd, timeout=cmd_timeout, **cmd_kwargs).combined_output()
+            kwargs = dict(cmd_kwargs)
+            if payload is not None:
+                # A fresh stream per attempt: a 401 retry sends it again.
+                kwargs["stdin"] = io.BytesIO(payload)
+            return current.command(
+                *shell_cmd, timeout=deadline + _CLIENT_WAIT_SLACK, **kwargs,
+            ).combined_output()
+
+        def stop() -> bool:
+            # Serialized, and the outcome kept: a second caller waits for the
+            # first stop's answer instead of assuming it worked.
+            with stop_lock:
+                if state["returned"]:
+                    return True
+                if state["stopped"] is None:
+                    state["stopped"] = self._stop_exec(exec_id)
+                return state["stopped"]
 
         def exec_fn() -> tuple[str, int]:
             try:
@@ -2043,11 +2133,35 @@ class SpritesEnvironment(BaseEnvironment):
                 # sprites-py has matching async and synchronous deadlines.
                 # Its Future.result() can raise built-in TimeoutError before
                 # the coroutine translates expiry to the SDK's exception.
-                return (f"command timed out after {cmd_timeout}s\n", 124)
+                if stop():
+                    return (f"command timed out after {deadline}s\n", 124)
+                return (f"command timed out after {deadline}s, and stopping it "
+                        "on the Sprite failed: it may still be running\n", 1)
+            except (SpriteError, SpritesApiError) as e:
+                # _with_auth_retry already replaced an error naming the token.
+                return (_exec_failure_text(e, shell_cmd), 1)
+            finally:
+                state["returned"] = True
 
-        # No external cancel: the SDK does not expose a kill hook on a
-        # running Cmd. The deadline above is the cancellation path.
-        return _ThreadedProcessHandle(exec_fn, cancel_fn=None)
+        def kill() -> None:
+            stop()
+
+        return _ThreadedProcessHandle(exec_fn, cancel_fn=kill)
+
+    def _stop_exec(self, exec_id: str) -> bool:
+        """Stop the processes exec ``exec_id`` started; True once none is left."""
+        try:
+            self._exec_or_raise(
+                _stop_exec_script(exec_id), _STOP_EXEC_TIMEOUT,
+                "stopping a command")
+            return True
+        except _ExecFailed as e:
+            reason = str(e)
+        except Exception as e:
+            reason = type(e).__name__
+        logger.warning("Sprites: could not confirm a command on %s stopped: %s",
+                       self._sprite_name, reason)
+        return False
 
     # ------------------------------------------------------------------
     # Cleanup

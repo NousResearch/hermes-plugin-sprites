@@ -40,19 +40,24 @@ from urllib.parse import quote, urlencode
 
 STDIN, STDOUT, STDERR, EXIT, STDIN_EOF = 0, 1, 2, 3, 4
 TRANSPORT_FAILED = 255
-#: Longest argv sent in the URL; anything longer goes through the stdin bootstrap. Request lines past
-#: 8 KiB are refused by common front ends, and the URL also carries the env pairs.
-MAX_URL_ARGV_BYTES = 4096
+#: Longest encoded query (argv and env pairs, after percent-escaping) sent in the URL; anything longer
+#: goes through the stdin bootstrap. Request lines past 8 KiB are refused by common front ends.
+MAX_QUERY_BYTES = 6144
 _FINISHED = b"finished\n"
+# Python starts with SIGPIPE and SIGXFSZ ignored and an ignore survives exec, so both go back to the
+# default first: the command must see the signal state it would get from a direct exec.
 _BOOTSTRAP = (
-    "import json,os,sys\n"
+    "import json,os,signal,sys\n"
+    "for s in (signal.SIGPIPE,signal.SIGXFSZ): signal.signal(s,signal.SIG_DFL)\n"
     "n=int(sys.argv[1]);b=b''\n"
     "while len(b)<n:\n"
     "  c=os.read(0,n-len(b))\n"
     "  if not c: sys.exit(255)\n"
     "  b+=c\n"
     "a=json.loads(b)\n"
-    "os.execvp(a[0],a)\n"
+    "try: os.execvp(a[0],a)\n"
+    "except OSError as e:\n"
+    "  sys.stderr.write(f'{a[0]}: {e.strerror}\\n'); sys.exit(127)\n"
 )
 
 
@@ -87,16 +92,22 @@ def remote_argv(args) -> list[str]:
 
 def plan(args) -> tuple[str, bytes]:
     """``(exec URL, bytes to send first on stdin)``: the argv itself, or a bootstrap fed the argv."""
+    def query(argv: list[str]) -> str:
+        params = [("cmd", a) for a in argv] + [("path", argv[0]), ("stdin", "true")]
+        return urlencode(params + [("env", kv) for kv in args.env])
+
     argv = remote_argv(args)
     first = b""
-    if sum(len(a.encode()) + 1 for a in argv) > MAX_URL_ARGV_BYTES:
+    try:
+        q = query(argv)
+    except UnicodeEncodeError:  # an undecodable name (surrogate escapes): JSON carries it, a URL cannot
+        q = ""
+    if not q or len(q) > MAX_QUERY_BYTES:
         first = json.dumps(argv).encode()
-        argv = ["python3", "-c", _BOOTSTRAP, str(len(first))]
-    params = [("cmd", a) for a in argv] + [("path", argv[0]), ("stdin", "true")]
-    params += [("env", kv) for kv in args.env]
+        q = query(["python3", "-c", _BOOTSTRAP, str(len(first))])
     base = _sprite_url(args.api, args.sprite)
     scheme, rest = base.split("://", 1)
-    return f"{'wss' if scheme == 'https' else 'ws'}://{rest}/exec?{urlencode(params)}", first
+    return f"{'wss' if scheme == 'https' else 'ws'}://{rest}/exec?{q}", first
 
 
 # ── reaper ──────────────────────────────────────────────────────────────────────────────────────────
@@ -181,7 +192,7 @@ def _text(frame: str) -> dict:
         raise StreamError(f"unreadable control frame from Sprites: {frame[:200]!r}") from None
     if not isinstance(msg, dict):
         raise StreamError(f"unexpected control frame from Sprites: {frame[:200]!r}")
-    if msg.get("type") == "error" or "error" in msg:
+    if msg.get("type") == "error" or msg.get("error"):
         err = msg.get("error")
         detail = json.dumps(err) if isinstance(err, (dict, list)) else str(err or msg)
         raise StreamError(f"Sprites exec error: {detail[:500]}")
@@ -213,8 +224,8 @@ def _receive(ws) -> int:
 
 def stream(args, reaper: subprocess.Popen) -> int:
     from websockets.sync.client import connect
-    url, first = plan(args)
     try:
+        url, first = plan(args)
         ws = connect(url, additional_headers={"Authorization": f"Bearer {_token(args)}"},
                      max_size=None, open_timeout=60, ping_interval=20, ping_timeout=60, close_timeout=1)
     except StreamError:
@@ -268,7 +279,11 @@ def main(argv=None) -> int:
     try:
         return stream(args, reaper)
     except StreamError as e:
-        sys.stderr.write(f"sprite_stream: {e}\n")
+        try:
+            sys.stderr.write(f"sprite_stream: {e}\n")
+            sys.stderr.flush()
+        except OSError:
+            sys.stderr = open(os.devnull, "w")  # else interpreter shutdown fails on the same pipe (exit 120)
         return TRANSPORT_FAILED
     except BrokenPipeError:
         return 141

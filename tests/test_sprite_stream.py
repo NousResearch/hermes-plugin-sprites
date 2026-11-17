@@ -273,6 +273,42 @@ def test_a_command_too_long_for_a_url_runs_through_the_stdin_bootstrap(fake):
     assert fake.sessions[0]["argv"][0] == "python3"
 
 
+def test_the_size_limit_counts_the_encoded_url(fake):
+    """Shell punctuation percent-escapes to three bytes each: 3 KB of it is a 9 KB URL."""
+    script = "true # " + "$'\"/=&\n" * 400
+    assert len(script.encode()) < 4096
+    cmd, env = _helper(fake, "bash", "-c", script, extra=[x for i in range(8) for x in ("--env", f"K{i}=v")])
+    assert subprocess.run(cmd, capture_output=True, env=env, timeout=60).returncode == 0
+    assert fake.sessions[0]["argv"][0] == "python3"
+    assert fake.url_lengths[0] < 8192
+
+
+def test_the_bootstrap_hands_over_default_signal_handling(fake):
+    """An ignored SIGPIPE inherited through exec breaks `yes | head` and pipefail scripts."""
+    # Not Python (it ignores both at startup itself): a shell, which can never undo an inherited ignore.
+    cmd, env = _helper(fake, "sh", "-c", "grep SigIgn /proc/$$/status", "x" * 8000)
+    proc = subprocess.run(cmd, capture_output=True, env=env, timeout=60)
+    assert fake.sessions[0]["argv"][0] == "python3"
+    mask = int(proc.stdout.split()[1], 16)
+    assert mask & ((1 << (signal.SIGPIPE - 1)) | (1 << (signal.SIGXFSZ - 1))) == 0
+
+
+def test_a_missing_command_under_the_bootstrap_exits_127(fake):
+    cmd, env = _helper(fake, "/nonexistent/cmd", "x" * 8000)
+    proc = subprocess.run(cmd, capture_output=True, env=env, timeout=60)
+    assert proc.returncode == 127 and b"Traceback" not in proc.stderr
+
+
+def test_an_undecodable_argument_still_runs(fake):
+    """A surrogate-escaped name cannot be put in a URL; it goes through the bootstrap intact."""
+    name = os.fsdecode(b"caf\xe9")
+    cmd, env = _helper(fake, sys.executable, "-c",
+                       "import os,sys; sys.stdout.buffer.write(os.fsencode(sys.argv[1]))", name)
+    proc = subprocess.run(cmd, capture_output=True, env=env, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == b"caf\xe9"
+
+
 def test_no_stdin_ends_remote_stdin_at_once(fake):
     cmd, env = _helper(fake, "cat", extra=("--no-stdin",))
     proc = subprocess.run(cmd, stdin=subprocess.PIPE, capture_output=True, env=env, timeout=30)
@@ -362,6 +398,16 @@ def test_an_ended_stream_has_its_session_killed(fake, how):
     assert _kill_paths(fake)[0] == ("/v1/sprites/s1/exec/sess-1/kill", "TERM")
     assert fake.kills[0][2] == "Bearer tok-1"
     _wait_for(lambda: fake.procs["sess-1"].poll() is not None)
+
+
+def test_a_gone_stdout_reader_kills_the_session(fake):
+    cmd, env = _helper(fake, "yes")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+    proc.stdout.read(4096)
+    proc.stdout.close()
+    assert proc.wait(timeout=30) == 141
+    _wait_for(lambda: fake.kills)
+    assert _kill_paths(fake)[0] == ("/v1/sprites/s1/exec/sess-1/kill", "TERM")
 
 
 def test_a_command_that_ignores_term_gets_kill(fake):

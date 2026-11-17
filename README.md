@@ -226,9 +226,11 @@ The Screen pane shows the Sprite's screen.
 - **Desktop user.** Commands for the desktop user (`pn` in the sandbox image)
   run through `sudo -n -H -u <user>`, so `$HOME` is that user's home. The
   image needs `sudo` (the desktop sandbox image has it).
-- **Long commands.** An argv over 4 KiB (Bot Desktop's setup script carries
-  its launcher and wallpaper) does not go in the URL: a short `python3`
-  bootstrap receives it as the first bytes on stdin and execs it.
+- **Long commands.** A command whose encoded query would pass 6 KiB (Bot
+  Desktop's setup script carries its launcher and wallpaper) does not go in
+  the URL: a short `python3` bootstrap receives it as the first bytes on
+  stdin, restores the default SIGPIPE/SIGXFSZ handling and execs it (exit 127
+  when the command does not exist).
 - **Exit status.** The remote command's status, or 255 when the stream itself
   failed (no token, connection or handshake refused, an error frame, the
   socket closed before an exit status), with the reason on stderr in one

@@ -32,7 +32,7 @@ from typing import Any, Dict, Optional
 
 from agent.terminal_env_provider import TerminalEnvironmentProvider
 
-_SPRITES_SPEC = "sprites-py>=0.5.0,<0.6"
+_SPRITES_SPEC = "sprites-py>=0.5.1,<0.6"
 
 #: Manifest name; the default settings namespace.
 _PLUGIN_ID = "sprites"

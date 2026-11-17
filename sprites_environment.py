@@ -1237,6 +1237,56 @@ class _ExecFailed(RuntimeError):
         super().__init__(message)
         self.exit_code = exit_code
 
+_stream_token_lock = threading.Lock()
+_stream_token_dirs: dict = {}
+
+
+def _stream_token_base() -> str:
+    """Where private token copies go: a per-user tmpfs, never under HERMES_HOME (file sync
+    uploads ``~/.hermes/cache``, and Hermes points TMPDIR there)."""
+    from hermes_constants import get_hermes_home
+    home = os.path.realpath(str(get_hermes_home()))
+    for base in (os.environ.get("XDG_RUNTIME_DIR"), "/dev/shm", "/tmp"):  # no-tmp: ok — must avoid TMPDIR
+        if not base or not os.path.isdir(base):
+            continue
+        real = os.path.realpath(base)
+        if real == home or real.startswith(home + os.sep):
+            continue
+        return real
+    raise FileNotFoundError("no private runtime directory outside HERMES_HOME")
+
+
+def _stream_token_file(token: str) -> str:
+    """Path of a 0600 file holding ``token`` alone, in a 0700 directory of its own, for the stream
+    helper. Same token, same file; an older token's file in that directory is removed."""
+    name = hashlib.sha256(token.encode()).hexdigest()[:24]
+    with _stream_token_lock:
+        directory = _stream_token_dirs.get(os.getpid())
+        if directory is None or not os.path.isdir(directory):
+            import atexit
+            import shutil
+            import tempfile
+            directory = tempfile.mkdtemp(prefix="hermes-sprites-stream-", dir=_stream_token_base())
+            _stream_token_dirs[os.getpid()] = directory
+            atexit.register(shutil.rmtree, directory, True)
+        path = os.path.join(directory, name)
+        if not os.path.exists(path):
+            tmp = os.path.join(directory, f".{name}.{uuid.uuid4().hex}")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, token.encode("ascii"))
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+            for other in os.listdir(directory):
+                if other != name:
+                    try:
+                        os.unlink(os.path.join(directory, other))
+                    except OSError:
+                        pass
+        return path
+
+
 class SpritesEnvironment(BaseEnvironment):
     """Sprites backend: stateful cloud sandboxes on Fly.io.
 
@@ -1625,29 +1675,28 @@ class SpritesEnvironment(BaseEnvironment):
         Screen's RFB relay, cua-driver's MCP server, forwarded TCP ports and
         short probes (``TerminalEnvironmentProvider.supports_streams``). The
         helper, ``sprite_stream.py``, speaks the Sprites exec WebSocket and
-        reads the token itself from the same source this environment uses:
-        the token file's path, or the name of the variable that holds it, is
-        passed, never the token. None when the token is only in this
-        process's secret scope (not in ``os.environ``), which a subprocess
-        cannot read.
+        reads the token from a file whose path is passed, never the token:
+        ``SPRITES_TOKEN_FILE`` itself, or for an env / secret-scope token a
+        private copy (``_stream_token_file``). A file, because core spawns
+        some streams (cua-driver's MCP server) with a stripped environment.
+        None when no private copy can be made.
         """
         sprite = self._sprite  # one read: cleanup() may clear it concurrently
         if sprite is None:
             return None
-        prefix = [sys.executable, str(Path(__file__).with_name("sprite_stream.py")),
-                  "--api", str(self._client.base_url), "--sprite", sprite.name]
-        if self._token_source.path is not None:
-            prefix += ["--token-file", self._token_source.path]
-        else:
-            var = next((v for v in ("SPRITES_TOKEN", "SPRITE_TOKEN")
-                        if os.environ.get(v) == self._token), None)
-            if var is None:
+        token_file = self._token_source.path
+        if token_file is None:
+            try:
+                token_file = _stream_token_file(self._token)
+            except OSError as e:
                 logger.warning(
-                    "Sprites: the token is not in the process environment, so "
-                    "Bot Desktop and computer_use cannot open a stream in %s; set "
-                    "SPRITES_TOKEN_FILE or SPRITES_TOKEN in the environment", sprite.name)
+                    "Sprites: could not write the private token copy Bot Desktop and "
+                    "computer_use need for %s (%s); set SPRITES_TOKEN_FILE instead",
+                    sprite.name, type(e).__name__)
                 return None
-            prefix += ["--token-env", var]
+        prefix = [sys.executable, str(Path(__file__).with_name("sprite_stream.py")),
+                  "--api", str(self._client.base_url), "--sprite", sprite.name,
+                  "--token-file", token_file]
         if user:
             prefix += ["--user", user]
         for key, value in (self._exec_env or {}).items():

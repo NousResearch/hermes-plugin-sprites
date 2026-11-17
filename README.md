@@ -218,11 +218,12 @@ The Screen pane shows the Sprite's screen.
 - **Transport.** `SpritesEnvironment.exec_prefix()` gives Hermes a local
   command: `sprite_stream.py`, running under Hermes's Python. It opens one
   Sprites exec WebSocket (no TTY) per stream and passes bytes through
-  unchanged. It reads the token from `SPRITES_TOKEN_FILE`, or from the
-  `SPRITES_TOKEN` / `SPRITE_TOKEN` variable it inherits. The command line
-  carries the file's path or the variable's name, never the token. A token
-  that exists only in Hermes's secret scope cannot reach a subprocess, so the
-  screen is not available then.
+  unchanged. It reads the token from a file whose path is on its command
+  line, never the token: `SPRITES_TOKEN_FILE` when set, else a private copy
+  of the token (a `0600` file in a `0700` directory under `$XDG_RUNTIME_DIR`,
+  `/dev/shm` or `/tmp`, never under `HERMES_HOME`, removed when Hermes
+  exits). A file because Hermes starts cua-driver's stream with only `PATH`
+  in its environment.
 - **Desktop user.** Commands for the desktop user (`pn` in the sandbox image)
   run through `sudo -n -H -u <user>`, so `$HOME` is that user's home. The
   image needs `sudo` (the desktop sandbox image has it).

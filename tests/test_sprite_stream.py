@@ -43,13 +43,21 @@ class TestExecPrefix:
         spec.loader.exec_module(mod)
         assert mod.SpritesProvider.supports_streams is True
 
-    def test_env_token_passes_the_variable_name_not_the_token(self, make_env):
+    def test_env_token_goes_to_a_private_file_outside_hermes_home(self, make_env, isolated_home):
+        """Core spawns cua-driver's stream with only PATH in its environment, so an env token must
+        reach the helper as a file."""
+        import stat as _stat
         prefix = make_env().exec_prefix()
         assert prefix[:2] == [sys.executable, str(HELPER)]
         assert prefix[prefix.index("--sprite") + 1] == "hermes-default"
-        assert prefix[prefix.index("--token-env") + 1] == "SPRITES_TOKEN"
+        path = Path(prefix[prefix.index("--token-file") + 1])
+        assert path.read_text() == "test-token"
+        assert _stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert _stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        assert not str(path.resolve()).startswith(str(isolated_home.resolve()))
         assert not any("test-token" in word for word in prefix)
         assert prefix[-1] == "--" and "--no-stdin" not in prefix and "--user" not in prefix
+        assert make_env().exec_prefix()[prefix.index("--token-file") + 1] == str(path)  # reused
 
     def test_token_file_passes_the_path(self, make_env, tmp_path, monkeypatch):
         path = tmp_path / "secrets" / "sprites-token"
@@ -65,10 +73,23 @@ class TestExecPrefix:
         assert prefix[prefix.index("--user") + 1] == "pn"
         assert "--no-stdin" in prefix
 
-    def test_token_only_in_secret_scope_cannot_stream(self, make_env, monkeypatch):
+    def test_token_not_in_os_environ_still_streams(self, make_env, monkeypatch):
+        """A secret-scope token (resolved when the environment was made) needs no variable."""
         env = make_env()
         monkeypatch.delenv("SPRITES_TOKEN")
-        assert env.exec_prefix() is None
+        prefix = env.exec_prefix()
+        assert Path(prefix[prefix.index("--token-file") + 1]).read_text() == "test-token"
+
+
+def test_exec_prefix_streams_under_a_stripped_environment(make_env, fake):
+    """The live failure: cua-driver's stream is spawned with env={"PATH": ...} only."""
+    env = make_env()
+    env._client.base_url = fake.api
+    cmd = env.exec_prefix() + ["echo", "ok"]
+    proc = subprocess.run(cmd, capture_output=True, env={"PATH": os.environ["PATH"]}, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == b"ok\n"
+    assert fake.auth == ["Bearer test-token"]
 
 
 # ---------------------------------------------------------------------------

@@ -1168,7 +1168,7 @@ def _stop_exec_script(exec_id: str) -> str:
     polls = max(1, int(_STOP_TERM_GRACE / 0.25))
     return (
         # Flag first, scan second: a command not started yet refuses to run
-        # (see _refuse_if_stopped), one already started is found by the scan.
+        # (see _launch_argv), one already started is found by the scan.
         # Found and stopped, it has passed or died before the check, so the
         # flag is removed; found nothing, the flag stays for a late start.
         f"touch {flag} || exit 1\n"

@@ -224,12 +224,24 @@ The Screen pane shows the Sprite's screen.
   that exists only in Hermes's secret scope cannot reach a subprocess, so the
   screen is not available then.
 - **Desktop user.** Commands for the desktop user (`pn` in the sandbox image)
-  run through `sudo -n -H -u <user>`, so `$HOME` is that user's home.
+  run through `sudo -n -H -u <user>`, so `$HOME` is that user's home. The
+  image needs `sudo` (the desktop sandbox image has it).
+- **Long commands.** An argv over 4 KiB (Bot Desktop's setup script carries
+  its launcher and wallpaper) does not go in the URL: a short `python3`
+  bootstrap receives it as the first bytes on stdin and execs it.
+- **Exit status.** The remote command's status, or 255 when the stream itself
+  failed (no token, connection or handshake refused, an error frame, the
+  socket closed before an exit status), with the reason on stderr in one
+  line, as `ssh` does.
 - **No orphaned sessions.** A Sprites exec session keeps running after its
   socket closes, and a running session keeps the Sprite awake. Hermes ends
   streams with SIGKILL. A reaper process, started for each stream in its own
-  session, kills the exec session through the API unless the stream reported
-  that its command finished.
+  session before it connects, learns the session id as soon as Sprites sends
+  it and kills the session through the API (TERM, then KILL after 5 s) unless
+  the stream reported that its command finished. A stream killed in the
+  moment between the socket opening and the session id arriving cannot be
+  identified, so that session runs until its command ends. A dropped
+  connection ends the stream (no reconnect).
 - **Idle.** An open stream (a viewer watching the screen, a cua-driver
   session, a DevTools connection) keeps the Sprite running. When nothing is
   open, the Sprite stops after its idle timeout. A warm stop ends every

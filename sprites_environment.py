@@ -1129,6 +1129,23 @@ def _delete_script(paths: list[str]) -> str:
     return f"rm -f -- {quoted} || sudo -n rm -f -- {quoted}"
 
 
+def _stop_flag_path(exec_id: str) -> str:
+    """File a stop leaves on the Sprite so the exec, if it starts late, does not run."""
+    return f"/tmp/.hermes-sprites-stopped-{exec_id}"
+
+
+def _refuse_if_stopped(exec_id: str, command: str) -> str:
+    """``command`` preceded by an exit when exec ``exec_id`` was already stopped.
+
+    A stop can run before the exec it targets has started (an immediate
+    /stop, a slow connection); its scan then finds nothing. The check runs in
+    a process that already carries the marker, so either the stop's scan
+    sees that process or this check sees the stop's flag.
+    """
+    flag = shlex.quote(_stop_flag_path(exec_id))
+    return f"if [ -e {flag} ]; then rm -f {flag}; exit 130; fi\n{command}"
+
+
 def _stop_exec_script(exec_id: str) -> str:
     """Stop every process carrying exec ``exec_id``'s marker: SIGTERM, then
     SIGKILL after ``_STOP_TERM_GRACE``. Exits 0 only once none is left.
@@ -1139,16 +1156,23 @@ def _stop_exec_script(exec_id: str) -> str:
     another user is not found.
     """
     marker = shlex.quote(f"{_EXEC_MARKER_VAR}={exec_id}")
+    flag = shlex.quote(_stop_flag_path(exec_id))
     polls = max(1, int(_STOP_TERM_GRACE / 0.25))
     return (
+        # Flag first, scan second: a command not started yet refuses to run
+        # (see _refuse_if_stopped), one already started is found by the scan.
+        # Found and stopped, it has passed or died before the check, so the
+        # flag is removed; found nothing, the flag stays for a late start.
+        f"touch {flag} || exit 1\n"
         f"M={marker}\n"
         'pids() { grep -lzx -- "$M" /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3; }\n'
         'P=$(pids); [ -n "$P" ] || exit 0\n'
         "kill -TERM $P 2>/dev/null\n"
         f"i=0; while [ $i -lt {polls} ]; do sleep 0.25; "
-        'P=$(pids); [ -n "$P" ] || exit 0; i=$((i+1)); done\n'
+        f'P=$(pids); [ -n "$P" ] || {{ rm -f {flag}; exit 0; }}; i=$((i+1)); done\n'
         "kill -KILL $P 2>/dev/null; sleep 0.2\n"
         'P=$(pids); [ -z "$P" ] || { echo "still running: $P"; exit 1; }\n'
+        f"rm -f {flag}\n"
     )
 
 
@@ -2083,14 +2107,15 @@ class SpritesEnvironment(BaseEnvironment):
         from sprites.exceptions import (
             ExitError, SpriteError, TimeoutError as SpritesTimeout)
 
+        exec_id = uuid.uuid4().hex
+        script = _refuse_if_stopped(exec_id, cmd_string)
         if login:
-            shell_cmd = ["bash", "-l", "-c", cmd_string]
+            shell_cmd = ["bash", "-l", "-c", script]
         else:
-            shell_cmd = ["bash", "-c", cmd_string]
+            shell_cmd = ["bash", "-c", script]
 
         # Absent/nonpositive timeouts get a fallback deadline.
         deadline = float(timeout) if timeout and timeout > 0 else 3600.0
-        exec_id = uuid.uuid4().hex
         cmd_kwargs = self._command_kwargs()
         cmd_kwargs["env"] = {**cmd_kwargs.get("env", {}), _EXEC_MARKER_VAR: exec_id}
         payload = (stdin_data.encode("utf-8", "surrogateescape")
@@ -2139,7 +2164,12 @@ class SpritesEnvironment(BaseEnvironment):
                         "on the Sprite failed: it may still be running\n", 1)
             except (SpriteError, SpritesApiError) as e:
                 # _with_auth_retry already replaced an error naming the token.
-                return (_exec_failure_text(e, shell_cmd), 1)
+                # The SDK raises the same NetworkError for a refused start and
+                # for a connection lost mid-command, so stop whatever started.
+                text = _exec_failure_text(e, shell_cmd)
+                if not stop():
+                    text += "Stopping it on the Sprite failed: it may still be running.\n"
+                return (text, 1)
             finally:
                 state["returned"] = True
 
@@ -2147,6 +2177,15 @@ class SpritesEnvironment(BaseEnvironment):
             stop()
 
         return _ThreadedProcessHandle(exec_fn, cancel_fn=kill)
+
+    def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
+        """Keep the per-exec marker out of the shell snapshot, and the fresh
+        value across sourcing it. Otherwise the snapshot dumped during the
+        session bootstrap gives every later command's children the
+        bootstrap's marker, and a stop finds the shell but not its children.
+        """
+        return tuple(sorted({*super()._snapshot_excluded_passthrough_names(),
+                             _EXEC_MARKER_VAR}))
 
     def _stop_exec(self, exec_id: str) -> bool:
         """Stop the processes exec ``exec_id`` started; True once none is left."""

@@ -960,6 +960,24 @@ class TestKillStopsTheRemoteCommand:
 
         assert calls["stop"] == []
 
+    def test_a_lost_connection_stops_the_command(self, make_env, sprites_sdk):
+        """The SDK raises NetworkError for a connection lost mid-command too,
+        so the command may be running: stop it rather than call it done."""
+        env = make_env(task_id="kill")
+        _, exc_mod = sprites_sdk
+
+        def dropped():
+            raise exc_mod.NetworkError("connection closed before exit status")
+
+        calls = _route_commands(env, user=dropped)
+        handle = env._run_bash("make deploy", timeout=60)
+        handle.wait()
+        handle.kill()
+
+        assert len(calls["stop"]) == 1
+        assert _marker_of(calls["user"][0]) in calls["stop"][0]
+        assert handle.returncode == 1
+
     def test_each_command_gets_its_own_marker(self, make_env):
         env = make_env(task_id="kill")
         calls = _route_commands(env, user=lambda: b"")
@@ -994,9 +1012,63 @@ def test_stop_script_stops_the_whole_tree():
             capture_output=True, text=True)
         assert leftover.stdout == ""
         assert bystander.poll() is None
+        from sprites_environment import _stop_flag_path
+        assert not os.path.exists(_stop_flag_path(exec_id))  # it had started
     finally:
         bystander.kill()
         tree.kill()
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self"), reason="needs /proc")
+def test_a_stop_before_the_command_starts_keeps_it_from_running(tmp_path):
+    """The stop's scan finds nothing when the exec has not started yet; the
+    command must then refuse to run when it does start."""
+    import subprocess
+    import uuid as _uuid
+    from sprites_environment import (
+        _EXEC_MARKER_VAR, _refuse_if_stopped, _stop_exec_script, _stop_flag_path)
+
+    exec_id = _uuid.uuid4().hex
+    try:
+        stopped = subprocess.run(["sh", "-c", _stop_exec_script(exec_id)], timeout=30)
+        assert stopped.returncode == 0
+        ran = tmp_path / "ran"
+        late = subprocess.run(
+            ["bash", "-c", _refuse_if_stopped(exec_id, f"touch {ran}")],
+            env={**os.environ, _EXEC_MARKER_VAR: exec_id}, timeout=10)
+
+        assert late.returncode == 130
+        assert not ran.exists()
+        assert not os.path.exists(_stop_flag_path(exec_id))
+    finally:
+        if os.path.exists(_stop_flag_path(exec_id)):
+            os.unlink(_stop_flag_path(exec_id))
+
+
+def test_children_carry_their_own_commands_marker_through_the_snapshot(make_env, tmp_path):
+    """Core's real bootstrap dump and per-command wrapper, run in a local
+    bash: the snapshot taken during the bootstrap must not hand its marker
+    to later commands' children, or a stop finds the shell but not them."""
+    import subprocess
+    from sprites_environment import _EXEC_MARKER_VAR
+    from tools.environments.base_session_env import _snapshot_bootstrap_script
+
+    env = make_env(task_id="snap")
+    env._snapshot_path = str(tmp_path / "snap.sh")
+    cwd = str(tmp_path)
+    bootstrap = _snapshot_bootstrap_script(
+        excluded_names=env._snapshot_excluded_passthrough_names(),
+        **env._snapshot_script_kwargs(cwd))
+    subprocess.run(["bash", "-c", bootstrap], cwd=cwd, check=True, capture_output=True,
+                   env={**os.environ, _EXEC_MARKER_VAR: "bootstrap"})
+    env._snapshot_ready = True
+    wrapped = env._wrap_command(f"sh -c 'echo child=${_EXEC_MARKER_VAR}'", cwd)
+
+    out = subprocess.run(["bash", "-c", wrapped], cwd=cwd, capture_output=True, text=True,
+                         env={**os.environ, _EXEC_MARKER_VAR: "command"}).stdout
+
+    assert "child=command" in out
+    assert "bootstrap" not in Path(env._snapshot_path).read_text()
 
 
 # ---------------------------------------------------------------------------
